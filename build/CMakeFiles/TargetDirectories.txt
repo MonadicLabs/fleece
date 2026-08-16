@@ -1,0 +1,6 @@
+/home/nis/dev/fleece/build/CMakeFiles/fleece.dir
+/home/nis/dev/fleece/build/CMakeFiles/fleece_tests.dir
+/home/nis/dev/fleece/build/CMakeFiles/example1.dir
+/home/nis/dev/fleece/build/CMakeFiles/test.dir
+/home/nis/dev/fleece/build/CMakeFiles/edit_cache.dir
+/home/nis/dev/fleece/build/CMakeFiles/rebuild_cache.dir
