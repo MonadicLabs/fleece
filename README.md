@@ -182,6 +182,7 @@ FleecePlatform* platform = fleece_runtime_get_platform(runtime);
 fleece_platform_register(platform, "stop", my_stop, NULL);
 // script: platform.stop();
 ```
+See `examples/example3_embodied_swarm.c` for a complete real binding (`getPosition`/`moveToward`, backed by a small per-process physics struct via `user_data`) - see the Embodied Example section below.
 
 ## Directory Structure
 
@@ -206,7 +207,9 @@ fleece/
 ├── examples/             # Example applications (one executable per .c file)
 │   ├── example1.c       # Basic swarm coordination example (single process, simulated peer loopback)
 │   ├── example2_search_and_deliver.c  # Search + CBAA task allocation + delivery over real UDP multicast (multi-process)
-│   └── run_swarm.sh     # Launches N example2 agents as real processes with prefixed, interleaved output
+│   ├── run_swarm.sh     # Launches N example2 agents as real processes with prefixed, interleaved output
+│   ├── example3_embodied_swarm.c  # Same, but with real 2D position/speed/arrival via a "platform" binding (multi-process)
+│   └── run_swarm3.sh    # Launches N example3 agents, same idea as run_swarm.sh
 ├── tests/                # Unit tests (one executable per file, run via ctest)
 │   ├── test_state_manager.c # Raw LWW store tests
 │   ├── test_gossip.c        # Export/import/merge/delta wire format tests
@@ -223,7 +226,7 @@ fleece/
 - GCC or compatible C compiler
 - CMake 3.10 or higher
 - Standard POSIX library (for `clock_gettime` and `nanosleep`)
-- Linux or macOS with multicast-capable networking, to run `example2_search_and_deliver` (it uses BSD/glibc UDP multicast sockets - not needed to build/test the library itself)
+- Linux or macOS with multicast-capable networking, to run `example2_search_and_deliver` or `example3_embodied_swarm` (both use BSD/glibc UDP multicast sockets - not needed to build/test the library itself)
 
 ### Building
 ```bash
@@ -256,6 +259,14 @@ cd build && ctest --output-on-failure
 examples/run_swarm.sh          # 3 agents, until Ctrl+C
 examples/run_swarm.sh 5        # 5 agents, until Ctrl+C
 examples/run_swarm.sh 3 10     # 3 agents, stops automatically after 10s
+
+# Same scenario, but agents have real position/speed and physically travel to
+# a target before delivering it (see the Embodied Swarm section below):
+./build/example3_embodied_swarm 1 &
+./build/example3_embodied_swarm 2 &
+# ...or, again, the launcher (give it more time than run_swarm.sh - movement
+# takes real ticks, not an instant claim):
+examples/run_swarm3.sh 3 30
 ```
 
 ## Usage Examples
@@ -319,6 +330,14 @@ fleece_embedded_execute(embedded,
 - **Real transport**: unlike `example1.c`'s single-process simulated loopback, this example wires `FleeceComms`'s send/poll callbacks to a real UDP multicast socket (see the FleeceComms section above) - run it as two or more separate OS processes to see the whole thing converge over an actual network stack, not just in-process. All of the socket code lives in the example; the library itself never touches a socket.
 - **`examples/run_swarm.sh [num_agents] [duration_seconds]`**: a launcher that spawns that many real agent processes for you (default 3) and prefixes/interleaves their output as `[agent N] ...`, so a single command demonstrates the whole swarm instead of needing several manually-opened terminals.
 
+### Embodied Example: Real 2D Position, Speed, and Arrival
+`examples/example3_embodied_swarm.c` is the same search-and-deliver scenario, but with genuine physical embodiment instead of an abstract instant claim:
+- **`platform` in real use**: this is the first example to actually register `platform` functions - `platform.getPosition()` and `platform.moveToward(x, y)`, each bound to the process's own small physics struct (position + max speed) via `fleece_platform_register`'s `user_data`. The script calls `moveToward` every tick while pursuing a claimed target; the native side advances position by at most `max_speed` units and reports `{x, y, arrived}` back.
+- **Live position, not a static spawn point**: the script mirrors the returned position onto `self.x`/`self.y` each tick, so it's visible to peers via the existing gossip mechanism, and bid scores are computed from *current*, moving position - a target that looked out of reach can become the best option (or vice versa) as agents actually move.
+- **Delivery requires physical arrival**: a claim only converts to `delivered` once `moveToward` reports `arrived: true` *and* the claim has held for a short settle window - not just a fixed timer, like `example2_search_and_deliver.c` used.
+- **A contest margin, added after watching it thrash**: with scores now changing every tick as agents converge on the same target, contesting on *any* marginally-better score caused two closing agents to flip the claim back and forth dozens of times before one arrived. `CONTEST_MARGIN` requires a bid to beat the current holder by a meaningful amount before it's worth contesting - dropped one test run from 40 claim events to 5, with faster, cleaner convergence.
+- **A live ASCII view, per agent**: each agent periodically renders its own local view of the swarm from what it currently knows (`self`, `swarm`, `world`) - `@` for itself, `+` for a live peer, `x`/`o`/`#` for an unclaimed/claimed/delivered target. Because it's a genuinely distributed system, this is deliberately each agent's own honest belief, not a global truth. It renders cleanly when watching one agent directly; through `run_swarm3.sh`'s combined multi-process output, a multi-line grid can get interleaved with other agents' single-line status lines (an inherent limit of interleaving real concurrent process output, not something the launcher tries to solve) - the single-line `claimed`/`ARRIVED`/`DELIVERED` events stay reliable either way.
+
 ### Mesh Communication
 ```c
 // Send update to all connected nodes
@@ -356,7 +375,7 @@ MIT License - See LICENSE file for details
 ### Planned Enhancements
 1. **A built-in Reticulum/radio transport** for comms - `example2_search_and_deliver.c` shows a real transport (UDP multicast) is fully possible via the existing send/poll callbacks, but fleece itself still ships only the simulated default backend
 2. **A `reset()` trigger** - the lifecycle function is callable but nothing in the runtime calls it automatically yet
-3. **Real hardware platform bindings** (e.g. a MAVLink or ROS2 integration registering functions via `fleece_platform_register`) - the registry exists but ships with nothing registered
+3. **Real hardware platform bindings** (e.g. a MAVLink or ROS2 integration) - `example3_embodied_swarm.c` shows the registry in real use (a simple 2D movement binding), but nothing resembling actual flight-controller or robot hardware is wired up yet
 4. **Hardware-specific optimizations** (ESP32, STM32, etc.) and validation on an actual microcontroller target (currently desktop POSIX only)
 5. **More example applications** (leader election, foraging, etc.)
 6. **Performance profiling** and optimization
