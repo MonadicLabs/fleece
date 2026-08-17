@@ -13,6 +13,12 @@ struct FleeceComms {
     bool is_initialized;
     uint32_t packet_count;
     uint32_t max_packets;
+
+    FleeceCommsSendCallback send_callback;
+    void* send_callback_user_data;
+
+    FleeceCommsReceiveCallback receive_callback;
+    void* receive_callback_user_data;
 };
 
 FleeceComms* fleece_comms_create(void) {
@@ -61,7 +67,11 @@ int fleece_comms_send(FleeceComms* comms, const char* destination, const uint8_t
     
     printf("Sending %u bytes to %s\n", size, destination);
     comms->packet_count++;
-    
+
+    if (comms->send_callback) {
+        comms->send_callback(destination, data, size, comms->send_callback_user_data);
+    }
+
     return 0;
 }
 
@@ -73,7 +83,11 @@ int fleece_comms_receive(FleeceComms* comms, char* destination, uint8_t** data, 
     if (destination) strcpy(destination, "node_001");
     *data = NULL;
     *size = 0;
-    
+
+    if (comms->receive_callback && *data && *size > 0) {
+        comms->receive_callback(destination, *data, *size, comms->receive_callback_user_data);
+    }
+
     return 0;
 }
 
@@ -82,7 +96,6 @@ int fleece_comms_initialize(FleeceComms* comms) {
         return -1;
     }
     
-    // In a real implementation, this would initialize Reticulum stack
     comms->is_initialized = true;
     comms->is_connected = true;  // Simulate connection for demo
     
@@ -103,4 +116,18 @@ void fleece_comms_close(FleeceComms* comms) {
 
 bool fleece_comms_is_connected(FleeceComms* comms) {
     return comms ? comms->is_connected : false;
+}
+
+void fleece_comms_set_send_callback(FleeceComms* comms, FleeceCommsSendCallback callback, void* user_data) {
+    if (!comms) return;
+
+    comms->send_callback = callback;
+    comms->send_callback_user_data = user_data;
+}
+
+void fleece_comms_set_receive_callback(FleeceComms* comms, FleeceCommsReceiveCallback callback, void* user_data) {
+    if (!comms) return;
+
+    comms->receive_callback = callback;
+    comms->receive_callback_user_data = user_data;
 }

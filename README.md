@@ -1,6 +1,6 @@
 # Fleece - Lightweight Swarm Coordination Runtime
 
-fleece is a **lightweight, decentralized swarm coordination runtime** designed for **microcontrollers**. It leverages **QuickJS** for logic execution and **Reticulum** for robust, peer-to-peer, mesh-based communication.
+fleece is a **lightweight, decentralized swarm coordination runtime** designed for **microcontrollers**.
 
 ## Key Features
 
@@ -16,14 +16,8 @@ fleece is a **lightweight, decentralized swarm coordination runtime** designed f
 - C-to-JS bindings for native system access
 - Sandboxed execution for security
 
-### 🌐 Mesh Messaging
-- **Reticulum P2P protocol** abstraction layer
-- Robust communication over **volatile wireless topologies**
-- Automatic network discovery and topology management
-- Built-in encryption and packet delivery guarantees
-
-### 📦 CBOR State
-- **Compact serialization** for bandwidth-limited links
+### 📦 Gossip State
+- **Compact binary framing** for bandwidth-limited links (not CBOR - a small length-prefixed record format, see `src/state/fleece_state_manager.c`)
 - Binary format optimized for microcontroller constraints
 - Efficient field-level versioning and conflict resolution
 
@@ -61,10 +55,10 @@ The core execution model follows a synchronized **4-phase coordination cycle**:
 - No central authority or master nodes
 
 ### Serialization
-- **CBOR (Concise Binary Object Representation)** for all state
+- **Compact binary gossip frame** for all state (not CBOR - see `fleece_state_manager_export`/`_import`)
 - **Minimal overhead** for bandwidth-constrained links
-- **Hierarchical field-level versioning**
-- **Efficient delta encoding** for partial updates
+- **Field-level versioning** via per-field timestamp + owner node id
+- Full-state export per gossip round (no delta encoding yet)
 
 ### Constraints
 - **Memory-optimized data structures**
@@ -250,9 +244,8 @@ MIT License - See LICENSE file for details
 ## Future Work
 
 ### Planned Enhancements
-1. **Full QuickJS integration** with native bindings
-2. **CBOR implementation** for state serialization
-3. **Reticulum integration** for real mesh networking
+1. **Real transport for comms** (Reticulum/radio) - the comm bus is currently a single-process simulation
+2. **CBOR (or similar) implementation** for state serialization - state currently uses a simpler custom binary gossip frame
 4. **Hardware-specific optimizations** (ESP32, STM32, etc.)
 5. **More example applications** (leader election, foraging, etc.)
 6. **Performance profiling** and optimization

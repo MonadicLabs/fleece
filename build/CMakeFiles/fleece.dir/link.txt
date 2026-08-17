@@ -1,2 +1,0 @@
-/usr/bin/ar qc libfleece.a CMakeFiles/fleece.dir/src/comms/fleece_comms.c.o CMakeFiles/fleece.dir/src/core/fleece_core.c.o CMakeFiles/fleece.dir/src/embedded/fleece_embedded.c.o CMakeFiles/fleece.dir/src/runtime/fleece_runtime.c.o CMakeFiles/fleece.dir/src/state/fleece_state_manager.c.o
-/usr/bin/ranlib libfleece.a

@@ -151,11 +151,8 @@ int fleece_core_run(FleeceCore* core) {
         // Phase 1: Input (Sensors/Radio)
         printf("Phase 1: Processing sensor inputs and radio packets\n");
         
-        // Phase 2: Gossip (State Synchronization)
-        if (core->state_manager) {
-            fleece_state_manager_gossip(core->state_manager);
-        }
-        
+        // Phase 2: Gossip (State Synchronization) - see fleece_runtime.c for the live gossip path
+
         // Phase 3: Script Execution (QuickJS VM)
         if (core->embedded) {
             fleece_embedded_execute(core->embedded, "console.log('Script execution phase');");

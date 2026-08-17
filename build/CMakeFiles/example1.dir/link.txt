@@ -1,1 +1,0 @@
-/usr/bin/cc  -Os -flto -Wl,--dependency-file=CMakeFiles/example1.dir/link.d CMakeFiles/example1.dir/examples/example1.c.o -o example1  libfleece.a

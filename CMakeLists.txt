@@ -15,7 +15,10 @@ set(CMAKE_C_EXTENSIONS OFF)
 # Memory optimization flags for microcontrollers (commented out for non-ARM targets)
 # set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Os -flto -march=armv7-m -mthumb")
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Os -flto")
+# QuickJS-ng (embedded JS engine). Configure before add_subdirectory so its own
+# options don't build the qjs/qjsc CLIs or install targets as part of this project.
+set(QJS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/quickjs EXCLUDE_FROM_ALL)
 
 # Source files
 file(GLOB_RECURSE FLEECE_SRC
@@ -38,6 +41,8 @@ include_directories(
 
 # Library
 add_library(fleece ${FLEECE_SRC})
+target_compile_options(fleece PRIVATE -Os -flto)
+target_link_libraries(fleece PUBLIC qjs)
 
 # Target properties
 set_target_properties(fleece PROPERTIES
@@ -47,14 +52,15 @@ set_target_properties(fleece PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-# Tests
+# Tests: one executable + one ctest entry per tests/*.c file
 enable_testing()
 file(GLOB_RECURSE TEST_SRC "tests/*.c")
-if(TEST_SRC)
-    add_executable(fleece_tests ${TEST_SRC})
-    target_link_libraries(fleece_tests fleece)
-    add_test(NAME fleece_tests COMMAND fleece_tests)
-endif()
+foreach(test_src ${TEST_SRC})
+    get_filename_component(test_name ${test_src} NAME_WE)
+    add_executable(${test_name} ${test_src})
+    target_link_libraries(${test_name} fleece)
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endforeach()
 
 # Examples
 file(GLOB_RECURSE EXAMPLE_SRC "examples/*.c")

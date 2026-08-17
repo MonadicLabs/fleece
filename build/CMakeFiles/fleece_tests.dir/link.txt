@@ -1,1 +1,0 @@
-/usr/bin/cc  -Os -flto -Wl,--dependency-file=CMakeFiles/fleece_tests.dir/link.d CMakeFiles/fleece_tests.dir/tests/test_state_manager.c.o -o fleece_tests  libfleece.a
