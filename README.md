@@ -11,40 +11,41 @@ fleece is a **lightweight, decentralized swarm coordination runtime** designed f
 - Optimized for **low RAM usage** in microcontroller environments
 
 ### 💻 Embedded JavaScript
-- **QuickJS integration** for high-level scripting
-- Resource-aware execution for constrained hardware
-- C-to-JS bindings for native system access
+- **Real QuickJS-ng integration** (vendored as a git submodule) for high-level scripting
+- **Buzz-inspired lifecycle** ([buzz-lang/Buzz](https://github.com/buzz-lang/Buzz)): scripts define `init()`/`step()`/`reset()`/`destroy()`
+- **`self`** - a read/write object for this node's own published state
+- **`swarm`** - a read-only view of every other known node's published state, kept in sync by gossip
+- **`platform`** - a pure name→function registry for hardware bindings (fleece defines none itself - see below)
 - Sandboxed execution for security
 
 ### 📦 Gossip State
 - **Compact binary framing** for bandwidth-limited links (not CBOR - a small length-prefixed record format, see `src/state/fleece_state_manager.c`)
-- Binary format optimized for microcontroller constraints
+- **Delta gossip**: each tick sends only fields changed since the last send, with a periodic full-state resync so a peer can recover from a dropped packet
 - Efficient field-level versioning and conflict resolution
 
 ## System Architecture
 
 ### Time-Step Loop
-The core execution model follows a synchronized **4-phase coordination cycle**:
+The core execution model follows a synchronized **4-phase coordination cycle**, run once per tick after `init()` is called:
 
 1. **Phase 1: Input (Sensors/Radio)**
-   - Process sensor data and incoming radio packets
-   - Update local state from external inputs
+   - Process incoming radio packets
    - Handle wireless communication events
 
-2. **Phase 2: Gossip (State Synchronization)**
-   - Exchange state with peer nodes via mesh network
-   - Resolve conflicts using LWW semantics
-   - Maintain eventual consistency across the swarm
+2. **Phase 2: Script Execution (QuickJS VM)**
+   - Calls the script's `step()` function
+   - Reads/writes `self`, reads `swarm`, calls `platform.<name>(...)`
+   - Runs *before* gossip so any `self.xxx` change this tick is broadcast this tick, not next
 
-3. **Phase 3: Script Execution (QuickJS VM)**
-   - Run user-defined swarm logic scripts
-   - Access shared state through the LWW store
-   - Coordinate behavior based on global state
+3. **Phase 3: Gossip (State Synchronization)**
+   - Exports and broadcasts what changed in `self` since the last send (delta), full state periodically (resync)
+   - Peer frames arrive via the comms receive callback and merge into `swarm` with LWW semantics
+   - Maintains eventual consistency across the swarm
 
 4. **Phase 4: Output (Actuators/Mesh Broadcast)**
-   - Control actuators and send mesh broadcasts
-   - Disseminate updates to peer nodes
-   - Implement swarm coordination behaviors
+   - Send mesh broadcasts, disseminate updates to peer nodes
+
+`destroy()` is called once when the loop exits (e.g. on SIGINT/SIGTERM). `reset()` is callable but has no automatic trigger yet - see Future Work.
 
 ## Technical Decisions
 
@@ -55,10 +56,10 @@ The core execution model follows a synchronized **4-phase coordination cycle**:
 - No central authority or master nodes
 
 ### Serialization
-- **Compact binary gossip frame** for all state (not CBOR - see `fleece_state_manager_export`/`_import`)
+- **Compact binary gossip frame** for all state (not CBOR - see `fleece_state_manager_export`/`_import`/`_export_delta`)
 - **Minimal overhead** for bandwidth-constrained links
 - **Field-level versioning** via per-field timestamp + owner node id
-- Full-state export per gossip round (no delta encoding yet)
+- **Delta export** by default (only fields changed since a watermark timestamp), with a full export every `FLEECE_GOSSIP_FULL_RESYNC_TICKS` ticks as anti-entropy
 
 ### Constraints
 - **Memory-optimized data structures**
@@ -93,7 +94,8 @@ The core execution model follows a synchronized **4-phase coordination cycle**:
 #### FleeceRuntime
 ```c
 FleeceRuntime* runtime = fleece_runtime_create();
-fleece_runtime_start(runtime); // Main 4-phase loop
+fleece_runtime_load_script(runtime, script_source); // defines init/step/reset/destroy
+fleece_runtime_start(runtime);                      // calls init(), then the 4-phase loop, then destroy()
 fleece_runtime_destroy(runtime);
 ```
 
@@ -112,14 +114,6 @@ fleece_state_manager_exists(manager, key);
 fleece_state_manager_remove(manager, key);
 ```
 
-#### FleeceCore
-```c
-FleeceCore* core = fleece_core_create();
-fleece_core_initialize(core);
-fleece_core_run(core); // Execute coordination loop
-fleece_core_destroy(core);
-```
-
 #### FleeceComms
 ```c
 FleeceComms* comms = fleece_comms_create();
@@ -131,8 +125,32 @@ fleece_comms_process_output(comms);
 #### FleeceEmbedded
 ```c
 FleeceEmbedded* embedded = fleece_embedded_create();
-fleece_embedded_execute(embedded, "console.log('Hello from fleece!');");
+fleece_embedded_set_state_manager(embedded, manager);   // backs self/swarm
+fleece_embedded_set_platform(embedded, platform);        // optional - backs platform.<name>()
+fleece_embedded_register_c_functions(embedded);           // installs console/self/swarm/platform
+
+fleece_embedded_load_script(embedded,
+    "function step() {\n"
+    "  self.status = 'ok';\n"
+    "  console.log('id', self.id, 'peers', Object.keys(swarm).length);\n"
+    "}\n", "<script>");
+fleece_embedded_call_step(embedded);
 fleece_embedded_destroy(embedded);
+```
+(`fleece_runtime_*` does all of this wiring for you - the snippet above is what it does internally.)
+
+#### FleecePlatform
+A pure name→function registry - fleece defines **no** functions of its own (no `arm`, no `moveTo`, nothing robot-specific). Register whatever verbs fit your actual hardware, and scripts call them as `platform.<name>(...)`. With nothing registered, `platform` is simply empty.
+```c
+static int my_stop(const uint8_t* args_json, uint32_t args_size,
+                    uint8_t** result_json, uint32_t* result_size, void* user_data) {
+    // interpret args_json however this hardware needs to, then act on it
+    return 0; // or -1 to surface as a thrown JS exception
+}
+
+FleecePlatform* platform = fleece_runtime_get_platform(runtime);
+fleece_platform_register(platform, "stop", my_stop, NULL);
+// script: platform.stop();
 ```
 
 ## Directory Structure
@@ -143,18 +161,25 @@ fleece/
 │   ├── runtime/           # Runtime interface headers
 │   ├── state/             # State manager interface
 │   ├── comms/            # Comms interface
-│   ├── embedded/         # Embedded JS interface
-│   └── core/             # Core system interface
+│   ├── embedded/         # Embedded JS interface (self/swarm/platform bindings)
+│   ├── platform/         # Platform function registry interface
+│   └── core/             # Dead/unused parallel runtime - not wired into anything
 ├── src/
 │   ├── runtime/          # Runtime implementation
 │   ├── state/            # State manager implementation
-│   ├── comms/           # Comms implementation
-│   ├── embedded/        # Embedded JS implementation
-│   └── core/            # Core implementation
+│   ├── comms/           # Comms implementation (single-process simulation, no real transport)
+│   ├── embedded/        # QuickJS-ng integration and self/swarm/platform bindings
+│   ├── platform/        # Platform function registry implementation
+│   └── core/            # Dead/unused - see include/core
+├── third_party/
+│   └── quickjs/          # QuickJS-ng, git submodule
 ├── examples/             # Example applications
 │   └── example1.c       # Basic swarm coordination example
-├── tests/                # Unit tests
-│   └── test_state_manager.c # State manager LWW tests
+├── tests/                # Unit tests (one executable per file, run via ctest)
+│   ├── test_state_manager.c # Raw LWW store tests
+│   ├── test_gossip.c        # Export/import/merge/delta wire format tests
+│   ├── test_embedded.c      # self/swarm QuickJS binding tests
+│   └── test_platform.c      # Platform registry + JS binding tests
 ├── CMakeLists.txt        # Build system
 ├── README.md            # Project documentation
 └── CLAUDE.md            # Development guidelines
@@ -169,6 +194,7 @@ fleece/
 
 ### Building
 ```bash
+git submodule update --init --recursive   # fetches QuickJS-ng (third_party/quickjs)
 mkdir build && cd build
 cmake ..
 make -j4
@@ -176,7 +202,8 @@ make -j4
 
 ### Running Tests
 ```bash
-./build/fleece_tests
+cd build && ctest --output-on-failure
+# or run an individual binary directly, e.g. ./build/test_embedded
 ```
 
 ### Running Examples
@@ -204,9 +231,11 @@ if (fleece_state_manager_get(state_manager, 0x0001, &data, &size) == 0) {
 
 ### Script Execution
 ```c
-// Execute JavaScript that processes swarm state
-fleece_embedded_execute(embedded, 
-    "if (shared_state.temperature > threshold) { act.cool(); }");
+// self/swarm/platform are real Proxy-backed globals once
+// fleece_embedded_register_c_functions() (or fleece_runtime_create()) has run.
+// 'cool' is only callable if something called fleece_platform_register(platform, "cool", ...).
+fleece_embedded_execute(embedded,
+    "if (self.temperature > threshold && 'cool' in platform) platform.cool();");
 ```
 
 ### Mesh Communication
@@ -246,10 +275,11 @@ MIT License - See LICENSE file for details
 ### Planned Enhancements
 1. **Real transport for comms** (Reticulum/radio) - the comm bus is currently a single-process simulation
 2. **CBOR (or similar) implementation** for state serialization - state currently uses a simpler custom binary gossip frame
-4. **Hardware-specific optimizations** (ESP32, STM32, etc.)
-5. **More example applications** (leader election, foraging, etc.)
-6. **Performance profiling** and optimization
-7. **Unit test coverage** improvements
+3. **A `reset()` trigger** - the lifecycle function is callable but nothing in the runtime calls it automatically yet
+4. **Real hardware platform bindings** (e.g. a MAVLink or ROS2 integration registering functions via `fleece_platform_register`) - the registry exists but ships with nothing registered
+5. **Hardware-specific optimizations** (ESP32, STM32, etc.) and validation on an actual microcontroller target (currently desktop POSIX only)
+6. **More example applications** (leader election, foraging, etc.)
+7. **Performance profiling** and optimization
 8. **Documentation updates** and tutorials
 
 ### Design Considerations

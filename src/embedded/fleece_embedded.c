@@ -8,6 +8,7 @@
 
 #include "fleece_embedded.h"
 #include "state/fleece_state_manager.h"
+#include "platform/fleece_platform.h"
 
 // Generous defaults for a desktop demo build; a real microcontroller target
 // would tune these down (or size them to the target's actual RAM budget).
@@ -20,16 +21,19 @@ struct FleeceEmbedded {
     JSRuntime* rt;
     JSContext* ctx;
     FleeceStateManager* manager;
+    FleecePlatform* platform;
 };
 
-// --- self/swarm Proxy support (evaluated once, wires natives into globalThis.self/swarm) ---
+// --- self/swarm/platform Proxy support (evaluated once, wires natives into
+// globalThis.self/swarm/platform) ---
 // JSON marshalling happens in C (JS_ParseJSON/JS_JSONStringify); the prelude only
 // forwards Proxy trap calls to the native helpers below.
-static const char* SELF_SWARM_PRELUDE =
+static const char* FLEECE_JS_PRELUDE =
     "(function() {\n"
     "  var self_get = __self_get, self_set = __self_set, self_delete = __self_delete,\n"
     "      self_keys = __self_keys, self_id = __self_id,\n"
-    "      swarm_nodes = __swarm_nodes, swarm_get = __swarm_get, swarm_keys = __swarm_keys;\n"
+    "      swarm_nodes = __swarm_nodes, swarm_get = __swarm_get, swarm_keys = __swarm_keys,\n"
+    "      platform_names = __platform_names, platform_call = __platform_call;\n"
     "\n"
     "  function makeNodeView(id) {\n"
     "    return new Proxy({}, {\n"
@@ -85,9 +89,29 @@ static const char* SELF_SWARM_PRELUDE =
     "    deleteProperty: function() { return false; }\n"
     "  });\n"
     "\n"
+    "  function makePlatformFunction(name) {\n"
+    "    return function() { return platform_call(name, Array.prototype.slice.call(arguments)); };\n"
+    "  }\n"
+    "\n"
+    "  globalThis.platform = new Proxy({}, {\n"
+    "    get: function(t, p, r) {\n"
+    "      if (typeof p !== 'string') return Reflect.get(t, p, r);\n"
+    "      return platform_names().indexOf(p) === -1 ? undefined : makePlatformFunction(p);\n"
+    "    },\n"
+    "    has: function(t, p) { return typeof p === 'string' ? platform_names().indexOf(p) !== -1 : Reflect.has(t, p); },\n"
+    "    ownKeys: function() { return platform_names(); },\n"
+    "    getOwnPropertyDescriptor: function(t, p) {\n"
+    "      if (typeof p !== 'string' || platform_names().indexOf(p) === -1) return undefined;\n"
+    "      return { value: makePlatformFunction(p), writable: false, enumerable: true, configurable: true };\n"
+    "    },\n"
+    "    set: function() { return false; },\n"
+    "    deleteProperty: function() { return false; }\n"
+    "  });\n"
+    "\n"
     "  delete globalThis.__self_get; delete globalThis.__self_set; delete globalThis.__self_delete;\n"
     "  delete globalThis.__self_keys; delete globalThis.__self_id;\n"
     "  delete globalThis.__swarm_nodes; delete globalThis.__swarm_get; delete globalThis.__swarm_keys;\n"
+    "  delete globalThis.__platform_names; delete globalThis.__platform_call;\n"
     "})();\n";
 
 static FleeceEmbedded* get_embedded(JSContext* ctx) {
@@ -338,6 +362,77 @@ static JSValue js_swarm_keys(JSContext* ctx, JSValueConst this_val, int argc, JS
     return names_to_js_array(ctx, names, count);
 }
 
+static JSValue js_platform_names(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    (void)this_val; (void)argc; (void)argv;
+    FleeceEmbedded* emb = get_embedded(ctx);
+    if (!emb || !emb->platform) return JS_NewArray(ctx);
+
+    char names[FLEECE_JS_LIST_MAX][FLEECE_PLATFORM_FUNCTION_NAME_MAX];
+    uint32_t count = fleece_platform_list_functions(emb->platform, names, FLEECE_JS_LIST_MAX);
+    return names_to_js_array(ctx, names, count);
+}
+
+// Calls a registered platform function: argv[0] is the name, argv[1] is a JS
+// array of the caller's arguments. Marshals to/from JSON at this boundary so
+// fleece_platform itself stays engine-agnostic (see fleece_platform.h).
+static JSValue js_platform_call(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    (void)this_val;
+    FleeceEmbedded* emb = get_embedded(ctx);
+    if (!emb || !emb->platform || argc < 2) {
+        return JS_ThrowTypeError(ctx, "platform: call requires a name and an argument list");
+    }
+
+    const char* name = JS_ToCString(ctx, argv[0]);
+    if (!name) return JS_EXCEPTION;
+
+    JSValue args_json_val = JS_JSONStringify(ctx, argv[1], JS_UNDEFINED, JS_UNDEFINED);
+    if (JS_IsException(args_json_val)) {
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
+    size_t args_len = 0;
+    const char* args_text = JS_ToCStringLen(ctx, &args_len, args_json_val);
+    JS_FreeValue(ctx, args_json_val);
+    if (!args_text) {
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
+
+    uint8_t* result_json = NULL;
+    uint32_t result_size = 0;
+    int rc = fleece_platform_call(emb->platform, name, (const uint8_t*)args_text, (uint32_t)args_len, &result_json, &result_size);
+    JS_FreeCString(ctx, args_text);
+
+    if (rc != 0) {
+        JSValue err = JS_ThrowTypeError(ctx, "platform.%s: call failed", name);
+        JS_FreeCString(ctx, name);
+        return err;
+    }
+    JS_FreeCString(ctx, name);
+
+    if (!result_json || result_size == 0) {
+        free(result_json);
+        return JS_UNDEFINED;
+    }
+
+    char* scratch = (char*)malloc((size_t)result_size + 1);
+    if (!scratch) {
+        free(result_json);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    memcpy(scratch, result_json, result_size);
+    scratch[result_size] = '\0';
+    free(result_json);
+
+    JSValue result = JS_ParseJSON(ctx, scratch, result_size, "<platform result>");
+    free(scratch);
+    if (JS_IsException(result)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return JS_UNDEFINED;
+    }
+    return result;
+}
+
 FleeceEmbedded* fleece_embedded_create(void) {
     FleeceEmbedded* embedded = (FleeceEmbedded*)calloc(1, sizeof(FleeceEmbedded));
     if (!embedded) {
@@ -378,6 +473,13 @@ int fleece_embedded_set_state_manager(FleeceEmbedded* embedded, FleeceStateManag
     return 0;
 }
 
+int fleece_embedded_set_platform(FleeceEmbedded* embedded, FleecePlatform* platform) {
+    if (!embedded || !platform) return -1;
+
+    embedded->platform = platform;
+    return 0;
+}
+
 int fleece_embedded_register_c_functions(FleeceEmbedded* embedded) {
     if (!embedded || !embedded->ctx || !embedded->manager) {
         return -1;
@@ -398,10 +500,12 @@ int fleece_embedded_register_c_functions(FleeceEmbedded* embedded) {
     JS_SetPropertyStr(ctx, global, "__swarm_nodes", JS_NewCFunction(ctx, js_swarm_nodes, "__swarm_nodes", 0));
     JS_SetPropertyStr(ctx, global, "__swarm_get", JS_NewCFunction(ctx, js_swarm_get, "__swarm_get", 2));
     JS_SetPropertyStr(ctx, global, "__swarm_keys", JS_NewCFunction(ctx, js_swarm_keys, "__swarm_keys", 1));
+    JS_SetPropertyStr(ctx, global, "__platform_names", JS_NewCFunction(ctx, js_platform_names, "__platform_names", 0));
+    JS_SetPropertyStr(ctx, global, "__platform_call", JS_NewCFunction(ctx, js_platform_call, "__platform_call", 2));
 
     JS_FreeValue(ctx, global);
 
-    JSValue prelude_result = JS_Eval(ctx, SELF_SWARM_PRELUDE, strlen(SELF_SWARM_PRELUDE), "<prelude>", JS_EVAL_TYPE_GLOBAL);
+    JSValue prelude_result = JS_Eval(ctx, FLEECE_JS_PRELUDE, strlen(FLEECE_JS_PRELUDE), "<prelude>", JS_EVAL_TYPE_GLOBAL);
     int rc = 0;
     if (JS_IsException(prelude_result)) {
         dump_exception(ctx);

@@ -13,6 +13,7 @@ extern "C" {
 
 typedef struct FleeceEmbedded FleeceEmbedded;
 typedef struct FleeceStateManager FleeceStateManager;
+typedef struct FleecePlatform FleecePlatform;
 
 // Create a new embedded JS instance
 FleeceEmbedded* fleece_embedded_create(void);
@@ -25,8 +26,15 @@ void fleece_embedded_destroy(FleeceEmbedded* embedded);
 // fleece_embedded_register_c_functions().
 int fleece_embedded_set_state_manager(FleeceEmbedded* embedded, FleeceStateManager* manager);
 
-// Register the native bindings (console.log, self, swarm) with the JS context.
-// Requires fleece_embedded_set_state_manager() to have been called first.
+// Bind the platform function registry backing the "platform" script global
+// (see include/platform/fleece_platform.h - fleece defines no functions of its
+// own, only the registry). Optional: if never called, "platform" is empty.
+// Call before fleece_embedded_register_c_functions().
+int fleece_embedded_set_platform(FleeceEmbedded* embedded, FleecePlatform* platform);
+
+// Register the native bindings (console.log, self, swarm, platform) with the
+// JS context. Requires fleece_embedded_set_state_manager() to have been
+// called first.
 int fleece_embedded_register_c_functions(FleeceEmbedded* embedded);
 
 // Evaluate a script's source once. Top-level function declarations (e.g.

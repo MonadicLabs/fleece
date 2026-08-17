@@ -26,6 +26,7 @@ file(GLOB_RECURSE FLEECE_SRC
     "src/state/*.c"
     "src/comms/*.c"
     "src/embedded/*.c"
+    "src/platform/*.c"
     "src/core/*.c"
 )
 

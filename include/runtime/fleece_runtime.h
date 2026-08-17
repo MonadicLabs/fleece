@@ -46,6 +46,11 @@ void* fleece_runtime_get_comms(FleeceRuntime* runtime);
 // Get the embedded JS engine from runtime
 void* fleece_runtime_get_embedded(FleeceRuntime* runtime);
 
+// Get the platform function registry from runtime (see include/platform/fleece_platform.h).
+// Register hardware-specific functions on it (fleece_platform_register) before
+// fleece_runtime_start() to make them callable from script as platform.<name>(...).
+void* fleece_runtime_get_platform(FleeceRuntime* runtime);
+
 #ifdef __cplusplus
 }
 #endif

@@ -11,6 +11,7 @@
 #include "fleece_state_manager.h"
 #include "fleece_comms.h"
 #include "fleece_embedded.h"
+#include "platform/fleece_platform.h"
 
 // Runtime implementation
 
@@ -23,6 +24,7 @@ struct FleeceRuntime {
     FleeceStateManager* state_manager;
     FleeceComms* comms;
     FleeceEmbedded* embedded;
+    FleecePlatform* platform;
     pthread_t main_thread;
     int script_fd;
     uint64_t gossip_watermark;   // local timestamp as of the last gossip send
@@ -57,13 +59,15 @@ FleeceRuntime* fleece_runtime_create(void) {
     runtime->state_manager = fleece_state_manager_create();
     runtime->comms = fleece_comms_create();
     runtime->embedded = fleece_embedded_create();
+    runtime->platform = fleece_platform_create();
 
-    if (!runtime->state_manager || !runtime->comms || !runtime->embedded) {
+    if (!runtime->state_manager || !runtime->comms || !runtime->embedded || !runtime->platform) {
         fleece_runtime_destroy(runtime);
         return NULL;
     }
 
     fleece_embedded_set_state_manager(runtime->embedded, runtime->state_manager);
+    fleece_embedded_set_platform(runtime->embedded, runtime->platform);
     fleece_embedded_register_c_functions(runtime->embedded);
 
     // The runtime owns the comms receive slot: gossip frames from peers land here.
@@ -81,6 +85,10 @@ void fleece_runtime_destroy(FleeceRuntime* runtime) {
 
     if (runtime->embedded) {
         fleece_embedded_destroy(runtime->embedded);
+    }
+
+    if (runtime->platform) {
+        fleece_platform_destroy(runtime->platform);
     }
 
     if (runtime->comms) {
@@ -183,4 +191,8 @@ void* fleece_runtime_get_comms(FleeceRuntime* runtime) {
 
 void* fleece_runtime_get_embedded(FleeceRuntime* runtime) {
     return runtime ? runtime->embedded : NULL;
+}
+
+void* fleece_runtime_get_platform(FleeceRuntime* runtime) {
+    return runtime ? runtime->platform : NULL;
 }
