@@ -51,6 +51,7 @@
 #include "runtime/fleece_runtime.h"
 #include "comms/fleece_comms.h"
 #include "state/fleece_state_manager.h"
+#include "example_common.h"
 
 #define MULTICAST_GROUP "239.1.1.1"
 #define MULTICAST_PORT 5555
@@ -150,118 +151,6 @@ static void udp_on_comms_poll(void* user_data) {
     }
 }
 
-static const char* SCRIPT =
-    "var TARGETS = {\n"
-    "  T1: { x: 10, y: 80, type: 'debris' },\n"
-    "  T2: { x: 70, y: 20, type: 'survivor' },\n"
-    "  T3: { x: 40, y: 50, type: 'debris' }\n"
-    "};\n"
-    "var SETTLE_TICKS = 5;    // consecutive ticks a claim must hold before delivering\n"
-    "var DISCOVERY_TICK = 2;  // tick at which each agent publishes any target it doesn't yet see\n"
-    "\n"
-    "function dist(a, b) {\n"
-    "  var dx = a.x - b.x, dy = a.y - b.y;\n"
-    "  return Math.sqrt(dx * dx + dy * dy);\n"
-    "}\n"
-    "\n"
-    "function scoreFor(targetId) {\n"
-    "  return -dist(self, TARGETS[targetId]);  // higher (closer to 0) = better\n"
-    "}\n"
-    "\n"
-    "// FNV-1a-ish string hash, deterministic per node id (unlike Math.random(),\n"
-    "// which can seed identically across processes started in the same instant -\n"
-    "// observed in practice: two agents launched together landing on the exact\n"
-    "// same 'random' position). A node's id is already guaranteed distinct, so\n"
-    "// deriving position from it guarantees distinct (and reproducible) starting\n"
-    "// positions too.\n"
-    "function hashStr(s) {\n"
-    "  var h = 2166136261;\n"
-    "  for (var i = 0; i < s.length; i++) {\n"
-    "    h = h ^ s.charCodeAt(i);\n"
-    "    h = (h * 16777619) >>> 0;\n"
-    "  }\n"
-    "  return h >>> 0;\n"
-    "}\n"
-    "\n"
-    "function init() {\n"
-    "  var h = hashStr(self.id);\n"
-    "  self.x = (h % 10007) / 10007 * 100;\n"
-    "  self.y = ((h >>> 12) % 10007) / 10007 * 100;\n"
-    "  self.myTask = null;\n"
-    "  self.holdTicks = 0;\n"
-    "  self.delivered = 0;\n"
-    "  console.log('agent', self.id, 'ready at (' + self.x.toFixed(1) + ',' + self.y.toFixed(1) + ')');\n"
-    "}\n"
-    "\n"
-    "function step() {\n"
-    "  self.uptime = (self.uptime || 0) + 1;\n"
-    "\n"
-    "  if (self.uptime === DISCOVERY_TICK) {\n"
-    "    for (var id in TARGETS) {\n"
-    "      if (!(id in world)) {\n"
-    "        var t = TARGETS[id];\n"
-    "        world[id] = { x: t.x, y: t.y, type: t.type, status: 'unclaimed', assignedTo: null, bidScore: null };\n"
-    "        console.log('agent', self.id, 'published target', id);\n"
-    "      }\n"
-    "    }\n"
-    "  }\n"
-    "\n"
-    "  if (self.myTask !== null) {\n"
-    "    var mine = world[self.myTask];\n"
-    "    if (!mine || mine.assignedTo !== self.id) {\n"
-    "      console.log('agent', self.id, 'lost claim on', self.myTask, '- re-entering bid pool');\n"
-    "      self.myTask = null;\n"
-    "      self.holdTicks = 0;\n"
-    "    } else if (mine.status === 'claimed') {\n"
-    "      self.holdTicks++;\n"
-    "      if (self.holdTicks >= SETTLE_TICKS) {\n"
-    "        var delivered = Object.assign({}, mine, { status: 'delivered' });\n"
-    "        if (worldCompareAndSet(self.myTask, mine, delivered)) {\n"
-    "          console.log('agent', self.id, 'DELIVERED', self.myTask);\n"
-    "          self.delivered++;\n"
-    "          self.myTask = null;\n"
-    "          self.holdTicks = 0;\n"
-    "        }\n"
-    "      }\n"
-    "    }\n"
-    "  } else {\n"
-    "    var bestId = null, bestScore = -Infinity, bestCurrent = null;\n"
-    "    for (var tid in TARGETS) {\n"
-    "      var current = world[tid];\n"
-    "      if (!current || current.status === 'delivered') continue;\n"
-    "      var myScore = scoreFor(tid);\n"
-    "      var eligible = current.status === 'unclaimed' || myScore > current.bidScore;\n"
-    "      if (eligible && myScore > bestScore) {\n"
-    "        bestScore = myScore;\n"
-    "        bestId = tid;\n"
-    "        bestCurrent = current;\n"
-    "      }\n"
-    "    }\n"
-    "    if (bestId !== null) {\n"
-    "      var claimed = Object.assign({}, bestCurrent, { status: 'claimed', assignedTo: self.id, bidScore: bestScore });\n"
-    "      if (worldCompareAndSet(bestId, bestCurrent, claimed)) {\n"
-    "        self.myTask = bestId;\n"
-    "        self.holdTicks = 0;\n"
-    "        console.log('agent', self.id, 'claimed', bestId, 'score', bestScore.toFixed(2));\n"
-    "      }\n"
-    "    }\n"
-    "  }\n"
-    "\n"
-    "  var allDelivered = true;\n"
-    "  for (var k in TARGETS) {\n"
-    "    var c = world[k];\n"
-    "    if (!c || c.status !== 'delivered') { allDelivered = false; break; }\n"
-    "  }\n"
-    "  if (allDelivered && !self.announcedDone) {\n"
-    "    self.announcedDone = true;\n"
-    "    console.log('agent', self.id, ': all targets delivered');\n"
-    "  }\n"
-    "}\n"
-    "\n"
-    "function destroy() {\n"
-    "  console.log('agent', self.id, 'shutting down, delivered', self.delivered, 'target(s)');\n"
-    "}\n";
-
 int main(int argc, char** argv) {
     int agent_num = argc > 1 ? atoi(argv[1]) : 1;
     if (agent_num <= 0) agent_num = 1;
@@ -298,8 +187,14 @@ int main(int argc, char** argv) {
     fleece_comms_set_send_callback(comms, udp_on_comms_send, &transport);
     fleece_comms_set_poll_callback(comms, udp_on_comms_poll, &transport);
 
-    if (fleece_runtime_load_script(runtime, SCRIPT) != 0) {
-        fprintf(stderr, "Failed to load script\n");
+    char* script = fleece_example_load_script(argv[0], "example2_search_and_deliver.js");
+    if (!script) {
+        fprintf(stderr, "Failed to locate example2_search_and_deliver.js (expected alongside examples/, near the executable)\n");
+    } else {
+        if (fleece_runtime_load_script(runtime, script) != 0) {
+            fprintf(stderr, "Failed to load script\n");
+        }
+        free(script);
     }
 
     printf("Starting runtime...\n");

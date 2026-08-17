@@ -205,11 +205,12 @@ fleece/
 ├── third_party/
 │   └── quickjs/          # QuickJS-ng, git submodule
 ├── examples/             # Example applications (one executable per .c file)
-│   ├── example1.c       # Basic swarm coordination example (single process, simulated peer loopback)
-│   ├── example2_search_and_deliver.c  # Search + CBAA task allocation + delivery over real UDP multicast (multi-process)
-│   ├── run_swarm.sh     # Launches N example2 agents as real processes with prefixed, interleaved output
-│   ├── example3_embodied_swarm.c  # Same, but with real 2D position/speed/arrival via a "platform" binding (multi-process)
-│   └── run_swarm3.sh    # Launches N example3 agents, same idea as run_swarm.sh
+│   ├── example1.c / .js               # Basic swarm coordination example (single process, simulated peer loopback)
+│   ├── example2_search_and_deliver.c / .js  # Search + CBAA task allocation + delivery over real UDP multicast (multi-process)
+│   ├── run_swarm.sh                   # Launches N example2 agents as real processes with prefixed, interleaved output
+│   ├── example3_embodied_swarm.c / .js      # Same, but with real 2D position/speed/arrival via a "platform" binding (multi-process)
+│   ├── run_swarm3.sh                  # Launches N example3 agents, same idea as run_swarm.sh
+│   └── example_common.h               # Shared helper: loads each example's companion .js file from disk (see below)
 ├── tests/                # Unit tests (one executable per file, run via ctest)
 │   ├── test_state_manager.c # Raw LWW store tests
 │   ├── test_gossip.c        # Export/import/merge/delta wire format tests
@@ -243,6 +244,7 @@ cd build && ctest --output-on-failure
 ```
 
 ### Running Examples
+Each example's script lives in a companion `.js` file next to its `.c` file (e.g. `examples/example1.js`) rather than embedded in the binary, and is loaded from disk at startup (see `examples/example_common.h`). Run the binaries from `build/` as shown below - each one locates its own script relative to its own location, so this works regardless of your current directory.
 ```bash
 # Basic swarm coordination example (single process)
 ./build/example1

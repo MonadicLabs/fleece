@@ -4,6 +4,7 @@
 #include "runtime/fleece_runtime.h"
 #include "comms/fleece_comms.h"
 #include "state/fleece_state_manager.h"
+#include "example_common.h"
 
 // Comms is still a single-process simulation (no real socket transport), so there is
 // no second process to actually gossip with. This struct wires the send callback up
@@ -45,41 +46,8 @@ static void on_comms_send(const char* destination, const uint8_t* data, uint32_t
     }
 }
 
-static const char* SCRIPT =
-    "function init() {\n"
-    "  self.role = 'coordinator';\n"
-    "  self.battery = 100;\n"
-    "  console.log('init: node', self.id, 'ready');\n"
-    "}\n"
-    "\n"
-    "function step() {\n"
-    "  self.uptime = (self.uptime || 0) + 1;\n"
-    "\n"
-    "  if (self.uptime === 3) {\n"
-    "    world.T1 = { lat: 42.1, lon: -71.05, type: 'debris', confidence: 0.87 };\n"
-    "    console.log('discovered target T1');\n"
-    "  }\n"
-    "\n"
-    "  var peers = Object.keys(swarm);\n"
-    "  console.log('step', self.uptime, '- self.battery =', self.battery, '- peers:', peers.length);\n"
-    "  for (var i = 0; i < peers.length; i++) {\n"
-    "    var id = peers[i];\n"
-    "    console.log('  swarm[' + id + '] =', JSON.stringify(swarm[id]));\n"
-    "  }\n"
-    "\n"
-    "  var knownWorld = Object.keys(world);\n"
-    "  console.log('  world:', JSON.stringify(knownWorld));\n"
-    "  for (var j = 0; j < knownWorld.length; j++) {\n"
-    "    var t = knownWorld[j];\n"
-    "    console.log('    world[' + t + '] =', JSON.stringify(world[t]));\n"
-    "  }\n"
-    "}\n"
-    "\n"
-    "function destroy() {\n"
-    "  console.log('destroy: node shutting down after', self.uptime, 'step(s)');\n"
-    "}\n";
-
-int main(void) {
+int main(int argc, char** argv) {
+    (void)argc;
     printf("Fleece Swarm Coordination Example 1\n");
     printf("===================================\n\n");
 
@@ -116,8 +84,14 @@ int main(void) {
         fleece_comms_set_send_callback(comms, on_comms_send, &loopback);
     }
 
-    if (fleece_runtime_load_script(runtime, SCRIPT) != 0) {
-        fprintf(stderr, "Failed to load script\n");
+    char* script = fleece_example_load_script(argv[0], "example1.js");
+    if (!script) {
+        fprintf(stderr, "Failed to locate example1.js (expected alongside examples/, near the executable)\n");
+    } else {
+        if (fleece_runtime_load_script(runtime, script) != 0) {
+            fprintf(stderr, "Failed to load script\n");
+        }
+        free(script);
     }
 
     // Run the runtime
