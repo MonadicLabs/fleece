@@ -14,6 +14,10 @@
 
 // Runtime implementation
 
+// How often (in loop ticks) to send a full gossip export instead of a delta,
+// so peers eventually recover from a dropped packet without waiting forever.
+#define FLEECE_GOSSIP_FULL_RESYNC_TICKS 50
+
 struct FleeceRuntime {
     volatile sig_atomic_t is_running;
     FleeceStateManager* state_manager;
@@ -21,6 +25,8 @@ struct FleeceRuntime {
     FleeceEmbedded* embedded;
     pthread_t main_thread;
     int script_fd;
+    uint64_t gossip_watermark;   // local timestamp as of the last gossip send
+    uint32_t gossip_tick_count;
 };
 
 static FleeceRuntime* global_runtime = NULL;
@@ -115,17 +121,26 @@ int fleece_runtime_start(FleeceRuntime* runtime) {
         // Phase 1: Input (Sensors/Radio)
         fleece_comms_process_input(runtime->comms);
 
-        // Phase 2: Gossip (State Synchronization) - broadcast our own fields;
-        // peers' fields arrive via runtime_gossip_receive() and merge into swarm.
+        // Phase 2: Script Execution (QuickJS VM) - runs before gossip so any
+        // self.xxx changes made this tick are broadcast this tick, not next.
+        fleece_embedded_call_step(runtime->embedded);
+
+        // Phase 3: Gossip (State Synchronization) - broadcast what changed since
+        // the last send (delta), with a periodic full resync so a peer can
+        // recover from a dropped packet instead of missing that update forever.
+        // Peers' fields arrive via runtime_gossip_receive() and merge into swarm.
+        bool full_resync = (runtime->gossip_tick_count % FLEECE_GOSSIP_FULL_RESYNC_TICKS) == 0;
         uint8_t* gossip_frame = NULL;
         uint32_t gossip_size = 0;
-        if (fleece_state_manager_export(runtime->state_manager, &gossip_frame, &gossip_size) == 0) {
+        int gossip_rc = full_resync
+            ? fleece_state_manager_export(runtime->state_manager, &gossip_frame, &gossip_size)
+            : fleece_state_manager_export_delta(runtime->state_manager, runtime->gossip_watermark, &gossip_frame, &gossip_size);
+        if (gossip_rc == 0) {
             fleece_comms_send(runtime->comms, "broadcast", gossip_frame, gossip_size);
             free(gossip_frame);
         }
-
-        // Phase 3: Script Execution (QuickJS VM)
-        fleece_embedded_call_step(runtime->embedded);
+        runtime->gossip_watermark = fleece_state_manager_get_local_timestamp(runtime->state_manager);
+        runtime->gossip_tick_count++;
 
         // Phase 4: Output (Actuators/Mesh Broadcast)
         fleece_comms_process_output(runtime->comms);

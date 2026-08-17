@@ -152,6 +152,48 @@ static void test_malformed_frames(void) {
     printf("Done: malformed frame test (no crash)\n");
 }
 
+static void test_delta_export(void) {
+    printf("Running delta export test...\n");
+
+    FleeceStateManager* a = fleece_state_manager_create_with_node_id(0xB0B0B0B0B0B0B0B0ULL);
+    FleeceStateManager* b = fleece_state_manager_create_with_node_id(0xC0C0C0C0C0C0C0C0ULL);
+    uint64_t a_id = fleece_state_manager_get_node_id(a);
+
+    fleece_state_manager_set_named(a, "x", (const uint8_t*)"1", 1);
+    uint64_t watermark = fleece_state_manager_get_local_timestamp(a);
+
+    // Nothing changed since the watermark -> delta should carry zero fields.
+    uint8_t* frame = NULL;
+    uint32_t frame_size = 0;
+    CHECK(fleece_state_manager_export_delta(a, watermark, &frame, &frame_size) == 0, "delta export with nothing new should still succeed");
+    CHECK(fleece_state_manager_import(b, frame, frame_size) == 0, "importing an empty delta should succeed");
+    CHECK(!fleece_state_manager_exists_named(b, a_id, "x"), "an empty delta should not (yet) reveal fields set before the watermark");
+    free(frame);
+
+    // Only the field changed after the watermark should appear in the next delta.
+    fleece_state_manager_set_named(a, "y", (const uint8_t*)"2", 2);
+    frame = NULL;
+    frame_size = 0;
+    CHECK(fleece_state_manager_export_delta(a, watermark, &frame, &frame_size) == 0, "delta export after a new write should succeed");
+    CHECK(fleece_state_manager_import(b, frame, frame_size) == 0, "importing the delta should succeed");
+    free(frame);
+
+    CHECK(fleece_state_manager_exists_named(b, a_id, "y"), "the field written after the watermark should be visible via delta");
+    CHECK(!fleece_state_manager_exists_named(b, a_id, "x"), "the field written before the watermark should NOT be visible via delta alone");
+
+    // A full export (delta since 0) should carry everything, healing the gap.
+    frame = NULL;
+    frame_size = 0;
+    fleece_state_manager_export(a, &frame, &frame_size);
+    fleece_state_manager_import(b, frame, frame_size);
+    free(frame);
+    CHECK(fleece_state_manager_exists_named(b, a_id, "x"), "a full resync export should carry fields the earlier delta skipped");
+
+    fleece_state_manager_destroy(a);
+    fleece_state_manager_destroy(b);
+    printf("Done: delta export test\n");
+}
+
 static void test_capacity_exhaustion(void) {
     printf("Running capacity exhaustion test...\n");
 
@@ -187,6 +229,8 @@ int main(void) {
     test_tombstone_propagation();
     printf("\n");
     test_self_owned_rejection();
+    printf("\n");
+    test_delta_export();
     printf("\n");
     test_malformed_frames();
     printf("\n");

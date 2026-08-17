@@ -362,7 +362,14 @@ int fleece_state_manager_merge_named(FleeceStateManager* manager, uint64_t owner
     return upsert_field(manager, key, owner_node_id, name, data, size, remote_timestamp, is_tombstone);
 }
 
-int fleece_state_manager_export(FleeceStateManager* manager, uint8_t** frame_data, uint32_t* frame_size) {
+uint64_t fleece_state_manager_get_local_timestamp(FleeceStateManager* manager) {
+    return manager ? manager->local_timestamp : 0;
+}
+
+// Serializes the local node's own named fields with timestamp > since_timestamp.
+// since_timestamp == 0 yields every local field (a full export), since real
+// timestamps start at 1 (see upsert_field's ++manager->local_timestamp).
+static int export_fields_since(FleeceStateManager* manager, uint64_t since_timestamp, uint8_t** frame_data, uint32_t* frame_size) {
     if (!manager || !frame_data || !frame_size) {
         return -1;
     }
@@ -371,7 +378,7 @@ int fleece_state_manager_export(FleeceStateManager* manager, uint8_t** frame_dat
     size_t total = 3 + 8 + 4;  // magic+version, owner_node_id, field_count
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         struct FieldEntry* f = &manager->fields[i];
-        if (!f->exists || f->node_id != manager->node_id || f->name[0] == '\0') continue;
+        if (!f->exists || f->node_id != manager->node_id || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
 
         total += 1 + 1 + strlen(f->name) + 8 + 4 + (f->is_tombstone ? 0 : f->size);
         count++;
@@ -391,7 +398,7 @@ int fleece_state_manager_export(FleeceStateManager* manager, uint8_t** frame_dat
 
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         struct FieldEntry* f = &manager->fields[i];
-        if (!f->exists || f->node_id != manager->node_id || f->name[0] == '\0') continue;
+        if (!f->exists || f->node_id != manager->node_id || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
 
         uint8_t name_len = (uint8_t)strlen(f->name);
         uint32_t data_len = f->is_tombstone ? 0 : f->size;
@@ -410,6 +417,14 @@ int fleece_state_manager_export(FleeceStateManager* manager, uint8_t** frame_dat
     *frame_data = buf;
     *frame_size = (uint32_t)pos;
     return 0;
+}
+
+int fleece_state_manager_export(FleeceStateManager* manager, uint8_t** frame_data, uint32_t* frame_size) {
+    return export_fields_since(manager, 0, frame_data, frame_size);
+}
+
+int fleece_state_manager_export_delta(FleeceStateManager* manager, uint64_t since_timestamp, uint8_t** frame_data, uint32_t* frame_size) {
+    return export_fields_since(manager, since_timestamp, frame_data, frame_size);
 }
 
 int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size) {

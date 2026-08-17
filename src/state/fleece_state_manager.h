@@ -41,6 +41,11 @@ void fleece_state_manager_destroy(FleeceStateManager* manager);
 // Get the local node's own id
 uint64_t fleece_state_manager_get_node_id(FleeceStateManager* manager);
 
+// Get the local node's current logical clock value (monotonically increasing
+// on every local write via set_named/remove_named). Used as a gossip delta
+// watermark - see fleece_state_manager_export_delta().
+uint64_t fleece_state_manager_get_local_timestamp(FleeceStateManager* manager);
+
 // Set a field value with LWW semantics (raw key, implicitly owned by the local node)
 int fleece_state_manager_set(FleeceStateManager* manager, uint32_t key, const uint8_t* data, uint32_t size);
 
@@ -86,8 +91,14 @@ uint32_t fleece_state_manager_list_fields(FleeceStateManager* manager, uint64_t 
 // local node's own fields (owner_node_id must not equal the local node id).
 int fleece_state_manager_merge_named(FleeceStateManager* manager, uint64_t owner_node_id, const char* name, const uint8_t* data, uint32_t size, uint64_t remote_timestamp, bool is_tombstone);
 
-// Export the local node's own named fields as a gossip wire frame
+// Export the local node's own named fields as a gossip wire frame (full state)
 int fleece_state_manager_export(FleeceStateManager* manager, uint8_t** frame_data, uint32_t* frame_size);
+
+// Export only the local node's own named fields whose timestamp is newer than
+// since_timestamp (delta gossip). Pass 0 for the full state (equivalent to
+// fleece_state_manager_export). Deletions since since_timestamp are included
+// as tombstone records, same as a full export.
+int fleece_state_manager_export_delta(FleeceStateManager* manager, uint64_t since_timestamp, uint8_t** frame_data, uint32_t* frame_size);
 
 // Import a gossip wire frame received from a peer, merging its fields with LWW
 int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size);
