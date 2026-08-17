@@ -25,6 +25,12 @@ void fleece_runtime_destroy(FleeceRuntime* runtime);
 // https://github.com/buzz-lang/Buzz). Call before fleece_runtime_start().
 int fleece_runtime_load_script(FleeceRuntime* runtime, const char* source);
 
+// Sets the peer liveness TTL (in loop ticks) used to hide dead/silent peers
+// from the "swarm" script global. Optional - defaults to
+// FLEECE_DEFAULT_PEER_TTL_TICKS (see fleece_embedded.h) if never called.
+// Call before fleece_runtime_start().
+int fleece_runtime_set_peer_ttl_ticks(FleeceRuntime* runtime, uint64_t ttl_ticks);
+
 // Start the runtime's main loop
 int fleece_runtime_start(FleeceRuntime* runtime);
 

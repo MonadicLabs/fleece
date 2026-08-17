@@ -17,15 +17,19 @@
 
 #define FLEECE_JS_LIST_MAX 128
 
+// Default peer liveness TTL, in runtime loop ticks (see fleece_embedded_set_peer_ttl_ticks).
+#define FLEECE_DEFAULT_PEER_TTL_TICKS 50
+
 struct FleeceEmbedded {
     JSRuntime* rt;
     JSContext* ctx;
     FleeceStateManager* manager;
     FleecePlatform* platform;
+    uint64_t peer_ttl_ticks;
 };
 
-// --- self/swarm/platform Proxy support (evaluated once, wires natives into
-// globalThis.self/swarm/platform) ---
+// --- self/swarm/platform/world Proxy support (evaluated once, wires natives
+// into globalThis.self/swarm/platform/world) ---
 // JSON marshalling happens in C (JS_ParseJSON/JS_JSONStringify); the prelude only
 // forwards Proxy trap calls to the native helpers below.
 static const char* FLEECE_JS_PRELUDE =
@@ -33,7 +37,9 @@ static const char* FLEECE_JS_PRELUDE =
     "  var self_get = __self_get, self_set = __self_set, self_delete = __self_delete,\n"
     "      self_keys = __self_keys, self_id = __self_id,\n"
     "      swarm_nodes = __swarm_nodes, swarm_get = __swarm_get, swarm_keys = __swarm_keys,\n"
-    "      platform_names = __platform_names, platform_call = __platform_call;\n"
+    "      platform_names = __platform_names, platform_call = __platform_call,\n"
+    "      world_get = __world_get, world_set = __world_set,\n"
+    "      world_delete = __world_delete, world_keys = __world_keys;\n"
     "\n"
     "  function makeNodeView(id) {\n"
     "    return new Proxy({}, {\n"
@@ -108,10 +114,35 @@ static const char* FLEECE_JS_PRELUDE =
     "    deleteProperty: function() { return false; }\n"
     "  });\n"
     "\n"
+    "  globalThis.world = new Proxy({}, {\n"
+    "    get: function(t, p, r) {\n"
+    "      if (typeof p !== 'string') return Reflect.get(t, p, r);\n"
+    "      return world_get(p);\n"
+    "    },\n"
+    "    set: function(t, p, v) {\n"
+    "      if (typeof p !== 'string') return Reflect.set(t, p, v);\n"
+    "      world_set(p, v);\n"
+    "      return true;\n"
+    "    },\n"
+    "    has: function(t, p) { return typeof p === 'string' ? world_keys().indexOf(p) !== -1 : Reflect.has(t, p); },\n"
+    "    ownKeys: function() { return world_keys(); },\n"
+    "    getOwnPropertyDescriptor: function(t, p) {\n"
+    "      if (typeof p !== 'string' || world_keys().indexOf(p) === -1) return undefined;\n"
+    "      return { value: world_get(p), writable: true, enumerable: true, configurable: true };\n"
+    "    },\n"
+    "    deleteProperty: function(t, p) {\n"
+    "      if (typeof p !== 'string') return Reflect.deleteProperty(t, p);\n"
+    "      world_delete(p);\n"
+    "      return true;\n"
+    "    }\n"
+    "  });\n"
+    "\n"
     "  delete globalThis.__self_get; delete globalThis.__self_set; delete globalThis.__self_delete;\n"
     "  delete globalThis.__self_keys; delete globalThis.__self_id;\n"
     "  delete globalThis.__swarm_nodes; delete globalThis.__swarm_get; delete globalThis.__swarm_keys;\n"
     "  delete globalThis.__platform_names; delete globalThis.__platform_call;\n"
+    "  delete globalThis.__world_get; delete globalThis.__world_set;\n"
+    "  delete globalThis.__world_delete; delete globalThis.__world_keys;\n"
     "})();\n";
 
 static FleeceEmbedded* get_embedded(JSContext* ctx) {
@@ -306,6 +337,15 @@ static JSValue js_self_id(JSContext* ctx, JSValueConst this_val, int argc, JSVal
     return JS_NewString(ctx, hex);
 }
 
+// A peer counts as live if we've heard from it (see fleece_state_manager_import)
+// within emb->peer_ttl_ticks. Checked on every swarm access, not just
+// enumeration, so a script holding a stale Proxy reference across ticks also
+// stops seeing data once the peer's TTL expires.
+static bool js_peer_is_live(FleeceEmbedded* emb, uint64_t node_id) {
+    if (!emb || !emb->manager) return false;
+    return fleece_state_manager_ticks_since_seen(emb->manager, node_id) <= emb->peer_ttl_ticks;
+}
+
 static JSValue js_swarm_nodes(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     (void)this_val; (void)argc; (void)argv;
     FleeceEmbedded* emb = get_embedded(ctx);
@@ -319,6 +359,7 @@ static JSValue js_swarm_nodes(JSContext* ctx, JSValueConst this_val, int argc, J
     uint32_t out_idx = 0;
     for (uint32_t i = 0; i < count; i++) {
         if (ids[i] == local_id) continue;  // swarm excludes the local node - that's what self is for
+        if (!js_peer_is_live(emb, ids[i])) continue;  // hide dead/silent peers
         char hex[17];
         format_node_id(ids[i], hex);
         JS_DefinePropertyValueUint32(ctx, arr, out_idx++, JS_NewString(ctx, hex), JS_PROP_C_W_E);
@@ -336,7 +377,7 @@ static JSValue js_swarm_get(JSContext* ctx, JSValueConst this_val, int argc, JSV
     uint64_t node_id;
     bool ok = parse_node_id(id_str, &node_id);
     JS_FreeCString(ctx, id_str);
-    if (!ok) return JS_UNDEFINED;
+    if (!ok || !js_peer_is_live(emb, node_id)) return JS_UNDEFINED;
 
     const char* name = JS_ToCString(ctx, argv[1]);
     if (!name) return JS_EXCEPTION;
@@ -355,10 +396,81 @@ static JSValue js_swarm_keys(JSContext* ctx, JSValueConst this_val, int argc, JS
     uint64_t node_id;
     bool ok = parse_node_id(id_str, &node_id);
     JS_FreeCString(ctx, id_str);
-    if (!ok) return JS_NewArray(ctx);
+    if (!ok || !js_peer_is_live(emb, node_id)) return JS_NewArray(ctx);
 
     char names[FLEECE_JS_LIST_MAX][FLEECE_FIELD_NAME_MAX];
     uint32_t count = fleece_state_manager_list_fields(emb->manager, node_id, names, FLEECE_JS_LIST_MAX);
+    return names_to_js_array(ctx, names, count);
+}
+
+static JSValue js_world_get(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    (void)this_val;
+    FleeceEmbedded* emb = get_embedded(ctx);
+    if (!emb || !emb->manager || argc < 1) return JS_UNDEFINED;
+
+    const char* name = JS_ToCString(ctx, argv[0]);
+    if (!name) return JS_EXCEPTION;
+    JSValue result = get_named_value(ctx, emb->manager, FLEECE_SHARED_OWNER_ID, name);
+    JS_FreeCString(ctx, name);
+    return result;
+}
+
+static JSValue js_world_set(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    (void)this_val;
+    FleeceEmbedded* emb = get_embedded(ctx);
+    if (!emb || !emb->manager) return JS_UNDEFINED;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "world: set requires a name and a value");
+
+    const char* name = JS_ToCString(ctx, argv[0]);
+    if (!name) return JS_EXCEPTION;
+
+    JSValue json = JS_JSONStringify(ctx, argv[1], JS_UNDEFINED, JS_UNDEFINED);
+    if (JS_IsException(json)) {
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
+    if (JS_IsUndefined(json)) {
+        JS_FreeValue(ctx, json);
+        JSValue err = JS_ThrowTypeError(ctx, "world.%s: value is not JSON-serializable", name);
+        JS_FreeCString(ctx, name);
+        return err;
+    }
+
+    size_t len = 0;
+    const char* text = JS_ToCStringLen(ctx, &len, json);
+    JSValue result = JS_UNDEFINED;
+    if (!text) {
+        result = JS_EXCEPTION;
+    } else {
+        if (fleece_state_manager_set_shared(emb->manager, name, (const uint8_t*)text, (uint32_t)len) != 0) {
+            result = JS_ThrowTypeError(ctx, "world.%s: state store is full", name);
+        }
+        JS_FreeCString(ctx, text);
+    }
+    JS_FreeValue(ctx, json);
+    JS_FreeCString(ctx, name);
+    return result;
+}
+
+static JSValue js_world_delete(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    (void)this_val;
+    FleeceEmbedded* emb = get_embedded(ctx);
+    if (!emb || !emb->manager || argc < 1) return JS_UNDEFINED;
+
+    const char* name = JS_ToCString(ctx, argv[0]);
+    if (!name) return JS_EXCEPTION;
+    fleece_state_manager_remove_shared(emb->manager, name);
+    JS_FreeCString(ctx, name);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_world_keys(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    (void)this_val; (void)argc; (void)argv;
+    FleeceEmbedded* emb = get_embedded(ctx);
+    if (!emb || !emb->manager) return JS_NewArray(ctx);
+
+    char names[FLEECE_JS_LIST_MAX][FLEECE_FIELD_NAME_MAX];
+    uint32_t count = fleece_state_manager_list_fields(emb->manager, FLEECE_SHARED_OWNER_ID, names, FLEECE_JS_LIST_MAX);
     return names_to_js_array(ctx, names, count);
 }
 
@@ -454,6 +566,7 @@ FleeceEmbedded* fleece_embedded_create(void) {
         return NULL;
     }
     JS_SetContextOpaque(embedded->ctx, embedded);
+    embedded->peer_ttl_ticks = FLEECE_DEFAULT_PEER_TTL_TICKS;
 
     return embedded;
 }
@@ -480,6 +593,13 @@ int fleece_embedded_set_platform(FleeceEmbedded* embedded, FleecePlatform* platf
     return 0;
 }
 
+int fleece_embedded_set_peer_ttl_ticks(FleeceEmbedded* embedded, uint64_t ttl_ticks) {
+    if (!embedded) return -1;
+
+    embedded->peer_ttl_ticks = ttl_ticks;
+    return 0;
+}
+
 int fleece_embedded_register_c_functions(FleeceEmbedded* embedded) {
     if (!embedded || !embedded->ctx || !embedded->manager) {
         return -1;
@@ -502,6 +622,10 @@ int fleece_embedded_register_c_functions(FleeceEmbedded* embedded) {
     JS_SetPropertyStr(ctx, global, "__swarm_keys", JS_NewCFunction(ctx, js_swarm_keys, "__swarm_keys", 1));
     JS_SetPropertyStr(ctx, global, "__platform_names", JS_NewCFunction(ctx, js_platform_names, "__platform_names", 0));
     JS_SetPropertyStr(ctx, global, "__platform_call", JS_NewCFunction(ctx, js_platform_call, "__platform_call", 2));
+    JS_SetPropertyStr(ctx, global, "__world_get", JS_NewCFunction(ctx, js_world_get, "__world_get", 1));
+    JS_SetPropertyStr(ctx, global, "__world_set", JS_NewCFunction(ctx, js_world_set, "__world_set", 2));
+    JS_SetPropertyStr(ctx, global, "__world_delete", JS_NewCFunction(ctx, js_world_delete, "__world_delete", 1));
+    JS_SetPropertyStr(ctx, global, "__world_keys", JS_NewCFunction(ctx, js_world_keys, "__world_keys", 0));
 
     JS_FreeValue(ctx, global);
 

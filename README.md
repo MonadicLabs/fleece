@@ -14,13 +14,17 @@ fleece is a **lightweight, decentralized swarm coordination runtime** designed f
 - **Real QuickJS-ng integration** (vendored as a git submodule) for high-level scripting
 - **Buzz-inspired lifecycle** ([buzz-lang/Buzz](https://github.com/buzz-lang/Buzz)): scripts define `init()`/`step()`/`reset()`/`destroy()`
 - **`self`** - a read/write object for this node's own published state
-- **`swarm`** - a read-only view of every other known node's published state, kept in sync by gossip
+- **`swarm`** - a read-only view of every other *live* known node's published state, kept in sync by gossip (dead/silent peers drop out automatically - see below)
+- **`world`** - a durable, any-node-writable collection for swarm-shared data (e.g. discovered targets, shared tasks) that isn't tied to any single node's liveness
 - **`platform`** - a pure name→function registry for hardware bindings (fleece defines none itself - see below)
 - Sandboxed execution for security
 
 ### 📦 Gossip State
 - **Compact binary framing** for bandwidth-limited links (not CBOR - a small length-prefixed record format, see `src/state/fleece_state_manager.c`)
 - **Delta gossip**: each tick sends only fields changed since the last send, with a periodic full-state resync so a peer can recover from a dropped packet
+- **Two independent streams**: `self` (owned by each node) and shared/`world` (owned by no single node, relayed by whoever holds a copy)
+- **Full replication of `world`**: every node re-broadcasts everything it currently holds, not just what it personally discovered, so a `world` entry propagates node-to-node until every reachable unit has it (multi-hop, once comms has a real transport); the periodic full resync also catches any node that missed a relay or joined late
+- **Peer liveness / heartbeat**: every gossip frame (even an empty delta) counts as a heartbeat; a peer not heard from within a configurable TTL disappears from `swarm` (its data isn't deleted, just hidden - it reappears immediately once heard from again)
 - Efficient field-level versioning and conflict resolution
 
 ## System Architecture
@@ -34,13 +38,13 @@ The core execution model follows a synchronized **4-phase coordination cycle**, 
 
 2. **Phase 2: Script Execution (QuickJS VM)**
    - Calls the script's `step()` function
-   - Reads/writes `self`, reads `swarm`, calls `platform.<name>(...)`
-   - Runs *before* gossip so any `self.xxx` change this tick is broadcast this tick, not next
+   - Reads/writes `self`, reads `swarm`, reads/writes `world`, calls `platform.<name>(...)`
+   - Runs *before* gossip so any `self.xxx`/`world.xxx` change this tick is broadcast this tick, not next
 
 3. **Phase 3: Gossip (State Synchronization)**
-   - Exports and broadcasts what changed in `self` since the last send (delta), full state periodically (resync)
-   - Peer frames arrive via the comms receive callback and merge into `swarm` with LWW semantics
-   - Maintains eventual consistency across the swarm
+   - Advances the peer-liveness tick counter, then exports and broadcasts what changed since the last send (delta), full state periodically (resync) - as two separate frames, one for `self`, one for the shared `world` stream
+   - Peer frames arrive via the comms receive callback and merge into `swarm`/`world` with LWW semantics; every frame received also counts as a heartbeat from its sender
+   - Maintains eventual consistency across the swarm, replicates `world` to every reachable unit, and prunes peers from `swarm` that haven't been heard from within the configured TTL
 
 4. **Phase 4: Output (Actuators/Mesh Broadcast)**
    - Send mesh broadcasts, disseminate updates to peer nodes
@@ -125,14 +129,15 @@ fleece_comms_process_output(comms);
 #### FleeceEmbedded
 ```c
 FleeceEmbedded* embedded = fleece_embedded_create();
-fleece_embedded_set_state_manager(embedded, manager);   // backs self/swarm
+fleece_embedded_set_state_manager(embedded, manager);   // backs self/swarm/world
 fleece_embedded_set_platform(embedded, platform);        // optional - backs platform.<name>()
-fleece_embedded_register_c_functions(embedded);           // installs console/self/swarm/platform
+fleece_embedded_set_peer_ttl_ticks(embedded, 30);         // optional - defaults to FLEECE_DEFAULT_PEER_TTL_TICKS
+fleece_embedded_register_c_functions(embedded);           // installs console/self/swarm/platform/world
 
 fleece_embedded_load_script(embedded,
     "function step() {\n"
     "  self.status = 'ok';\n"
-    "  console.log('id', self.id, 'peers', Object.keys(swarm).length);\n"
+    "  console.log('id', self.id, 'peers', Object.keys(swarm).length, 'world entries', Object.keys(world).length);\n"
     "}\n", "<script>");
 fleece_embedded_call_step(embedded);
 fleece_embedded_destroy(embedded);
@@ -161,14 +166,14 @@ fleece/
 │   ├── runtime/           # Runtime interface headers
 │   ├── state/             # State manager interface
 │   ├── comms/            # Comms interface
-│   ├── embedded/         # Embedded JS interface (self/swarm/platform bindings)
+│   ├── embedded/         # Embedded JS interface (self/swarm/world/platform bindings)
 │   ├── platform/         # Platform function registry interface
 │   └── core/             # Dead/unused parallel runtime - not wired into anything
 ├── src/
 │   ├── runtime/          # Runtime implementation
 │   ├── state/            # State manager implementation
 │   ├── comms/           # Comms implementation (single-process simulation, no real transport)
-│   ├── embedded/        # QuickJS-ng integration and self/swarm/platform bindings
+│   ├── embedded/        # QuickJS-ng integration and self/swarm/world/platform bindings
 │   ├── platform/        # Platform function registry implementation
 │   └── core/            # Dead/unused - see include/core
 ├── third_party/
@@ -178,7 +183,7 @@ fleece/
 ├── tests/                # Unit tests (one executable per file, run via ctest)
 │   ├── test_state_manager.c # Raw LWW store tests
 │   ├── test_gossip.c        # Export/import/merge/delta wire format tests
-│   ├── test_embedded.c      # self/swarm QuickJS binding tests
+│   ├── test_embedded.c      # self/swarm/world QuickJS binding tests
 │   └── test_platform.c      # Platform registry + JS binding tests
 ├── CMakeLists.txt        # Build system
 ├── README.md            # Project documentation
@@ -231,11 +236,24 @@ if (fleece_state_manager_get(state_manager, 0x0001, &data, &size) == 0) {
 
 ### Script Execution
 ```c
-// self/swarm/platform are real Proxy-backed globals once
+// self/swarm/platform/world are real Proxy-backed globals once
 // fleece_embedded_register_c_functions() (or fleece_runtime_create()) has run.
 // 'cool' is only callable if something called fleece_platform_register(platform, "cool", ...).
 fleece_embedded_execute(embedded,
     "if (self.temperature > threshold && 'cool' in platform) platform.cool();");
+```
+
+### World (shared, swarm-replicated) State
+```c
+// Any node can publish, claim, or update a "world" entry - it's not tied to
+// this node's liveness and gets relayed to every reachable unit (see the
+// Gossip State section above). Equivalent C API: fleece_state_manager_set_shared.
+fleece_embedded_execute(embedded,
+    "if (!('T1' in world)) {\n"
+    "  world.T1 = { lat: 42.1, lon: -71.05, type: 'debris', assignedTo: null };\n"
+    "} else if (world.T1.assignedTo === null) {\n"
+    "  world.T1 = Object.assign({}, world.T1, { assignedTo: self.id });\n"  // claim it
+    "}");
 ```
 
 ### Mesh Communication

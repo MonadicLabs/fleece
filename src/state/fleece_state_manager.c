@@ -8,6 +8,8 @@
 
 #include "fleece_state_manager.h"
 
+#define FLEECE_MAX_TRACKED_PEERS 32
+
 // Internal state structure for the state manager
 
 struct FleeceStateManager {
@@ -27,6 +29,13 @@ struct FleeceStateManager {
     uint32_t field_capacity;
     uint64_t local_timestamp;
     uint64_t node_id;
+
+    uint64_t current_tick;  // advanced by fleece_state_manager_tick(); peer liveness only
+    struct PeerSeen {
+        uint64_t node_id;
+        uint64_t last_seen_tick;
+        bool exists;
+    } peers_seen[FLEECE_MAX_TRACKED_PEERS];
 };
 
 static const uint32_t FIELD_CAPACITY = 128;  // Max fields for microcontrollers (shared across local + peer fields)
@@ -70,6 +79,10 @@ static uint64_t read_u64(const uint8_t* buf) {
 }
 
 FleeceStateManager* fleece_state_manager_create_with_node_id(uint64_t node_id) {
+    if (node_id == FLEECE_SHARED_OWNER_ID) {
+        return NULL;  // reserved for shared/"world" fields, not a real node identity
+    }
+
     FleeceStateManager* manager = (FleeceStateManager*)calloc(1, sizeof(FleeceStateManager));
     if (!manager) {
         return NULL;
@@ -109,6 +122,47 @@ void fleece_state_manager_destroy(FleeceStateManager* manager) {
 
 uint64_t fleece_state_manager_get_node_id(FleeceStateManager* manager) {
     return manager ? manager->node_id : 0;
+}
+
+// Records that a frame/merge was received from node_id "now" (current_tick).
+// Called from both import() (even for empty deltas) and merge_named() (so
+// direct callers, e.g. tests, also register liveness).
+static void touch_peer(FleeceStateManager* manager, uint64_t node_id) {
+    if (node_id == manager->node_id) return;  // we don't track our own liveness
+    if (node_id == FLEECE_SHARED_OWNER_ID) return;  // the shared namespace isn't a real peer
+
+    for (int i = 0; i < FLEECE_MAX_TRACKED_PEERS; i++) {
+        if (manager->peers_seen[i].exists && manager->peers_seen[i].node_id == node_id) {
+            manager->peers_seen[i].last_seen_tick = manager->current_tick;
+            return;
+        }
+    }
+    for (int i = 0; i < FLEECE_MAX_TRACKED_PEERS; i++) {
+        if (!manager->peers_seen[i].exists) {
+            manager->peers_seen[i].exists = true;
+            manager->peers_seen[i].node_id = node_id;
+            manager->peers_seen[i].last_seen_tick = manager->current_tick;
+            return;
+        }
+    }
+    // tracking table full - silently skip; doesn't affect data merge correctness
+}
+
+void fleece_state_manager_tick(FleeceStateManager* manager) {
+    if (!manager) return;
+
+    manager->current_tick++;
+}
+
+uint64_t fleece_state_manager_ticks_since_seen(FleeceStateManager* manager, uint64_t node_id) {
+    if (!manager) return UINT64_MAX;
+
+    for (int i = 0; i < FLEECE_MAX_TRACKED_PEERS; i++) {
+        if (manager->peers_seen[i].exists && manager->peers_seen[i].node_id == node_id) {
+            return manager->current_tick - manager->peers_seen[i].last_seen_tick;
+        }
+    }
+    return UINT64_MAX;
 }
 
 // Finds a live or tombstoned slot for (key, owner_node_id), regardless of tombstone state.
@@ -308,13 +362,39 @@ bool fleece_state_manager_exists_named(FleeceStateManager* manager, uint64_t own
     return find_field_owned(manager, hash_name(name), owner_node_id) != NULL;
 }
 
+// --- Shared fields (owner = FLEECE_SHARED_OWNER_ID; see header for the LWW caveat) ---
+
+int fleece_state_manager_set_shared(FleeceStateManager* manager, const char* name, const uint8_t* data, uint32_t size) {
+    if (!manager || !name || !name[0] || !data || size == 0) {
+        return -1;
+    }
+
+    return upsert_field(manager, hash_name(name), FLEECE_SHARED_OWNER_ID, name, data, size, ++manager->local_timestamp, false);
+}
+
+int fleece_state_manager_remove_shared(FleeceStateManager* manager, const char* name) {
+    if (!manager || !name) return -1;
+
+    struct FieldEntry* field = find_field_owned(manager, hash_name(name), FLEECE_SHARED_OWNER_ID);
+    if (!field) {
+        return -1;
+    }
+
+    free(field->data);
+    field->data = NULL;
+    field->size = 0;
+    field->is_tombstone = true;
+    field->timestamp = ++manager->local_timestamp;
+    return 0;
+}
+
 uint32_t fleece_state_manager_list_nodes(FleeceStateManager* manager, uint64_t* node_ids_out, uint32_t max_nodes) {
     if (!manager || !node_ids_out || max_nodes == 0) return 0;
 
     uint32_t count = 0;
     for (uint32_t i = 0; i < manager->field_capacity && count < max_nodes; i++) {
         struct FieldEntry* f = &manager->fields[i];
-        if (!f->exists || f->is_tombstone) continue;
+        if (!f->exists || f->is_tombstone || f->node_id == FLEECE_SHARED_OWNER_ID) continue;  // not a real node
 
         bool seen = false;
         for (uint32_t j = 0; j < count; j++) {
@@ -351,6 +431,7 @@ int fleece_state_manager_merge_named(FleeceStateManager* manager, uint64_t owner
     if (!is_tombstone && (!data || size == 0)) return -1;
     if (owner_node_id == manager->node_id) return -1;  // never let the network overwrite our own self
 
+    touch_peer(manager, owner_node_id);
     manager->local_timestamp = manager->local_timestamp > remote_timestamp ? manager->local_timestamp : remote_timestamp;
 
     uint32_t key = hash_name(name);
@@ -366,10 +447,13 @@ uint64_t fleece_state_manager_get_local_timestamp(FleeceStateManager* manager) {
     return manager ? manager->local_timestamp : 0;
 }
 
-// Serializes the local node's own named fields with timestamp > since_timestamp.
-// since_timestamp == 0 yields every local field (a full export), since real
-// timestamps start at 1 (see upsert_field's ++manager->local_timestamp).
-static int export_fields_since(FleeceStateManager* manager, uint64_t since_timestamp, uint8_t** frame_data, uint32_t* frame_size) {
+// Serializes fields owned by owner_filter (the local node's own id, or
+// FLEECE_SHARED_OWNER_ID) with timestamp > since_timestamp. since_timestamp == 0
+// yields every such field (a full export), since real timestamps start at 1
+// (see upsert_field's ++manager->local_timestamp). The frame header's
+// owner_node_id is owner_filter itself, so a receiver's import() files the
+// fields under the right owner (a real peer id, or the shared namespace).
+static int export_fields_since(FleeceStateManager* manager, uint64_t owner_filter, uint64_t since_timestamp, uint8_t** frame_data, uint32_t* frame_size) {
     if (!manager || !frame_data || !frame_size) {
         return -1;
     }
@@ -378,7 +462,7 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t since_times
     size_t total = 3 + 8 + 4;  // magic+version, owner_node_id, field_count
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         struct FieldEntry* f = &manager->fields[i];
-        if (!f->exists || f->node_id != manager->node_id || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
+        if (!f->exists || f->node_id != owner_filter || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
 
         total += 1 + 1 + strlen(f->name) + 8 + 4 + (f->is_tombstone ? 0 : f->size);
         count++;
@@ -393,12 +477,12 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t since_times
     buf[pos++] = FLEECE_GOSSIP_MAGIC0;
     buf[pos++] = FLEECE_GOSSIP_MAGIC1;
     buf[pos++] = FLEECE_GOSSIP_VERSION;
-    write_u64(&buf[pos], manager->node_id); pos += 8;
+    write_u64(&buf[pos], owner_filter); pos += 8;
     write_u32(&buf[pos], count); pos += 4;
 
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         struct FieldEntry* f = &manager->fields[i];
-        if (!f->exists || f->node_id != manager->node_id || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
+        if (!f->exists || f->node_id != owner_filter || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
 
         uint8_t name_len = (uint8_t)strlen(f->name);
         uint32_t data_len = f->is_tombstone ? 0 : f->size;
@@ -420,11 +504,23 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t since_times
 }
 
 int fleece_state_manager_export(FleeceStateManager* manager, uint8_t** frame_data, uint32_t* frame_size) {
-    return export_fields_since(manager, 0, frame_data, frame_size);
+    if (!manager) return -1;
+    return export_fields_since(manager, manager->node_id, 0, frame_data, frame_size);
 }
 
 int fleece_state_manager_export_delta(FleeceStateManager* manager, uint64_t since_timestamp, uint8_t** frame_data, uint32_t* frame_size) {
-    return export_fields_since(manager, since_timestamp, frame_data, frame_size);
+    if (!manager) return -1;
+    return export_fields_since(manager, manager->node_id, since_timestamp, frame_data, frame_size);
+}
+
+int fleece_state_manager_export_shared(FleeceStateManager* manager, uint8_t** frame_data, uint32_t* frame_size) {
+    if (!manager) return -1;
+    return export_fields_since(manager, FLEECE_SHARED_OWNER_ID, 0, frame_data, frame_size);
+}
+
+int fleece_state_manager_export_shared_delta(FleeceStateManager* manager, uint64_t since_timestamp, uint8_t** frame_data, uint32_t* frame_size) {
+    if (!manager) return -1;
+    return export_fields_since(manager, FLEECE_SHARED_OWNER_ID, since_timestamp, frame_data, frame_size);
 }
 
 int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size) {
@@ -445,6 +541,8 @@ int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* fram
     if (owner_node_id == manager->node_id) {
         return -1;  // reject a "peer" frame claiming to be us
     }
+
+    touch_peer(manager, owner_node_id);  // even an empty delta counts as "heard from"
 
     for (uint32_t i = 0; i < count; i++) {
         if (pos + 2 > frame_size) return -1;

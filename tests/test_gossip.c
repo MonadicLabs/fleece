@@ -218,6 +218,134 @@ static void test_capacity_exhaustion(void) {
     printf("Done: capacity exhaustion test\n");
 }
 
+static void test_peer_liveness_ticks(void) {
+    printf("Running peer liveness tick test...\n");
+
+    FleeceStateManager* a = fleece_state_manager_create_with_node_id(0xAAAA1111AAAA1111ULL);
+    FleeceStateManager* b = fleece_state_manager_create_with_node_id(0xBBBB2222BBBB2222ULL);
+    uint64_t a_id = fleece_state_manager_get_node_id(a);
+
+    CHECK(fleece_state_manager_ticks_since_seen(b, a_id) == UINT64_MAX, "a never-heard-from peer should report UINT64_MAX");
+
+    // a has zero fields, so this is an empty delta - it should still count as a heartbeat.
+    uint8_t* frame = NULL;
+    uint32_t frame_size = 0;
+    fleece_state_manager_export(a, &frame, &frame_size);
+    fleece_state_manager_import(b, frame, frame_size);
+    free(frame);
+    CHECK(fleece_state_manager_ticks_since_seen(b, a_id) == 0, "importing even an empty frame should register liveness");
+
+    fleece_state_manager_tick(b);
+    fleece_state_manager_tick(b);
+    fleece_state_manager_tick(b);
+    CHECK(fleece_state_manager_ticks_since_seen(b, a_id) == 3, "ticks_since_seen should track elapsed ticks since the last time heard from");
+
+    frame = NULL;
+    frame_size = 0;
+    fleece_state_manager_export(a, &frame, &frame_size);
+    fleece_state_manager_import(b, frame, frame_size);
+    free(frame);
+    CHECK(fleece_state_manager_ticks_since_seen(b, a_id) == 0, "hearing from the peer again should reset ticks_since_seen");
+
+    fleece_state_manager_destroy(a);
+    fleece_state_manager_destroy(b);
+    printf("Done: peer liveness tick test\n");
+}
+
+static void test_shared_fields_basic(void) {
+    printf("Running shared fields basic test...\n");
+
+    CHECK(fleece_state_manager_create_with_node_id(FLEECE_SHARED_OWNER_ID) == NULL, "creating a manager with the reserved shared owner id should fail");
+
+    FleeceStateManager* a = fleece_state_manager_create_with_node_id(0xCCCC3333CCCC3333ULL);
+
+    CHECK(fleece_state_manager_set_shared(a, "T1", (const uint8_t*)"{\"lat\":1}", 9) == 0, "set_shared should succeed");
+    CHECK(fleece_state_manager_exists_named(a, FLEECE_SHARED_OWNER_ID, "T1"), "shared field should be readable under FLEECE_SHARED_OWNER_ID");
+
+    uint8_t* data = NULL;
+    uint32_t size = 0;
+    CHECK(fleece_state_manager_get_named(a, FLEECE_SHARED_OWNER_ID, "T1", &data, &size) == 0, "get_named with the shared owner should succeed");
+    CHECK(data != NULL && size == 9 && memcmp(data, "{\"lat\":1}", 9) == 0, "shared field value should match what was set");
+    free(data);
+
+    CHECK(fleece_state_manager_remove_shared(a, "T1") == 0, "remove_shared should succeed");
+    CHECK(!fleece_state_manager_exists_named(a, FLEECE_SHARED_OWNER_ID, "T1"), "removed shared field should no longer exist");
+
+    fleece_state_manager_destroy(a);
+    printf("Done: shared fields basic test\n");
+}
+
+static void test_shared_fields_multi_writer(void) {
+    printf("Running shared fields multi-writer test...\n");
+
+    FleeceStateManager* a = fleece_state_manager_create_with_node_id(0xDDDD4444DDDD4444ULL);
+    FleeceStateManager* b = fleece_state_manager_create_with_node_id(0xEEEE5555EEEE5555ULL);
+
+    // a discovers and publishes a target
+    fleece_state_manager_set_shared(a, "T1", (const uint8_t*)"\"discovered\"", 12);
+
+    uint8_t* frame = NULL;
+    uint32_t frame_size = 0;
+    CHECK(fleece_state_manager_export_shared(a, &frame, &frame_size) == 0, "export_shared should succeed");
+    CHECK(fleece_state_manager_import(b, frame, frame_size) == 0, "b should be able to import a's shared frame");
+    free(frame);
+
+    uint8_t* data = NULL;
+    uint32_t size = 0;
+    fleece_state_manager_get_named(b, FLEECE_SHARED_OWNER_ID, "T1", &data, &size);
+    CHECK(data != NULL && size == 12 && memcmp(data, "\"discovered\"", 12) == 0, "b should see a's published target");
+    free(data);
+    data = NULL;
+
+    // b claims/updates the target - a local write always applies immediately, regardless of clock skew
+    CHECK(fleece_state_manager_set_shared(b, "T1", (const uint8_t*)"\"claimed\"", 9) == 0, "b claiming the target should succeed");
+
+    // b relays its (now freshest) copy back to a
+    frame = NULL;
+    frame_size = 0;
+    fleece_state_manager_export_shared(b, &frame, &frame_size);
+    fleece_state_manager_import(a, frame, frame_size);
+    free(frame);
+
+    fleece_state_manager_get_named(a, FLEECE_SHARED_OWNER_ID, "T1", &data, &size);
+    CHECK(data != NULL && size == 9 && memcmp(data, "\"claimed\"", 9) == 0, "a should see b's claim after b relays it back");
+    free(data);
+
+    uint64_t nodes[8];
+    uint32_t node_count = fleece_state_manager_list_nodes(b, nodes, 8);
+    for (uint32_t i = 0; i < node_count; i++) {
+        CHECK(nodes[i] != FLEECE_SHARED_OWNER_ID, "FLEECE_SHARED_OWNER_ID must never be tracked as a peer node id");
+    }
+
+    fleece_state_manager_destroy(a);
+    fleece_state_manager_destroy(b);
+    printf("Done: shared fields multi-writer test\n");
+}
+
+static void test_shared_fields_survive_discoverer_death(void) {
+    printf("Running shared fields survive discoverer death test...\n");
+
+    FleeceStateManager* discoverer = fleece_state_manager_create_with_node_id(0xF0F0F0F0F0F0F0F0ULL);
+    FleeceStateManager* other = fleece_state_manager_create_with_node_id(0x0F0F0F0F0F0F0F0FULL);
+
+    fleece_state_manager_set_shared(discoverer, "T2", (const uint8_t*)"1", 1);
+    fleece_state_manager_set_named(discoverer, "battery", (const uint8_t*)"90", 2);  // discoverer's own self data, for contrast
+
+    uint8_t* frame = NULL;
+    uint32_t frame_size = 0;
+    fleece_state_manager_export_shared(discoverer, &frame, &frame_size);
+    fleece_state_manager_import(other, frame, frame_size);
+    free(frame);
+    CHECK(fleece_state_manager_exists_named(other, FLEECE_SHARED_OWNER_ID, "T2"), "other should have the target after import");
+
+    fleece_state_manager_destroy(discoverer);  // simulate the discoverer dying entirely
+
+    CHECK(fleece_state_manager_exists_named(other, FLEECE_SHARED_OWNER_ID, "T2"), "the target should survive the discoverer going away entirely - it was never tied to the discoverer's liveness");
+
+    fleece_state_manager_destroy(other);
+    printf("Done: shared fields survive discoverer death test\n");
+}
+
 int main(void) {
     printf("Fleece Gossip Wire Format Tests\n");
     printf("================================\n\n");
@@ -235,6 +363,14 @@ int main(void) {
     test_malformed_frames();
     printf("\n");
     test_capacity_exhaustion();
+    printf("\n");
+    test_peer_liveness_ticks();
+    printf("\n");
+    test_shared_fields_basic();
+    printf("\n");
+    test_shared_fields_multi_writer();
+    printf("\n");
+    test_shared_fields_survive_discoverer_death();
     printf("\n");
 
     if (g_failures > 0) {

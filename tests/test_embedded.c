@@ -149,6 +149,124 @@ static void test_lifecycle_functions(void) {
     printf("Done: lifecycle function test\n");
 }
 
+static void test_world_binding(void) {
+    printf("Running world binding test...\n");
+
+    FleeceStateManager* manager = fleece_state_manager_create_with_node_id(0x6060606060606060ULL);
+    FleeceEmbedded* embedded = make_embedded(manager);
+
+    CHECK(fleece_embedded_execute(embedded,
+        "world.T1 = { lat: 42.1, lon: -71.05, type: 'debris' };"
+        "if (!('T1' in world)) throw new Error('T1 should be in world after write');"
+        "var keys = Object.keys(world);"
+        "if (keys.length !== 1 || keys[0] !== 'T1') throw new Error('Object.keys(world) mismatch: ' + keys);"
+        "if (JSON.stringify(world.T1) !== '{\"lat\":42.1,\"lon\":-71.05,\"type\":\"debris\"}') throw new Error('world.T1 readback mismatch: ' + JSON.stringify(world.T1));"
+    ) == 0, "writing/reading world should work like self");
+
+    CHECK(fleece_state_manager_exists_named(manager, FLEECE_SHARED_OWNER_ID, "T1"), "T1 should be stored under FLEECE_SHARED_OWNER_ID");
+    CHECK(!fleece_state_manager_exists_named(manager, fleece_state_manager_get_node_id(manager), "T1"), "T1 should NOT be stored under the local node's own id");
+
+    CHECK(fleece_embedded_execute(embedded,
+        "delete world.T1;"
+        "if ('T1' in world) throw new Error('T1 should be gone after delete');"
+    ) == 0, "delete world.T1 should remove it");
+
+    fleece_embedded_destroy(embedded);
+    fleece_state_manager_destroy(manager);
+    printf("Done: world binding test\n");
+}
+
+static void test_world_survive_and_propagate(void) {
+    printf("Running world survive+propagate (embedded-level) test...\n");
+
+    FleeceStateManager* discoverer = fleece_state_manager_create_with_node_id(0x7070707070707070ULL);
+    FleeceEmbedded* discoverer_js = make_embedded(discoverer);
+    fleece_embedded_execute(discoverer_js, "world.T3 = { status: 'detected' };");
+
+    FleeceStateManager* other = fleece_state_manager_create_with_node_id(0x8080808080808080ULL);
+    FleeceEmbedded* other_js = make_embedded(other);
+
+    uint8_t* frame = NULL;
+    uint32_t frame_size = 0;
+    fleece_state_manager_export_shared(discoverer, &frame, &frame_size);
+    fleece_state_manager_import(other, frame, frame_size);
+    free(frame);
+
+    CHECK(fleece_embedded_execute(other_js,
+        "if (!('T3' in world)) throw new Error('T3 should have propagated to other');"
+        "if (JSON.stringify(world.T3) !== '{\"status\":\"detected\"}') throw new Error('T3 mismatch: ' + JSON.stringify(world.T3));"
+        "if ('T3' in swarm) throw new Error('the shared/world owner must never leak into swarm');"
+    ) == 0, "a target discovered by one node should be visible to another via gossip");
+
+    fleece_embedded_destroy(discoverer_js);
+    fleece_state_manager_destroy(discoverer);  // simulate the discoverer dying entirely
+
+    CHECK(fleece_embedded_execute(other_js,
+        "if (!('T3' in world)) throw new Error('T3 should survive after the discoverer is gone');"
+    ) == 0, "the target should persist after the discovering node is destroyed");
+
+    fleece_embedded_destroy(other_js);
+    fleece_state_manager_destroy(other);
+    printf("Done: world survive+propagate test\n");
+}
+
+static void test_shared_owner_hidden_from_swarm(void) {
+    printf("Running shared-owner-not-in-swarm test...\n");
+
+    FleeceStateManager* manager = fleece_state_manager_create_with_node_id(0x9090909090909090ULL);
+    FleeceEmbedded* embedded = make_embedded(manager);
+
+    fleece_state_manager_set_shared(manager, "T4", (const uint8_t*)"1", 1);
+    fleece_state_manager_merge_named(manager, 0xA1A1A1A1A1A1A1A1ULL, "battery", (const uint8_t*)"50", 2, 1, false);
+
+    CHECK(fleece_embedded_execute(embedded,
+        "var ids = Object.keys(swarm);"
+        "if (ids.indexOf('0000000000000000') !== -1) throw new Error('the shared owner id must never appear in swarm: ' + ids);"
+        "if (ids.length !== 1 || ids[0] !== 'a1a1a1a1a1a1a1a1') throw new Error('swarm should show exactly the real peer: ' + ids);"
+    ) == 0, "the shared/world owner must never leak into swarm, even alongside a real peer");
+
+    fleece_embedded_destroy(embedded);
+    fleece_state_manager_destroy(manager);
+    printf("Done: shared-owner-not-in-swarm test\n");
+}
+
+static void test_peer_ttl_expiry(void) {
+    printf("Running peer TTL expiry (embedded-level) test...\n");
+
+    FleeceStateManager* manager = fleece_state_manager_create_with_node_id(0xB1B1B1B1B1B1B1B1ULL);
+    FleeceEmbedded* embedded = fleece_embedded_create();
+    fleece_embedded_set_state_manager(embedded, manager);
+    fleece_embedded_set_peer_ttl_ticks(embedded, 2);  // short TTL, just for the test
+    fleece_embedded_register_c_functions(embedded);
+
+    uint64_t peer_id = 0xB2B2B2B2B2B2B2B2ULL;
+    fleece_state_manager_merge_named(manager, peer_id, "battery", (const uint8_t*)"70", 2, 1, false);
+
+    CHECK(fleece_embedded_execute(embedded,
+        "if (Object.keys(swarm).length !== 1) throw new Error('a freshly-heard peer should be visible in swarm');"
+    ) == 0, "a freshly-heard peer should be in swarm");
+
+    fleece_state_manager_tick(manager);
+    fleece_state_manager_tick(manager);
+    fleece_state_manager_tick(manager);  // 3 ticks elapsed, TTL is 2 -> stale
+
+    CHECK(fleece_embedded_execute(embedded,
+        "if (Object.keys(swarm).length !== 0) throw new Error('a stale peer should have disappeared from swarm');"
+        "if (swarm['b2b2b2b2b2b2b2b2'] !== undefined) throw new Error('accessing a stale peer directly should also be undefined');"
+    ) == 0, "a peer not heard from within the TTL should vanish from swarm");
+
+    CHECK(fleece_state_manager_exists_named(manager, peer_id, "battery"), "underlying peer data should NOT be deleted, only hidden from swarm");
+
+    fleece_state_manager_merge_named(manager, peer_id, "battery", (const uint8_t*)"71", 2, 2, false);
+    CHECK(fleece_embedded_execute(embedded,
+        "if (Object.keys(swarm).length !== 1) throw new Error('the peer should reappear immediately once heard from again');"
+    ) == 0, "hearing from a stale peer again should immediately revive it in swarm");
+
+    fleece_embedded_destroy(embedded);
+    fleece_state_manager_destroy(manager);
+    printf("Done: peer TTL expiry test\n");
+}
+
 int main(void) {
     printf("Fleece Embedded (QuickJS self/swarm) Unit Tests\n");
     printf("=================================================\n\n");
@@ -162,6 +280,14 @@ int main(void) {
     test_console_log_no_crash();
     printf("\n");
     test_lifecycle_functions();
+    printf("\n");
+    test_world_binding();
+    printf("\n");
+    test_world_survive_and_propagate();
+    printf("\n");
+    test_shared_owner_hidden_from_swarm();
+    printf("\n");
+    test_peer_ttl_expiry();
     printf("\n");
 
     if (g_failures > 0) {

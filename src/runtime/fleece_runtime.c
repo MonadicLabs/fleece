@@ -27,7 +27,8 @@ struct FleeceRuntime {
     FleecePlatform* platform;
     pthread_t main_thread;
     int script_fd;
-    uint64_t gossip_watermark;   // local timestamp as of the last gossip send
+    uint64_t self_gossip_watermark;     // local timestamp as of the last self-stream gossip send
+    uint64_t shared_gossip_watermark;   // local timestamp as of the last shared/"world"-stream gossip send
     uint32_t gossip_tick_count;
 };
 
@@ -111,6 +112,12 @@ int fleece_runtime_load_script(FleeceRuntime* runtime, const char* source) {
     return fleece_embedded_load_script(runtime->embedded, source, "<script>");
 }
 
+int fleece_runtime_set_peer_ttl_ticks(FleeceRuntime* runtime, uint64_t ttl_ticks) {
+    if (!runtime) return -1;
+
+    return fleece_embedded_set_peer_ttl_ticks(runtime->embedded, ttl_ticks);
+}
+
 int fleece_runtime_start(FleeceRuntime* runtime) {
     if (!runtime || runtime->is_running) {
         return -1;
@@ -126,28 +133,46 @@ int fleece_runtime_start(FleeceRuntime* runtime) {
 
     // Main runtime loop
     while (runtime->is_running) {
+        fleece_state_manager_tick(runtime->state_manager);  // drives peer liveness (swarm TTL); see fleece_state_manager_ticks_since_seen
+
         // Phase 1: Input (Sensors/Radio)
         fleece_comms_process_input(runtime->comms);
 
         // Phase 2: Script Execution (QuickJS VM) - runs before gossip so any
-        // self.xxx changes made this tick are broadcast this tick, not next.
+        // self.xxx/world.xxx changes made this tick are broadcast this tick, not next.
         fleece_embedded_call_step(runtime->embedded);
 
-        // Phase 3: Gossip (State Synchronization) - broadcast what changed since
-        // the last send (delta), with a periodic full resync so a peer can
-        // recover from a dropped packet instead of missing that update forever.
-        // Peers' fields arrive via runtime_gossip_receive() and merge into swarm.
+        // Phase 3: Gossip (State Synchronization) - two independent streams, each
+        // delta-by-default with a periodic full resync (anti-entropy) so a peer
+        // can recover from a dropped packet instead of missing an update forever:
+        //   - self: this node's own fields (owner = its own node id)
+        //   - shared: the "world" collection (owner = FLEECE_SHARED_OWNER_ID),
+        //     which any node may write/relay - not tied to any single node's liveness.
+        // Peers' frames arrive via runtime_gossip_receive() and merge into swarm/world.
         bool full_resync = (runtime->gossip_tick_count % FLEECE_GOSSIP_FULL_RESYNC_TICKS) == 0;
-        uint8_t* gossip_frame = NULL;
-        uint32_t gossip_size = 0;
-        int gossip_rc = full_resync
-            ? fleece_state_manager_export(runtime->state_manager, &gossip_frame, &gossip_size)
-            : fleece_state_manager_export_delta(runtime->state_manager, runtime->gossip_watermark, &gossip_frame, &gossip_size);
-        if (gossip_rc == 0) {
-            fleece_comms_send(runtime->comms, "broadcast", gossip_frame, gossip_size);
-            free(gossip_frame);
+
+        uint8_t* self_frame = NULL;
+        uint32_t self_frame_size = 0;
+        int self_rc = full_resync
+            ? fleece_state_manager_export(runtime->state_manager, &self_frame, &self_frame_size)
+            : fleece_state_manager_export_delta(runtime->state_manager, runtime->self_gossip_watermark, &self_frame, &self_frame_size);
+        if (self_rc == 0) {
+            fleece_comms_send(runtime->comms, "broadcast", self_frame, self_frame_size);
+            free(self_frame);
         }
-        runtime->gossip_watermark = fleece_state_manager_get_local_timestamp(runtime->state_manager);
+        runtime->self_gossip_watermark = fleece_state_manager_get_local_timestamp(runtime->state_manager);
+
+        uint8_t* shared_frame = NULL;
+        uint32_t shared_frame_size = 0;
+        int shared_rc = full_resync
+            ? fleece_state_manager_export_shared(runtime->state_manager, &shared_frame, &shared_frame_size)
+            : fleece_state_manager_export_shared_delta(runtime->state_manager, runtime->shared_gossip_watermark, &shared_frame, &shared_frame_size);
+        if (shared_rc == 0) {
+            fleece_comms_send(runtime->comms, "broadcast", shared_frame, shared_frame_size);
+            free(shared_frame);
+        }
+        runtime->shared_gossip_watermark = fleece_state_manager_get_local_timestamp(runtime->state_manager);
+
         runtime->gossip_tick_count++;
 
         // Phase 4: Output (Actuators/Mesh Broadcast)

@@ -32,9 +32,18 @@ int fleece_embedded_set_state_manager(FleeceEmbedded* embedded, FleeceStateManag
 // Call before fleece_embedded_register_c_functions().
 int fleece_embedded_set_platform(FleeceEmbedded* embedded, FleecePlatform* platform);
 
-// Register the native bindings (console.log, self, swarm, platform) with the
-// JS context. Requires fleece_embedded_set_state_manager() to have been
-// called first.
+// Sets the peer liveness TTL (in runtime loop ticks) used to hide dead/silent
+// peers from the "swarm" script global. Optional - if never called, a
+// default (FLEECE_DEFAULT_PEER_TTL_TICKS) applies. A peer not heard from
+// (see fleece_state_manager_ticks_since_seen) within this many ticks is
+// excluded from swarm, though its underlying data is not deleted - it
+// reappears immediately once a new frame arrives. Does not affect "world"
+// (shared fields have no single owner to go stale).
+int fleece_embedded_set_peer_ttl_ticks(FleeceEmbedded* embedded, uint64_t ttl_ticks);
+
+// Register the native bindings (console.log, self, swarm, platform, world)
+// with the JS context. Requires fleece_embedded_set_state_manager() to have
+// been called first.
 int fleece_embedded_register_c_functions(FleeceEmbedded* embedded);
 
 // Evaluate a script's source once. Top-level function declarations (e.g.
