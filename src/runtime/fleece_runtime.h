@@ -14,8 +14,17 @@ extern "C" {
 // Runtime state type
     typedef struct FleeceRuntime FleeceRuntime;
 
-// Create a new runtime instance
+// Create a new runtime instance (local node id defaults to a fixed placeholder -
+// see fleece_state_manager_create)
 FleeceRuntime* fleece_runtime_create(void);
+
+// Create a new runtime instance with an explicit local node id. Needed to run
+// more than one real node id in the same process, or to give a node a stable
+// identity across restarts (e.g. derived from a CLI argument or hardware id)
+// instead of the shared placeholder every fleece_runtime_create() instance
+// otherwise gets. Returns NULL if node_id == FLEECE_SHARED_OWNER_ID (see
+// fleece_state_manager_create_with_node_id).
+FleeceRuntime* fleece_runtime_create_with_node_id(uint64_t node_id);
 
 // Destroy runtime instance
 void fleece_runtime_destroy(FleeceRuntime* runtime);

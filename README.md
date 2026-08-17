@@ -1,5 +1,7 @@
 # Fleece - Lightweight Swarm Coordination Runtime
 
+[![CI](https://github.com/MonadicLabs/fleece/actions/workflows/ci.yml/badge.svg)](https://github.com/MonadicLabs/fleece/actions/workflows/ci.yml)
+
 fleece is a **lightweight, decentralized swarm coordination runtime** designed for **microcontrollers**.
 
 ## Key Features
@@ -20,10 +22,12 @@ fleece is a **lightweight, decentralized swarm coordination runtime** designed f
 - Sandboxed execution for security
 
 ### 📦 Gossip State
-- **Compact binary framing** for bandwidth-limited links (not CBOR - a small length-prefixed record format, see `src/state/fleece_state_manager.c`)
+- **Real CBOR (RFC 8949) framing** for bandwidth-limited links - a 3-byte magic/version prefix followed by a CBOR-encoded record array, see `src/state/fleece_state_manager.c`
 - **Delta gossip**: each tick sends only fields changed since the last send, with a periodic full-state resync so a peer can recover from a dropped packet
 - **Two independent streams**: `self` (owned by each node) and shared/`world` (owned by no single node, relayed by whoever holds a copy)
 - **Full replication of `world`**: every node re-broadcasts everything it currently holds, not just what it personally discovered, so a `world` entry propagates node-to-node until every reachable unit has it (multi-hop, once comms has a real transport); the periodic full resync also catches any node that missed a relay or joined late
+- **Deterministic convergence on `world` conflicts**: every shared record carries its true author (`origin_node_id`), so if two nodes write the same field at the exact same logical timestamp, all nodes converge on the identical winner (higher origin id) instead of each side keeping its own write forever
+- **`worldCompareAndSet`**: a local compare-and-set primitive for building safe claim protocols on top of `world` (e.g. "claim this target only if unclaimed") - see the World section below
 - **Peer liveness / heartbeat**: every gossip frame (even an empty delta) counts as a heartbeat; a peer not heard from within a configurable TTL disappears from `swarm` (its data isn't deleted, just hidden - it reappears immediately once heard from again)
 - Efficient field-level versioning and conflict resolution
 
@@ -55,14 +59,14 @@ The core execution model follows a synchronized **4-phase coordination cycle**, 
 
 ### Consistency
 - **Eventually consistent** via monotonic timestamps
-- **Deterministic node-ID tie-breaking** for conflict resolution
+- **Deterministic node-ID tie-breaking** for conflict resolution: `self`/`swarm` fields are safe by construction (a given (name, owner) pair only ever has one real writer); `world` fields can genuinely be written by two different nodes at the exact same logical timestamp, so those records carry their true author's id and break exact ties by higher id, consistently on every node
 - **Conflict-free Replicated Data Types (CRDT)** principles
 - No central authority or master nodes
 
 ### Serialization
-- **Compact binary gossip frame** for all state (not CBOR - see `fleece_state_manager_export`/`_import`/`_export_delta`)
+- **Real CBOR (RFC 8949)** gossip frames for all state (see `fleece_state_manager_export`/`_import`/`_export_delta`) - a minimal encoder/decoder supporting just the CBOR major types actually needed (uint, byte string, text string, array, bool), not a general-purpose codec
 - **Minimal overhead** for bandwidth-constrained links
-- **Field-level versioning** via per-field timestamp + owner node id
+- **Field-level versioning** via per-field timestamp + owner node id (shared/`world` records additionally carry the true author's id, `origin_node_id`, distinct from the storage owner - see Consistency below)
 - **Delta export** by default (only fields changed since a watermark timestamp), with a full export every `FLEECE_GOSSIP_FULL_RESYNC_TICKS` ticks as anti-entropy
 
 ### Constraints
@@ -98,6 +102,10 @@ The core execution model follows a synchronized **4-phase coordination cycle**, 
 #### FleeceRuntime
 ```c
 FleeceRuntime* runtime = fleece_runtime_create();
+// or, to give this process a specific/stable node id (e.g. running more than
+// one real node in the same process, or deriving an id from a CLI argument -
+// see examples/example2_search_and_deliver.c):
+// FleeceRuntime* runtime = fleece_runtime_create_with_node_id(node_id);
 fleece_runtime_load_script(runtime, script_source); // defines init/step/reset/destroy
 fleece_runtime_start(runtime);                      // calls init(), then the 4-phase loop, then destroy()
 fleece_runtime_destroy(runtime);
@@ -119,12 +127,28 @@ fleece_state_manager_remove(manager, key);
 ```
 
 #### FleeceComms
+The comms module itself is a transport-agnostic simulation - fleece ships no real radio/socket backend. Real transports are wired in entirely from outside via three callbacks, all optional:
 ```c
 FleeceComms* comms = fleece_comms_create();
 fleece_comms_initialize(comms);
+
+// Called after a successful fleece_comms_send() - do the real send here.
+fleece_comms_set_send_callback(comms, my_send, my_transport);
+
+// Called once per fleece_comms_process_input() (i.e. once per runtime tick) -
+// do your own periodic I/O here (e.g. poll a non-blocking socket). Fleece has
+// no opinion on what happens inside it.
+fleece_comms_set_poll_callback(comms, my_poll, my_transport);
+
+// (fleece_comms_set_receive_callback also exists but nothing in the runtime
+// currently drives it - see examples/example2_search_and_deliver.c for the
+// pattern actually used: feed received bytes straight into
+// fleece_state_manager_import() from inside the poll callback instead.)
+
 fleece_comms_process_input(comms);
 fleece_comms_process_output(comms);
 ```
+See `examples/example2_search_and_deliver.c` for a complete real backend (UDP multicast) built entirely on these two callbacks, with zero transport-specific code in the library itself.
 
 #### FleeceEmbedded
 ```c
@@ -138,6 +162,7 @@ fleece_embedded_load_script(embedded,
     "function step() {\n"
     "  self.status = 'ok';\n"
     "  console.log('id', self.id, 'peers', Object.keys(swarm).length, 'world entries', Object.keys(world).length);\n"
+    "  worldCompareAndSet('lock', undefined, self.id);  // claim-if-absent; see the World section below\n"
     "}\n", "<script>");
 fleece_embedded_call_step(embedded);
 fleece_embedded_destroy(embedded);
@@ -178,8 +203,10 @@ fleece/
 │   └── core/            # Dead/unused - see include/core
 ├── third_party/
 │   └── quickjs/          # QuickJS-ng, git submodule
-├── examples/             # Example applications
-│   └── example1.c       # Basic swarm coordination example
+├── examples/             # Example applications (one executable per .c file)
+│   ├── example1.c       # Basic swarm coordination example (single process, simulated peer loopback)
+│   ├── example2_search_and_deliver.c  # Search + CBAA task allocation + delivery over real UDP multicast (multi-process)
+│   └── run_swarm.sh     # Launches N example2 agents as real processes with prefixed, interleaved output
 ├── tests/                # Unit tests (one executable per file, run via ctest)
 │   ├── test_state_manager.c # Raw LWW store tests
 │   ├── test_gossip.c        # Export/import/merge/delta wire format tests
@@ -196,6 +223,7 @@ fleece/
 - GCC or compatible C compiler
 - CMake 3.10 or higher
 - Standard POSIX library (for `clock_gettime` and `nanosleep`)
+- Linux or macOS with multicast-capable networking, to run `example2_search_and_deliver` (it uses BSD/glibc UDP multicast sockets - not needed to build/test the library itself)
 
 ### Building
 ```bash
@@ -213,8 +241,21 @@ cd build && ctest --output-on-failure
 
 ### Running Examples
 ```bash
-# Basic swarm coordination example
+# Basic swarm coordination example (single process)
 ./build/example1
+
+# Search + CBAA task allocation + delivery, over real UDP multicast.
+# Run as two (or more) SEPARATE processes to see real multi-process gossip -
+# each argument is a small distinct agent number, not a full node id:
+./build/example2_search_and_deliver 1 &
+./build/example2_search_and_deliver 2 &
+
+# ...or use the launcher, which spawns N real agent processes for you and
+# interleaves their output with an [agent N] prefix - one command, no manual
+# terminal juggling:
+examples/run_swarm.sh          # 3 agents, until Ctrl+C
+examples/run_swarm.sh 5        # 5 agents, until Ctrl+C
+examples/run_swarm.sh 3 10     # 3 agents, stops automatically after 10s
 ```
 
 ## Usage Examples
@@ -247,14 +288,36 @@ fleece_embedded_execute(embedded,
 ```c
 // Any node can publish, claim, or update a "world" entry - it's not tied to
 // this node's liveness and gets relayed to every reachable unit (see the
-// Gossip State section above). Equivalent C API: fleece_state_manager_set_shared.
+// Gossip State section above). Plain reads/writes go through the world Proxy,
+// same as self. Equivalent C API: fleece_state_manager_set_shared/get_named.
 fleece_embedded_execute(embedded,
     "if (!('T1' in world)) {\n"
-    "  world.T1 = { lat: 42.1, lon: -71.05, type: 'debris', assignedTo: null };\n"
-    "} else if (world.T1.assignedTo === null) {\n"
-    "  world.T1 = Object.assign({}, world.T1, { assignedTo: self.id });\n"  // claim it
+    "  world.T1 = { lat: 42.1, lon: -71.05, type: 'debris' };\n"
     "}");
 ```
+
+Publishing a target this way is safe (any node can add or read entries), but **claiming** one needs care: two units could both read "unclaimed" in the same round before either's claim has propagated, and both would think they won. Use `worldCompareAndSet` (backed by `fleece_state_manager_set_shared_cas`) for that - it's a *local* compare-and-set (each node only sees what it currently knows, there's no central lock), so pair it with a re-check a tick or two later once gossip has had a chance to propagate:
+```c
+fleece_embedded_execute(embedded,
+    "// Optimistically claim - fails harmlessly (returns false) if someone else already has.\n"
+    "var task = world.T1;\n"
+    "if (task && task.assignedTo === undefined) {\n"
+    "  worldCompareAndSet('T1', task, Object.assign({}, task, { assignedTo: self.id }));\n"
+    "}\n"
+    "// A few ticks later, in step(): re-check the claim actually stuck (see\n"
+    "// fleece_state_manager_set_shared_cas doc comment for why this recheck matters).\n"
+    "if (world.T1 && world.T1.assignedTo === self.id) {\n"
+    "  /* proceed with the task */\n"
+    "}");
+```
+
+### Full Example: Search + Task Allocation + Delivery
+`examples/example2_search_and_deliver.c` puts the pieces above together into a complete, runnable multi-unit scenario:
+- **Search**: each unit independently "discovers" a fixed set of hardcoded targets after a short delay and publishes any it doesn't yet see in `world`, via the `if (!(id in world))` pattern above - duplicate discoveries by multiple units harmlessly settle to one record.
+- **Task allocation**: a CBAA-flavored auction (Consensus-Based Auction Algorithm - the single-task-per-agent sibling of CBBA) built entirely in the JS layer: each unit scores itself against every open target, bids on the best one via `worldCompareAndSet`, and re-checks its claim every tick - if outbid (a higher-scoring bid displaced it), it releases the claim and re-enters the bidding pool. Each unit pursues **at most one task at a time**.
+- **Delivery**: once a claim has held for a settle window (long enough for gossip to propagate and any competing bid to surface), the unit marks the task delivered, again via `worldCompareAndSet`.
+- **Real transport**: unlike `example1.c`'s single-process simulated loopback, this example wires `FleeceComms`'s send/poll callbacks to a real UDP multicast socket (see the FleeceComms section above) - run it as two or more separate OS processes to see the whole thing converge over an actual network stack, not just in-process. All of the socket code lives in the example; the library itself never touches a socket.
+- **`examples/run_swarm.sh [num_agents] [duration_seconds]`**: a launcher that spawns that many real agent processes for you (default 3) and prefixes/interleaves their output as `[agent N] ...`, so a single command demonstrates the whole swarm instead of needing several manually-opened terminals.
 
 ### Mesh Communication
 ```c
@@ -291,14 +354,13 @@ MIT License - See LICENSE file for details
 ## Future Work
 
 ### Planned Enhancements
-1. **Real transport for comms** (Reticulum/radio) - the comm bus is currently a single-process simulation
-2. **CBOR (or similar) implementation** for state serialization - state currently uses a simpler custom binary gossip frame
-3. **A `reset()` trigger** - the lifecycle function is callable but nothing in the runtime calls it automatically yet
-4. **Real hardware platform bindings** (e.g. a MAVLink or ROS2 integration registering functions via `fleece_platform_register`) - the registry exists but ships with nothing registered
-5. **Hardware-specific optimizations** (ESP32, STM32, etc.) and validation on an actual microcontroller target (currently desktop POSIX only)
-6. **More example applications** (leader election, foraging, etc.)
-7. **Performance profiling** and optimization
-8. **Documentation updates** and tutorials
+1. **A built-in Reticulum/radio transport** for comms - `example2_search_and_deliver.c` shows a real transport (UDP multicast) is fully possible via the existing send/poll callbacks, but fleece itself still ships only the simulated default backend
+2. **A `reset()` trigger** - the lifecycle function is callable but nothing in the runtime calls it automatically yet
+3. **Real hardware platform bindings** (e.g. a MAVLink or ROS2 integration registering functions via `fleece_platform_register`) - the registry exists but ships with nothing registered
+4. **Hardware-specific optimizations** (ESP32, STM32, etc.) and validation on an actual microcontroller target (currently desktop POSIX only)
+5. **More example applications** (leader election, foraging, etc.)
+6. **Performance profiling** and optimization
+7. **Documentation updates** and tutorials
 
 ### Design Considerations
 - **Backward compatibility** in the API

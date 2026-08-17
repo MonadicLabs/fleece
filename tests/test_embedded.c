@@ -176,6 +176,33 @@ static void test_world_binding(void) {
     printf("Done: world binding test\n");
 }
 
+static void test_world_compare_and_set(void) {
+    printf("Running worldCompareAndSet test...\n");
+
+    FleeceStateManager* manager = fleece_state_manager_create_with_node_id(0x6161616161616161ULL);
+    FleeceEmbedded* embedded = make_embedded(manager);
+
+    CHECK(fleece_embedded_execute(embedded,
+        "if (worldCompareAndSet('T1', undefined, { status: 'discovered' }) !== true) throw new Error('claim-if-absent should succeed when T1 does not exist');"
+        "if (JSON.stringify(world.T1) !== '{\"status\":\"discovered\"}') throw new Error('T1 should reflect the claimed value: ' + JSON.stringify(world.T1));"
+    ) == 0, "worldCompareAndSet(name, undefined, value) should claim an absent field");
+
+    CHECK(fleece_embedded_execute(embedded,
+        "if (worldCompareAndSet('T1', undefined, { status: 'stolen' }) !== false) throw new Error('a second claim-if-absent should fail now that T1 exists');"
+        "if (JSON.stringify(world.T1) !== '{\"status\":\"discovered\"}') throw new Error('a failed CAS must not modify the existing value: ' + JSON.stringify(world.T1));"
+    ) == 0, "worldCompareAndSet should return false (not throw) on a losing race, and leave the value untouched");
+
+    CHECK(fleece_embedded_execute(embedded,
+        "if (worldCompareAndSet('T1', { status: 'wrong' }, { status: 'claimed' }) !== false) throw new Error('CAS with a mismatched expected value should fail');"
+        "if (worldCompareAndSet('T1', { status: 'discovered' }, { status: 'claimed' }) !== true) throw new Error('CAS with the correct expected value should succeed');"
+        "if (JSON.stringify(world.T1) !== '{\"status\":\"claimed\"}') throw new Error('T1 should now reflect the claim: ' + JSON.stringify(world.T1));"
+    ) == 0, "worldCompareAndSet should support compare-and-update, not just claim-if-absent");
+
+    fleece_embedded_destroy(embedded);
+    fleece_state_manager_destroy(manager);
+    printf("Done: worldCompareAndSet test\n");
+}
+
 static void test_world_survive_and_propagate(void) {
     printf("Running world survive+propagate (embedded-level) test...\n");
 
@@ -282,6 +309,8 @@ int main(void) {
     test_lifecycle_functions();
     printf("\n");
     test_world_binding();
+    printf("\n");
+    test_world_compare_and_set();
     printf("\n");
     test_world_survive_and_propagate();
     printf("\n");

@@ -112,6 +112,13 @@ uint32_t fleece_state_manager_list_fields(FleeceStateManager* manager, uint64_t 
 // local node's own fields (owner_node_id must not equal the local node id).
 int fleece_state_manager_merge_named(FleeceStateManager* manager, uint64_t owner_node_id, const char* name, const uint8_t* data, uint32_t size, uint64_t remote_timestamp, bool is_tombstone);
 
+// Merge a shared/"world" field received via gossip (owner = FLEECE_SHARED_OWNER_ID).
+// origin_node_id is the real node that authored this value - distinct from the
+// storage owner, and used to break exact-timestamp ties deterministically
+// (see the "Shared fields" section below). LWW otherwise works the same way
+// as fleece_state_manager_merge_named.
+int fleece_state_manager_merge_shared(FleeceStateManager* manager, uint64_t origin_node_id, const char* name, const uint8_t* data, uint32_t size, uint64_t remote_timestamp, bool is_tombstone);
+
 // --- Shared fields (backs the "world" script object) ---
 //
 // Unlike self (owned by the local node) or swarm (a read-only view of peers'
@@ -126,6 +133,15 @@ int fleece_state_manager_merge_named(FleeceStateManager* manager, uint64_t owner
 // synchronized wall clock or a vector clock - neither exists here; this is a
 // known, accepted limitation, not a bug.
 //
+// A separate, narrower problem IS fixed: if two nodes write the same field
+// with the exact same timestamp (plausible - local_timestamp is a small
+// per-node counter, not a high-resolution clock), fleece_state_manager_import
+// / fleece_state_manager_merge_shared track each value's true author
+// (origin_node_id, distinct from the FLEECE_SHARED_OWNER_ID used for storage/
+// routing) and break exact ties deterministically (higher origin_node_id
+// wins) - so every node converges on the SAME winner, rather than each side
+// stubbornly keeping its own write forever.
+//
 // Shared fields are NOT tied to any real node's liveness (see
 // fleece_state_manager_ticks_since_seen) - a target persists until explicitly
 // removed, independent of which node(s) discovered or last touched it.
@@ -137,6 +153,37 @@ int fleece_state_manager_set_shared(FleeceStateManager* manager, const char* nam
 int fleece_state_manager_remove_shared(FleeceStateManager* manager, const char* name);
 // (reads reuse fleece_state_manager_get_named/exists_named/list_fields with
 // owner_node_id = FLEECE_SHARED_OWNER_ID - no separate read API needed)
+
+// Local compare-and-set for a shared field: applies new_data only if the
+// CURRENTLY stored bytes for `name` exactly match expected_data/expected_size.
+// Pass expected_data == NULL (expected_size ignored) to require the field be
+// currently absent/tombstoned - e.g. "claim only if unclaimed". Returns 0 if
+// the write was applied, 1 if the comparison failed (not an error - just
+// "someone/something else got there first" from this node's local point of
+// view), -1 on a real error (bad arguments, capacity).
+//
+// This is a LOCAL compare-and-set only: it compares against what THIS node
+// currently knows, so two nodes can still both succeed "locally" before
+// either has heard from the other - there is no central lock or consensus
+// here, by design. Combined with the deterministic origin-id tie-break above
+// (so every node converges on the same eventual winner even after such a
+// race), the recommended pattern for claiming something contested is:
+// optimistically CAS your claim in, then a few ticks later re-check that your
+// claim is still the one that stuck (gossip needs time to propagate) and back
+// off if it isn't.
+int fleece_state_manager_set_shared_cas(FleeceStateManager* manager, const char* name,
+                                          const uint8_t* expected_data, uint32_t expected_size,
+                                          const uint8_t* new_data, uint32_t new_size);
+
+// Gossip wire frames are real CBOR (RFC 8949), not a bespoke format: a 3-byte
+// ['F']['G'][version] prefix (a quick sanity/version check that isn't itself
+// part of the CBOR payload) followed by a CBOR-encoded
+// [owner_node_id, [record, record, ...]] array. A self-stream record is
+// [is_tombstone, name, timestamp, data]; a shared/"world"-stream record
+// additionally carries its author up front: [origin_node_id, is_tombstone,
+// name, timestamp, data] (see fleece_state_manager_merge_shared). Only the
+// CBOR major types actually needed here are supported (uint, bstring,
+// tstring, array, bool) - this is not a general-purpose CBOR codec.
 
 // Export the local node's own named fields as a gossip wire frame (full state)
 int fleece_state_manager_export(FleeceStateManager* manager, uint8_t** frame_data, uint32_t* frame_size);
@@ -156,7 +203,7 @@ int fleece_state_manager_export_shared_delta(FleeceStateManager* manager, uint64
 // Import a gossip wire frame received from a peer, merging its fields with LWW.
 // Handles both self-stream and shared-stream frames - the frame's own
 // owner_node_id (a real peer id, or FLEECE_SHARED_OWNER_ID) determines where
-// the fields land.
+// the fields land and which record shape (see above) to expect.
 int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size);
 
 #ifdef __cplusplus

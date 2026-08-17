@@ -474,6 +474,86 @@ static JSValue js_world_keys(JSContext* ctx, JSValueConst this_val, int argc, JS
     return names_to_js_array(ctx, names, count);
 }
 
+// worldCompareAndSet(name, expectedValueOrUndefined, newValue) -> bool.
+// A permanent global function (unlike the underscore-prefixed __world_*
+// plumbing, which the prelude deletes after wiring up the Proxy) - not part
+// of the `world` Proxy itself, since Proxy traps only see property
+// get/set/delete, not a 3-argument atomic operation. expectedValueOrUndefined
+// === undefined means "the field must not currently exist" (claim-if-absent);
+// see fleece_state_manager_set_shared_cas for the exact semantics and the
+// claim-then-recheck pattern this is meant to support.
+static JSValue js_world_compare_and_set(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    (void)this_val;
+    FleeceEmbedded* emb = get_embedded(ctx);
+    if (!emb || !emb->manager) return JS_UNDEFINED;
+    if (argc < 3) return JS_ThrowTypeError(ctx, "worldCompareAndSet requires a name, an expected value (or undefined), and a new value");
+
+    const char* name = JS_ToCString(ctx, argv[0]);
+    if (!name) return JS_EXCEPTION;
+
+    bool expect_absent = JS_IsUndefined(argv[1]);
+    JSValue expected_json = JS_UNDEFINED;
+    const char* expected_text = NULL;
+    size_t expected_len = 0;
+    if (!expect_absent) {
+        expected_json = JS_JSONStringify(ctx, argv[1], JS_UNDEFINED, JS_UNDEFINED);
+        if (JS_IsException(expected_json)) {
+            JS_FreeCString(ctx, name);
+            return JS_EXCEPTION;
+        }
+        if (JS_IsUndefined(expected_json)) {
+            JS_FreeValue(ctx, expected_json);
+            JSValue err = JS_ThrowTypeError(ctx, "worldCompareAndSet: expected value is not JSON-serializable");
+            JS_FreeCString(ctx, name);
+            return err;
+        }
+        expected_text = JS_ToCStringLen(ctx, &expected_len, expected_json);
+        if (!expected_text) {
+            JS_FreeValue(ctx, expected_json);
+            JS_FreeCString(ctx, name);
+            return JS_EXCEPTION;
+        }
+    }
+
+    JSValue new_json = JS_JSONStringify(ctx, argv[2], JS_UNDEFINED, JS_UNDEFINED);
+    if (JS_IsException(new_json)) {
+        if (expected_text) JS_FreeCString(ctx, expected_text);
+        if (!expect_absent) JS_FreeValue(ctx, expected_json);
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
+    if (JS_IsUndefined(new_json)) {
+        JS_FreeValue(ctx, new_json);
+        if (expected_text) JS_FreeCString(ctx, expected_text);
+        if (!expect_absent) JS_FreeValue(ctx, expected_json);
+        JSValue err = JS_ThrowTypeError(ctx, "worldCompareAndSet: new value is not JSON-serializable");
+        JS_FreeCString(ctx, name);
+        return err;
+    }
+    size_t new_len = 0;
+    const char* new_text = JS_ToCStringLen(ctx, &new_len, new_json);
+    if (!new_text) {
+        JS_FreeValue(ctx, new_json);
+        if (expected_text) JS_FreeCString(ctx, expected_text);
+        if (!expect_absent) JS_FreeValue(ctx, expected_json);
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
+
+    int rc = fleece_state_manager_set_shared_cas(emb->manager, name,
+        expect_absent ? NULL : (const uint8_t*)expected_text, (uint32_t)expected_len,
+        (const uint8_t*)new_text, (uint32_t)new_len);
+
+    JS_FreeCString(ctx, new_text);
+    JS_FreeValue(ctx, new_json);
+    if (expected_text) JS_FreeCString(ctx, expected_text);
+    if (!expect_absent) JS_FreeValue(ctx, expected_json);
+    JS_FreeCString(ctx, name);
+
+    if (rc < 0) return JS_ThrowTypeError(ctx, "worldCompareAndSet: failed (bad arguments or state store full)");
+    return JS_NewBool(ctx, rc == 0);
+}
+
 static JSValue js_platform_names(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     (void)this_val; (void)argc; (void)argv;
     FleeceEmbedded* emb = get_embedded(ctx);
@@ -626,6 +706,9 @@ int fleece_embedded_register_c_functions(FleeceEmbedded* embedded) {
     JS_SetPropertyStr(ctx, global, "__world_set", JS_NewCFunction(ctx, js_world_set, "__world_set", 2));
     JS_SetPropertyStr(ctx, global, "__world_delete", JS_NewCFunction(ctx, js_world_delete, "__world_delete", 1));
     JS_SetPropertyStr(ctx, global, "__world_keys", JS_NewCFunction(ctx, js_world_keys, "__world_keys", 0));
+    // Permanent global (not deleted by the prelude below, unlike __world_* above) -
+    // a 3-argument atomic operation doesn't fit the world Proxy's get/set/delete traps.
+    JS_SetPropertyStr(ctx, global, "worldCompareAndSet", JS_NewCFunction(ctx, js_world_compare_and_set, "worldCompareAndSet", 3));
 
     JS_FreeValue(ctx, global);
 

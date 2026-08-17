@@ -50,14 +50,15 @@ static void runtime_gossip_receive(const char* source, const uint8_t* data, uint
     fleece_state_manager_import(runtime->state_manager, data, size);
 }
 
-FleeceRuntime* fleece_runtime_create(void) {
+static FleeceRuntime* runtime_create_internal(FleeceStateManager* state_manager) {
     FleeceRuntime* runtime = (FleeceRuntime*)calloc(1, sizeof(FleeceRuntime));
     if (!runtime) {
+        fleece_state_manager_destroy(state_manager);
         return NULL;
     }
 
     runtime->is_running = 0;
-    runtime->state_manager = fleece_state_manager_create();
+    runtime->state_manager = state_manager;
     runtime->comms = fleece_comms_create();
     runtime->embedded = fleece_embedded_create();
     runtime->platform = fleece_platform_create();
@@ -77,6 +78,14 @@ FleeceRuntime* fleece_runtime_create(void) {
     global_runtime = runtime;
 
     return runtime;
+}
+
+FleeceRuntime* fleece_runtime_create(void) {
+    return runtime_create_internal(fleece_state_manager_create());
+}
+
+FleeceRuntime* fleece_runtime_create_with_node_id(uint64_t node_id) {
+    return runtime_create_internal(fleece_state_manager_create_with_node_id(node_id));
 }
 
 void fleece_runtime_destroy(FleeceRuntime* runtime) {

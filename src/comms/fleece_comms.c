@@ -19,6 +19,9 @@ struct FleeceComms {
 
     FleeceCommsReceiveCallback receive_callback;
     void* receive_callback_user_data;
+
+    FleeceCommsPollCallback poll_callback;
+    void* poll_callback_user_data;
 };
 
 FleeceComms* fleece_comms_create(void) {
@@ -44,9 +47,13 @@ void fleece_comms_destroy(FleeceComms* comms) {
 
 void fleece_comms_process_input(FleeceComms* comms) {
     if (!comms || !comms->is_initialized) return;
-    
+
     // Simulate receiving packets (in real implementation, this would read from radio)
     printf("Processing incoming comms (packets received: %u)\n", comms->packet_count);
+
+    if (comms->poll_callback) {
+        comms->poll_callback(comms->poll_callback_user_data);
+    }
 }
 
 void fleece_comms_process_output(FleeceComms* comms) {
@@ -130,4 +137,11 @@ void fleece_comms_set_receive_callback(FleeceComms* comms, FleeceCommsReceiveCal
 
     comms->receive_callback = callback;
     comms->receive_callback_user_data = user_data;
+}
+
+void fleece_comms_set_poll_callback(FleeceComms* comms, FleeceCommsPollCallback callback, void* user_data) {
+    if (!comms) return;
+
+    comms->poll_callback = callback;
+    comms->poll_callback_user_data = user_data;
 }

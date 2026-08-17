@@ -123,6 +123,17 @@ static void test_self_owned_rejection(void) {
     printf("Done: self-owned-frame rejection test\n");
 }
 
+// Frames are real CBOR (see fleece_state_manager.c) behind a 3-byte
+// ['F']['G'][version] prefix: [owner_node_id, [records...]], where a
+// self-stream record is [is_tombstone, name, timestamp, data]. These are
+// small hand-built CBOR fragments (all values kept < 24 so each head is a
+// single byte: (major << 5) | value) - see RFC 8949 for the encoding.
+#define CBOR_ARRAY(n) (uint8_t)(0x80 | (n))
+#define CBOR_UINT(n)  (uint8_t)(0x00 | (n))
+#define CBOR_BOOL_FALSE 0xF4
+#define CBOR_TEXT(n)  (uint8_t)(0x60 | (n))
+#define CBOR_BYTES(n) (uint8_t)(0x40 | (n))
+
 static void test_malformed_frames(void) {
     printf("Running malformed frame test...\n");
 
@@ -134,19 +145,49 @@ static void test_malformed_frames(void) {
     CHECK(fleece_state_manager_import(m, tiny, 0) != 0, "zero-length frame should be rejected");
     CHECK(fleece_state_manager_import(m, tiny, 1) != 0, "too-short frame should be rejected");
 
-    uint8_t bad_magic[15] = {0};
-    bad_magic[0] = 'X';
-    bad_magic[1] = 'X';
-    bad_magic[2] = 1;
+    uint8_t bad_magic[8] = {'X', 'X', 2, 0, 0, 0, 0, 0};
     CHECK(fleece_state_manager_import(m, bad_magic, sizeof(bad_magic)) != 0, "wrong magic should be rejected");
 
-    // Valid header (owner id 0, distinct from m's id) claiming 5 fields with no room for any of them.
-    uint8_t truncated[15 + 2] = {0};
-    truncated[0] = 'F';
-    truncated[1] = 'G';
-    truncated[2] = 1;
-    truncated[11] = 5;  // field_count (LE u32 at offset 11)
-    CHECK(fleece_state_manager_import(m, truncated, sizeof(truncated)) != 0, "truncated field records should be rejected without crashing");
+    uint8_t bad_version[8] = {'F', 'G', 99, 0, 0, 0, 0, 0};
+    CHECK(fleece_state_manager_import(m, bad_version, sizeof(bad_version)) != 0, "wrong version should be rejected");
+
+    // Valid magic/version/outer-array/owner/record-count (claims 5 records) but
+    // truncated to zero bytes for the records themselves - the CBOR parser
+    // must bounds-check every item read, not just the fixed-size header.
+    uint8_t truncated_records[] = {'F', 'G', 2, CBOR_ARRAY(2), CBOR_UINT(5), CBOR_ARRAY(5)};
+    CHECK(fleece_state_manager_import(m, truncated_records, sizeof(truncated_records)) != 0, "truncated field records should be rejected without crashing");
+
+    // Outer array declares 3 elements instead of the required 2 (type/shape confusion).
+    uint8_t wrong_outer_arity[] = {'F', 'G', 2, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_ARRAY(0)};
+    CHECK(fleece_state_manager_import(m, wrong_outer_arity, sizeof(wrong_outer_arity)) != 0, "wrong outer array arity should be rejected");
+
+    // owner_node_id encoded as a text string instead of a uint (major-type confusion).
+    uint8_t wrong_owner_type[] = {'F', 'G', 2, CBOR_ARRAY(2), CBOR_TEXT(0), CBOR_ARRAY(0)};
+    CHECK(fleece_state_manager_import(m, wrong_owner_type, sizeof(wrong_owner_type)) != 0, "non-uint owner_node_id should be rejected");
+
+    // A single well-formed record (owner=5, is_tombstone=false, name="x", ts=1,
+    // data=[1 byte]) but the byte-string length claims 9 bytes when only 1 remains.
+    uint8_t oversized_data_len[] = {
+        'F', 'G', 2, CBOR_ARRAY(2), CBOR_UINT(5), CBOR_ARRAY(1),
+        CBOR_ARRAY(4), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x', CBOR_UINT(1), CBOR_BYTES(9), 0xAB
+    };
+    CHECK(fleece_state_manager_import(m, oversized_data_len, sizeof(oversized_data_len)) != 0, "a data length exceeding the remaining buffer should be rejected");
+
+    // Same shape, but the record's own inner array claims 3 elements instead of 4.
+    uint8_t wrong_record_arity[] = {
+        'F', 'G', 2, CBOR_ARRAY(2), CBOR_UINT(5), CBOR_ARRAY(1),
+        CBOR_ARRAY(3), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x'
+    };
+    CHECK(fleece_state_manager_import(m, wrong_record_arity, sizeof(wrong_record_arity)) != 0, "wrong per-record array arity should be rejected");
+
+    // A well-formed, fully in-bounds record should actually be accepted (positive control
+    // proving the above rejections are about the corruption, not the hand-built encoding itself).
+    uint8_t valid_record[] = {
+        'F', 'G', 2, CBOR_ARRAY(2), CBOR_UINT(5), CBOR_ARRAY(1),
+        CBOR_ARRAY(4), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x', CBOR_UINT(1), CBOR_BYTES(1), 0xAB
+    };
+    CHECK(fleece_state_manager_import(m, valid_record, sizeof(valid_record)) == 0, "a well-formed hand-built CBOR frame should be accepted");
+    CHECK(fleece_state_manager_exists_named(m, 5, "x"), "the accepted record's field should actually be readable back");
 
     fleece_state_manager_destroy(m);
     printf("Done: malformed frame test (no crash)\n");
@@ -346,6 +387,95 @@ static void test_shared_fields_survive_discoverer_death(void) {
     printf("Done: shared fields survive discoverer death test\n");
 }
 
+// On an exact-timestamp tie for the same shared field, the higher
+// origin_node_id must win, and every node must converge on that SAME winner
+// regardless of the order the two competing writes arrive in - otherwise two
+// nodes racing to claim the same target could each end up believing THEY won.
+static void test_shared_field_tie_break_convergence(void) {
+    printf("Running shared field tie-break convergence test...\n");
+
+    uint64_t low_origin = 0x1111111111111111ULL;
+    uint64_t high_origin = 0x9999999999999999ULL;
+
+    FleeceStateManager* a = fleece_state_manager_create_with_node_id(0xAAAA111122223333ULL);
+    CHECK(fleece_state_manager_merge_shared(a, low_origin, "T1", (const uint8_t*)"\"low\"", 5, 100, false) == 0, "first merge (low origin) should apply");
+    CHECK(fleece_state_manager_merge_shared(a, high_origin, "T1", (const uint8_t*)"\"high\"", 6, 100, false) == 0, "merge should succeed even when it loses the tie-break (return code reflects the call, not who won)");
+
+    uint8_t* data = NULL;
+    uint32_t size = 0;
+    fleece_state_manager_get_named(a, FLEECE_SHARED_OWNER_ID, "T1", &data, &size);
+    CHECK(data != NULL && size == 6 && memcmp(data, "\"high\"", 6) == 0, "on a tie, the higher origin_node_id should win when it arrives second");
+    free(data);
+    fleece_state_manager_destroy(a);
+
+    // Reverse arrival order on a second, independent manager - must converge
+    // on the SAME winner (high_origin), proving this isn't a first-write-wins
+    // race dressed up as a tie-break.
+    FleeceStateManager* b = fleece_state_manager_create_with_node_id(0xBBBB111122223333ULL);
+    CHECK(fleece_state_manager_merge_shared(b, high_origin, "T1", (const uint8_t*)"\"high\"", 6, 100, false) == 0, "first merge (high origin) should apply");
+    CHECK(fleece_state_manager_merge_shared(b, low_origin, "T1", (const uint8_t*)"\"low\"", 5, 100, false) == 0, "merge should succeed even when it loses the tie-break");
+
+    data = NULL;
+    size = 0;
+    fleece_state_manager_get_named(b, FLEECE_SHARED_OWNER_ID, "T1", &data, &size);
+    CHECK(data != NULL && size == 6 && memcmp(data, "\"high\"", 6) == 0, "on a tie, the higher origin_node_id should win when it arrives first too - order must not matter");
+    free(data);
+    fleece_state_manager_destroy(b);
+
+    // A strictly newer timestamp still wins outright, regardless of origin id -
+    // the tie-break only kicks in on an exact match.
+    FleeceStateManager* c = fleece_state_manager_create_with_node_id(0xCCCC111122223333ULL);
+    CHECK(fleece_state_manager_merge_shared(c, high_origin, "T1", (const uint8_t*)"\"high\"", 6, 100, false) == 0, "seed with high origin at ts=100");
+    CHECK(fleece_state_manager_merge_shared(c, low_origin, "T1", (const uint8_t*)"\"newer\"", 7, 200, false) == 0, "a strictly newer write should apply");
+    data = NULL;
+    size = 0;
+    fleece_state_manager_get_named(c, FLEECE_SHARED_OWNER_ID, "T1", &data, &size);
+    CHECK(data != NULL && size == 7 && memcmp(data, "\"newer\"", 7) == 0, "a strictly newer timestamp should win outright, even from the lower origin id");
+    free(data);
+    fleece_state_manager_destroy(c);
+
+    printf("Done: shared field tie-break convergence test\n");
+}
+
+static void test_set_shared_cas(void) {
+    printf("Running set_shared_cas test...\n");
+
+    FleeceStateManager* m = fleece_state_manager_create_with_node_id(0xD0D0111122223333ULL);
+
+    // Claim-if-absent: expected_data == NULL means "must not currently exist".
+    CHECK(fleece_state_manager_set_shared_cas(m, "T1", NULL, 0, (const uint8_t*)"\"mine\"", 6) == 0, "CAS with expected=absent should succeed when the field doesn't exist yet");
+    uint8_t* data = NULL;
+    uint32_t size = 0;
+    fleece_state_manager_get_named(m, FLEECE_SHARED_OWNER_ID, "T1", &data, &size);
+    CHECK(data != NULL && size == 6 && memcmp(data, "\"mine\"", 6) == 0, "the CAS'd value should actually be stored");
+    free(data);
+
+    // A second claim-if-absent must now fail - it's no longer absent.
+    CHECK(fleece_state_manager_set_shared_cas(m, "T1", NULL, 0, (const uint8_t*)"\"other\"", 7) == 1, "CAS with expected=absent should report a comparison failure (1) once the field exists");
+    data = NULL;
+    size = 0;
+    fleece_state_manager_get_named(m, FLEECE_SHARED_OWNER_ID, "T1", &data, &size);
+    CHECK(data != NULL && size == 6 && memcmp(data, "\"mine\"", 6) == 0, "a failed CAS must leave the existing value untouched");
+    free(data);
+
+    // Compare-and-update: succeeds only if the expected bytes match exactly.
+    CHECK(fleece_state_manager_set_shared_cas(m, "T1", (const uint8_t*)"\"wrong\"", 7, (const uint8_t*)"\"updated\"", 9) == 1, "CAS with a mismatched expected value should fail (1), not error");
+    CHECK(fleece_state_manager_set_shared_cas(m, "T1", (const uint8_t*)"\"mine\"", 6, (const uint8_t*)"\"updated\"", 9) == 0, "CAS with a matching expected value should succeed");
+    data = NULL;
+    size = 0;
+    fleece_state_manager_get_named(m, FLEECE_SHARED_OWNER_ID, "T1", &data, &size);
+    CHECK(data != NULL && size == 9 && memcmp(data, "\"updated\"", 9) == 0, "a successful compare-and-update should apply the new value");
+    free(data);
+
+    // Error cases (bad arguments) return -1, distinct from a comparison failure (1).
+    CHECK(fleece_state_manager_set_shared_cas(NULL, "T1", NULL, 0, (const uint8_t*)"x", 1) == -1, "CAS on a NULL manager should be a real error, not a comparison failure");
+    CHECK(fleece_state_manager_set_shared_cas(m, "T1", NULL, 0, NULL, 0) == -1, "CAS with a NULL new value should be a real error");
+    CHECK(fleece_state_manager_set_shared_cas(m, NULL, NULL, 0, (const uint8_t*)"x", 1) == -1, "CAS with a NULL name should be a real error");
+
+    fleece_state_manager_destroy(m);
+    printf("Done: set_shared_cas test\n");
+}
+
 int main(void) {
     printf("Fleece Gossip Wire Format Tests\n");
     printf("================================\n\n");
@@ -371,6 +501,10 @@ int main(void) {
     test_shared_fields_multi_writer();
     printf("\n");
     test_shared_fields_survive_discoverer_death();
+    printf("\n");
+    test_shared_field_tie_break_convergence();
+    printf("\n");
+    test_set_shared_cas();
     printf("\n");
 
     if (g_failures > 0) {
