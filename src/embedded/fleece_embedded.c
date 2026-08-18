@@ -850,3 +850,7 @@ int fleece_embedded_get_value(FleeceEmbedded* embedded, const char* name, uint8_
 void* fleece_embedded_get_context(FleeceEmbedded* embedded) {
     return embedded ? (void*)embedded->ctx : NULL;
 }
+
+void* fleece_embedded_get_state_manager(FleeceEmbedded* embedded) {
+    return embedded ? (void*)embedded->manager : NULL;
+}

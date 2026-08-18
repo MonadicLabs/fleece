@@ -21,6 +21,13 @@ fleece is a **lightweight, decentralized swarm coordination runtime** designed f
 - **`platform`** - a pure name→function registry for hardware bindings (fleece defines none itself - see below)
 - Sandboxed execution for security
 
+### 🎯 GOAP Planning
+- **Goal-Oriented Action Planning** (planner + runtime "brain"): plan → select action → execute action → re-plan when done
+- Action preconditions/effects, action bodies (`exec`), goal expressions, and costs are authored as **JS functions**, evaluated by QuickJS; orchestration stays in C
+- **Utility-curve goal selection**: priorities weighted by a curve over a blackboard field, so the unit picks the most pressing unsatisfied goal
+- CBOR **plan blob** serialization for offline authoring / radio distribution of the whole action library
+- See `src/planner/fleece_planner.c`, `src/embedded/fleece_goap_js.c`, and `examples/example4_goap.c`
+
 ### 📦 Gossip State
 - **Real CBOR (RFC 8949) framing** for bandwidth-limited links - a 3-byte magic/version prefix followed by a CBOR-encoded record array, see `src/state/fleece_state_manager.c`
 - **Delta gossip**: each tick sends only fields changed since the last send, with a periodic full-state resync so a peer can recover from a dropped packet
@@ -193,13 +200,15 @@ fleece/
 │   ├── state/             # State manager interface
 │   ├── comms/            # Comms interface
 │   ├── embedded/         # Embedded JS interface (self/swarm/world/platform bindings)
+│   ├── planner/          # GOAP planner interface
 │   ├── platform/         # Platform function registry interface
 │   └── core/             # Dead/unused parallel runtime - not wired into anything
 ├── src/
 │   ├── runtime/          # Runtime implementation
 │   ├── state/            # State manager implementation
 │   ├── comms/           # Comms implementation (single-process simulation, no real transport)
-│   ├── embedded/        # QuickJS-ng integration and self/swarm/world/platform bindings
+│   ├── embedded/         # QuickJS-ng integration and self/swarm/world/platform bindings
+│   ├── planner/          # GOAP planner (search, goal selection, CBOR plan blob)
 │   ├── platform/        # Platform function registry implementation
 │   └── core/            # Dead/unused - see include/core
 ├── third_party/
@@ -210,11 +219,14 @@ fleece/
 │   ├── run_swarm.sh                   # Launches N example2 agents as real processes with prefixed, interleaved output
 │   ├── example3_embodied_swarm.c / .js      # Same, but with real 2D position/speed/arrival via a "platform" binding (multi-process)
 │   ├── run_swarm3.sh                  # Launches N example3 agents, same idea as run_swarm.sh
+│   ├── example4_goap.c               # GOAP-driven unit: plan -> execute -> replan, pure C (no script)
 │   └── example_common.h               # Shared helper: loads each example's companion .js file from disk (see below)
 ├── tests/                # Unit tests (one executable per file, run via ctest)
 │   ├── test_state_manager.c # Raw LWW store tests
 │   ├── test_gossip.c        # Export/import/merge/delta wire format tests
 │   ├── test_embedded.c      # self/swarm/world QuickJS binding tests
+│   ├── test_planner.c       # GOAP planner + CBOR plan blob tests
+│   ├── test_goap_js.c       # QuickJS eval bridge + behavior-loop brain tests
 │   └── test_platform.c      # Platform registry + JS binding tests
 ├── CMakeLists.txt        # Build system
 ├── README.md            # Project documentation
@@ -244,7 +256,7 @@ cd build && ctest --output-on-failure
 ```
 
 ### Running Examples
-Each example's script lives in a companion `.js` file next to its `.c` file (e.g. `examples/example1.js`) rather than embedded in the binary, and is loaded from disk at startup (see `examples/example_common.h`). Run the binaries from `build/` as shown below - each one locates its own script relative to its own location, so this works regardless of your current directory.
+Each example's script lives in a companion `.js` file next to its `.c` file (e.g. `examples/example1.js`) rather than embedded in the binary, and is loaded from disk at startup (see `examples/example_common.h`). The one exception is `example4_goap` - all of its behavior runs through the GOAP brain, so it has no script at all. Run the binaries from `build/` as shown below - each one locates its own script relative to its own location, so this works regardless of your current directory.
 ```bash
 # Basic swarm coordination example (single process)
 ./build/example1
@@ -269,6 +281,11 @@ examples/run_swarm.sh 3 10     # 3 agents, stops automatically after 10s
 # ...or, again, the launcher (give it more time than run_swarm.sh - movement
 # takes real ticks, not an instant claim):
 examples/run_swarm3.sh 3 30
+
+# GOAP-driven unit - the planner runs the unit's behavior loop, in one process:
+# plan -> select action -> execute action -> replan when done
+# (runs ~70 ticks then exits):
+./build/example4_goap
 ```
 
 ## Usage Examples
@@ -340,6 +357,16 @@ fleece_embedded_execute(embedded,
 - **A contest margin, added after watching it thrash**: with scores now changing every tick as agents converge on the same target, contesting on *any* marginally-better score caused two closing agents to flip the claim back and forth dozens of times before one arrived. `CONTEST_MARGIN` requires a bid to beat the current holder by a meaningful amount before it's worth contesting - dropped one test run from 40 claim events to 5, with faster, cleaner convergence.
 - **A live ASCII view, per agent**: each agent periodically renders its own local view of the swarm from what it currently knows (`self`, `swarm`, `world`) - `@` for itself, `+` for a live peer, `x`/`o`/`#` for an unclaimed/claimed/delivered target. Because it's a genuinely distributed system, this is deliberately each agent's own honest belief, not a global truth. It renders cleanly when watching one agent directly; through `run_swarm3.sh`'s combined multi-process output, a multi-line grid can get interleaved with other agents' single-line status lines (an inherent limit of interleaving real concurrent process output, not something the launcher tries to solve) - the single-line `claimed`/`ARRIVED`/`DELIVERED` events stay reliable either way.
 
+### GOAP Planning (Goal-Oriented Action Planning)
+`src/planner/fleece_planner.c` implements a lightweight, engine-agnostic GOAP planner: action preconditions, effects, goal expressions, and costs are stored as opaque **JS function sources** and evaluated by host callbacks. In fleece the host is QuickJS, wired up in `src/embedded/fleece_goap_js.c`:
+
+- **Script JS is used only to author the functions** (pre/eff/exec/goal-expr/cost). Planning, goal selection, and execution orchestration all stay in C - there is no `goap.*` global in script.
+- **`bb` object**: authored functions receive `{ self, world, platform, swarm }` mirroring the script globals; `self`/`world` are detached copies the function may mutate. **`eff` is a planner heuristic only** - the A* search uses it to simulate the future; the executor never applies it. **`exec` is the action's real body** - the executor calls `exec(bb, tick)` every tick; it does the actual work (drive hardware, move, consume...), mutating its `bb` copy, and returns `true` when finished. An action with no `exec` has no runtime body: it completes at once and changes nothing (see the contract in `fleece_planner.h`).
+- **Behavior-loop "brain"**: `fleece_goap_brain_tick()` (or `fleece_runtime_set_goap()`, which drives it once per main-loop tick) runs the full loop - snapshot the live state, pick the highest-utility unsatisfied goal, plan, execute the plan's first action's `exec()` body each tick (committing its work to the state manager as it happens), then **re-plan** when the action reports done.
+- **Plan blob**: `fleece_goap_serialize()` compiles the whole table set (actions/goals/utilities/missions) into a compact CBOR blob for offline authoring or radio distribution (`fleece_goap_deserialize()` to load).
+
+Example scenario in `examples/example4_goap.c`: a forager robot whose goals (`forage` food, `recharge` battery) have utility curves so selection shifts with state - watch the `[brain]` lines print the plan->execute->replan cycle, and the shared `world.foodTotal` counter grow as gossip carries each cycle's harvest.
+
 ### Mesh Communication
 ```c
 // Send update to all connected nodes
@@ -379,7 +406,7 @@ MIT License - See LICENSE file for details
 2. **A `reset()` trigger** - the lifecycle function is callable but nothing in the runtime calls it automatically yet
 3. **Real hardware platform bindings** (e.g. a MAVLink or ROS2 integration) - `example3_embodied_swarm.c` shows the registry in real use (a simple 2D movement binding), but nothing resembling actual flight-controller or robot hardware is wired up yet
 4. **Hardware-specific optimizations** (ESP32, STM32, etc.) and validation on an actual microcontroller target (currently desktop POSIX only)
-5. **More example applications** (leader election, foraging, etc.)
+5. **More example applications** (leader election, foraging at scale, etc.)
 6. **Performance profiling** and optimization
 7. **Documentation updates** and tutorials
 

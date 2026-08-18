@@ -70,6 +70,9 @@ int fleece_embedded_get_value(FleeceEmbedded* embedded, const char* name, uint8_
 // Get the underlying QuickJS context (JSContext*)
 void* fleece_embedded_get_context(FleeceEmbedded* embedded);
 
+// Get the bound state manager (FleeceStateManager*), or NULL if none was set.
+void* fleece_embedded_get_state_manager(FleeceEmbedded* embedded);
+
 #ifdef __cplusplus
 }
 #endif

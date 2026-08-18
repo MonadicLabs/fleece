@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include "fleece_state_manager.h"
+#include "fleece_cbor.h"
 
 #define FLEECE_MAX_TRACKED_PEERS 32
 
@@ -57,110 +58,8 @@ static uint32_t hash_name(const char* name) {
 // --- Minimal CBOR (RFC 8949) support -----------------------------------
 // Only what this file's wire format needs: unsigned integers, byte strings,
 // text strings, arrays, and booleans. Not a general-purpose CBOR codec.
-
-static size_t cbor_uint_size(uint64_t v) {
-    if (v < 24) return 1;
-    if (v <= 0xFFULL) return 2;
-    if (v <= 0xFFFFULL) return 3;
-    if (v <= 0xFFFFFFFFULL) return 5;
-    return 9;
-}
-
-static size_t cbor_bytes_size(uint32_t len) { return cbor_uint_size(len) + len; }
-static size_t cbor_text_size(uint32_t len) { return cbor_uint_size(len) + len; }
-static size_t cbor_array_header_size(uint32_t count) { return cbor_uint_size(count); }
-
-static void cbor_write_head(uint8_t* buf, size_t* pos, uint8_t major, uint64_t v) {
-    uint8_t mt = (uint8_t)(major << 5);
-    if (v < 24) {
-        buf[(*pos)++] = (uint8_t)(mt | v);
-    } else if (v <= 0xFFULL) {
-        buf[(*pos)++] = (uint8_t)(mt | 24);
-        buf[(*pos)++] = (uint8_t)v;
-    } else if (v <= 0xFFFFULL) {
-        buf[(*pos)++] = (uint8_t)(mt | 25);
-        buf[(*pos)++] = (uint8_t)(v >> 8);
-        buf[(*pos)++] = (uint8_t)v;
-    } else if (v <= 0xFFFFFFFFULL) {
-        buf[(*pos)++] = (uint8_t)(mt | 26);
-        for (int i = 3; i >= 0; i--) buf[(*pos)++] = (uint8_t)(v >> (8 * i));
-    } else {
-        buf[(*pos)++] = (uint8_t)(mt | 27);
-        for (int i = 7; i >= 0; i--) buf[(*pos)++] = (uint8_t)(v >> (8 * i));
-    }
-}
-
-static void cbor_write_uint(uint8_t* buf, size_t* pos, uint64_t v) { cbor_write_head(buf, pos, 0, v); }
-static void cbor_write_array_header(uint8_t* buf, size_t* pos, uint32_t count) { cbor_write_head(buf, pos, 4, count); }
-
-static void cbor_write_bytes(uint8_t* buf, size_t* pos, const uint8_t* data, uint32_t len) {
-    cbor_write_head(buf, pos, 2, len);
-    if (len > 0) {
-        memcpy(&buf[*pos], data, len);
-        *pos += len;
-    }
-}
-
-static void cbor_write_text(uint8_t* buf, size_t* pos, const char* text, uint32_t len) {
-    cbor_write_head(buf, pos, 3, len);
-    if (len > 0) {
-        memcpy(&buf[*pos], text, len);
-        *pos += len;
-    }
-}
-
-static void cbor_write_bool(uint8_t* buf, size_t* pos, bool v) {
-    buf[(*pos)++] = v ? 0xF5 : 0xF4;
-}
-
-// Reads one CBOR item's initial byte + any argument follow-bytes, filling
-// *major (0-7) and *value (the unsigned/count/length/simple-value argument).
-// Does not itself read a following byte/text-string payload or array
-// elements - callers do that using *value as a length/count. Returns false
-// (bounds failure or unsupported encoding) rather than reading past size.
-static bool cbor_read_head(const uint8_t* buf, uint32_t size, size_t* pos, uint8_t* major, uint64_t* value) {
-    if (*pos + 1 > size) return false;
-    uint8_t initial = buf[(*pos)++];
-    *major = (uint8_t)(initial >> 5);
-    uint8_t info = (uint8_t)(initial & 0x1F);
-
-    if (info < 24) {
-        *value = info;
-        return true;
-    }
-    if (info == 24) {
-        if (*pos + 1 > size) return false;
-        *value = buf[(*pos)++];
-        return true;
-    }
-    if (info == 25) {
-        if (*pos + 2 > size) return false;
-        *value = ((uint64_t)buf[*pos] << 8) | buf[*pos + 1];
-        *pos += 2;
-        return true;
-    }
-    if (info == 26) {
-        if (*pos + 4 > size) return false;
-        uint64_t v = 0;
-        for (int i = 0; i < 4; i++) v = (v << 8) | buf[(*pos)++];
-        *value = v;
-        return true;
-    }
-    if (info == 27) {
-        if (*pos + 8 > size) return false;
-        uint64_t v = 0;
-        for (int i = 0; i < 8; i++) v = (v << 8) | buf[(*pos)++];
-        *value = v;
-        return true;
-    }
-    return false;  // info 28-31: reserved/indefinite-length - not supported
-}
-
-// Overflow-safe "does [pos, pos+len) fit within [0, size)" check.
-static bool bounds_ok(size_t pos, uint64_t len, uint32_t size) {
-    if (len > size) return false;
-    return pos <= (size_t)size - (size_t)len;
-}
+//
+// Shared with fleece_planner via src/state/fleece_cbor.{c,h}.
 
 FleeceStateManager* fleece_state_manager_create_with_node_id(uint64_t node_id) {
     if (node_id == FLEECE_SHARED_OWNER_ID) {
@@ -589,7 +488,7 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t owner_filte
     bool is_shared_stream = (owner_filter == FLEECE_SHARED_OWNER_ID);
 
     uint32_t count = 0;
-    size_t body_size = cbor_array_header_size(2) + cbor_uint_size(owner_filter);
+    size_t body_size = fleece_cbor_array_header_size(2) + fleece_cbor_uint_size(owner_filter);
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         struct FieldEntry* f = &manager->fields[i];
         if (!f->exists || f->node_id != owner_filter || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
@@ -597,15 +496,15 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t owner_filte
         uint32_t name_len = (uint32_t)strlen(f->name);
         uint32_t data_len = f->is_tombstone ? 0 : f->size;
 
-        body_size += cbor_array_header_size(is_shared_stream ? 5 : 4);
-        if (is_shared_stream) body_size += cbor_uint_size(f->origin_node_id);
+        body_size += fleece_cbor_array_header_size(is_shared_stream ? 5 : 4);
+        if (is_shared_stream) body_size += fleece_cbor_uint_size(f->origin_node_id);
         body_size += 1;  // bool is always 1 byte
-        body_size += cbor_text_size(name_len);
-        body_size += cbor_uint_size(f->timestamp);
-        body_size += cbor_bytes_size(data_len);
+        body_size += fleece_cbor_text_size(name_len);
+        body_size += fleece_cbor_uint_size(f->timestamp);
+        body_size += fleece_cbor_bytes_size(data_len);
         count++;
     }
-    body_size += cbor_array_header_size(count);
+    body_size += fleece_cbor_array_header_size(count);
 
     uint8_t* buf = (uint8_t*)malloc(3 + body_size);
     if (!buf) {
@@ -617,9 +516,9 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t owner_filte
     buf[pos++] = FLEECE_GOSSIP_MAGIC1;
     buf[pos++] = FLEECE_GOSSIP_VERSION;
 
-    cbor_write_array_header(buf, &pos, 2);
-    cbor_write_uint(buf, &pos, owner_filter);
-    cbor_write_array_header(buf, &pos, count);
+    fleece_cbor_write_array_header(buf, &pos, 2);
+    fleece_cbor_write_uint(buf, &pos, owner_filter);
+    fleece_cbor_write_array_header(buf, &pos, count);
 
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         struct FieldEntry* f = &manager->fields[i];
@@ -628,12 +527,12 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t owner_filte
         uint32_t name_len = (uint32_t)strlen(f->name);
         uint32_t data_len = f->is_tombstone ? 0 : f->size;
 
-        cbor_write_array_header(buf, &pos, is_shared_stream ? 5 : 4);
-        if (is_shared_stream) cbor_write_uint(buf, &pos, f->origin_node_id);
-        cbor_write_bool(buf, &pos, f->is_tombstone);
-        cbor_write_text(buf, &pos, f->name, name_len);
-        cbor_write_uint(buf, &pos, f->timestamp);
-        cbor_write_bytes(buf, &pos, f->data, data_len);
+        fleece_cbor_write_array_header(buf, &pos, is_shared_stream ? 5 : 4);
+        if (is_shared_stream) fleece_cbor_write_uint(buf, &pos, f->origin_node_id);
+        fleece_cbor_write_bool(buf, &pos, f->is_tombstone);
+        fleece_cbor_write_text(buf, &pos, f->name, name_len);
+        fleece_cbor_write_uint(buf, &pos, f->timestamp);
+        fleece_cbor_write_bytes(buf, &pos, f->data, data_len);
     }
 
     *frame_data = buf;
@@ -677,9 +576,9 @@ int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* fram
     uint64_t value;
 
     // Outer array: [owner_node_id, records]
-    if (!cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 4 || value != 2) return -1;
+    if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 4 || value != 2) return -1;
 
-    if (!cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
+    if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
     uint64_t owner_node_id = value;
 
     if (owner_node_id == manager->node_id) {
@@ -690,35 +589,35 @@ int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* fram
 
     touch_peer(manager, owner_node_id);  // even an empty delta counts as "heard from"
 
-    if (!cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 4) return -1;
+    if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 4) return -1;
     uint64_t count = value;
 
     for (uint64_t i = 0; i < count; i++) {
-        if (!cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 4) return -1;
+        if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 4) return -1;
         if (value != (uint64_t)(is_shared_stream ? 5 : 4)) return -1;
 
         uint64_t origin_node_id = owner_node_id;  // self-stream: origin is always the frame's owner
         if (is_shared_stream) {
-            if (!cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
+            if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
             origin_node_id = value;
         }
 
-        if (!cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 7 || (value != 20 && value != 21)) return -1;
+        if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 7 || (value != 20 && value != 21)) return -1;
         bool is_tombstone = (value == 21);
 
-        if (!cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 3) return -1;  // text string (name)
-        if (!bounds_ok(pos, value, frame_size)) return -1;
+        if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 3) return -1;  // text string (name)
+        if (!fleece_cbor_bounds_ok(pos, value, frame_size)) return -1;
         char name[FLEECE_FIELD_NAME_MAX];
         uint32_t copy_len = (uint32_t)(value < FLEECE_FIELD_NAME_MAX - 1 ? value : FLEECE_FIELD_NAME_MAX - 1);
         memcpy(name, &frame_data[pos], copy_len);
         name[copy_len] = '\0';
         pos += value;
 
-        if (!cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
+        if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
         uint64_t timestamp = value;
 
-        if (!cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 2) return -1;  // byte string (data)
-        if (!bounds_ok(pos, value, frame_size)) return -1;
+        if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 2) return -1;  // byte string (data)
+        if (!fleece_cbor_bounds_ok(pos, value, frame_size)) return -1;
         const uint8_t* data = &frame_data[pos];
         uint32_t data_len = (uint32_t)value;
         pos += value;

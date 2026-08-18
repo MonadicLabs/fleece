@@ -12,6 +12,8 @@
 #include "fleece_comms.h"
 #include "fleece_embedded.h"
 #include "platform/fleece_platform.h"
+#include "planner/fleece_planner.h"
+#include "embedded/fleece_goap_js.h"
 
 // Runtime implementation
 
@@ -30,6 +32,9 @@ struct FleeceRuntime {
     uint64_t self_gossip_watermark;     // local timestamp as of the last self-stream gossip send
     uint64_t shared_gossip_watermark;   // local timestamp as of the last shared/"world"-stream gossip send
     uint32_t gossip_tick_count;
+    FleeceGoapBrain* goap_brain;        // optional behavior-loop driver (see fleece_runtime_set_goap)
+    void (*tick_cb)(FleeceRuntime*, void*);  // optional per-tick C hook (see fleece_runtime_set_tick_callback)
+    void* tick_ud;
 };
 
 static FleeceRuntime* global_runtime = NULL;
@@ -93,6 +98,11 @@ void fleece_runtime_destroy(FleeceRuntime* runtime) {
 
     fleece_runtime_stop(runtime);
 
+    if (runtime->goap_brain) {
+        fleece_goap_brain_destroy(runtime->goap_brain);
+        runtime->goap_brain = NULL;
+    }
+
     if (runtime->embedded) {
         fleece_embedded_destroy(runtime->embedded);
     }
@@ -147,9 +157,20 @@ int fleece_runtime_start(FleeceRuntime* runtime) {
         // Phase 1: Input (Sensors/Radio)
         fleece_comms_process_input(runtime->comms);
 
-        // Phase 2: Script Execution (QuickJS VM) - runs before gossip so any
-        // self.xxx/world.xxx changes made this tick are broadcast this tick, not next.
+        // Phase 2: C tick hook (optional) + Script Execution (QuickJS VM) - run
+        // before gossip so any self.xxx/world.xxx changes made this tick are
+        // broadcast this tick, not next.
+        if (runtime->tick_cb) {
+            runtime->tick_cb(runtime, runtime->tick_ud);
+        }
         fleece_embedded_call_step(runtime->embedded);
+
+        // Phase 2.5: GOAP brain (optional) - decides and applies/commits effects;
+        // runs after script step so it sees this tick's sensor/state changes, and
+        // before gossip so its decisions are broadcast this tick.
+        if (runtime->goap_brain) {
+            fleece_goap_brain_tick(runtime->goap_brain);
+        }
 
         // Phase 3: Gossip (State Synchronization) - two independent streams, each
         // delta-by-default with a periodic full resync (anti-entropy) so a peer
@@ -229,4 +250,22 @@ void* fleece_runtime_get_embedded(FleeceRuntime* runtime) {
 
 void* fleece_runtime_get_platform(FleeceRuntime* runtime) {
     return runtime ? runtime->platform : NULL;
+}
+
+int fleece_runtime_set_goap(FleeceRuntime* runtime, FleeceGoap* goap) {
+    if (!runtime || !goap) return -1;
+    if (runtime->goap_brain) return -1;  // already attached
+
+    runtime->goap_brain = fleece_goap_brain_create(runtime->embedded, goap);
+    return runtime->goap_brain ? 0 : -1;
+}
+
+void* fleece_runtime_get_goap_brain(FleeceRuntime* runtime) {
+    return runtime ? runtime->goap_brain : NULL;
+}
+
+void fleece_runtime_set_tick_callback(FleeceRuntime* runtime, void (*cb)(FleeceRuntime*, void*), void* user_data) {
+    if (!runtime) return;
+    runtime->tick_cb = cb;
+    runtime->tick_ud = user_data;
 }

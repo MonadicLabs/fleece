@@ -28,6 +28,7 @@ file(GLOB_RECURSE FLEECE_SRC
     "src/embedded/*.c"
     "src/platform/*.c"
     "src/core/*.c"
+    "src/planner/*.c"
 )
 
 # Include directories
@@ -38,6 +39,7 @@ include_directories(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/comms"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/core"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/planner"
 )
 
 # Library
