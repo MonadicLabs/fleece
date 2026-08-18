@@ -454,6 +454,54 @@ static void test_plan_no_solution(void) {
     printf("Done: no-solution plan test\n");
 }
 
+static void test_plan_depth_budget(void) {
+    printf("Running plan-depth budget test...\n");
+    FleeceGoap* g = fleece_goap_create();
+    register_scenario(g);
+
+    FleeceGoapEval eval;
+    fill_eval(&eval);
+
+    FleeceGoapBlackboard bb = {0};
+    setd(&bb, "battery", 10.0, false);
+    setd(&bb, "scan", 0.0, false);
+    setd(&bb, "foodCount", 0.0, false);
+    sets(&bb, "location", "base", false);
+
+    const char* goal_ids[] = { "gather" };
+
+    // gather needs deploy->scan->collect = 3 actions; a cap of 2 forbids it.
+    fleece_goap_set_max_plan_depth(g, 2);
+    FleeceGoapPlan* plan = fleece_goap_plan(g, &bb, goal_ids, 1, &eval);
+    CHECK(plan == NULL, "no plan within depth 2 for a 3-action goal");
+
+    // A cap of exactly 3 admits it.
+    fleece_goap_set_max_plan_depth(g, 3);
+    plan = fleece_goap_plan(g, &bb, goal_ids, 1, &eval);
+    CHECK(plan != NULL, "plan within depth 3");
+    if (plan) CHECK(fleece_goap_plan_length(plan) == 3, "plan should have 3 actions");
+
+    fleece_goap_plan_destroy(plan);
+    fleece_goap_bb_release(&bb);
+    fleece_goap_destroy(g);
+    printf("Done: plan-depth budget test\n");
+}
+
+static void test_mem_usage(void) {
+    printf("Running mem-usage test...\n");
+    FleeceGoap* g = fleece_goap_create();
+    uint32_t empty = fleece_goap_get_mem_usage(g);
+    CHECK(empty > 0, "empty goap has nonzero footprint");
+    register_scenario(g);
+    uint32_t loaded = fleece_goap_get_mem_usage(g);
+    CHECK(loaded > empty, "registering the scenario grows the footprint");
+    fleece_goap_reset(g);
+    uint32_t after_reset = fleece_goap_get_mem_usage(g);
+    CHECK(after_reset <= loaded, "reset drops the footprint back down");
+    fleece_goap_destroy(g);
+    printf("Done: mem-usage test\n");
+}
+
 static void test_plan_cost_aware(void) {
     printf("Running cost-aware plan test...\n");
     FleeceGoap* g = fleece_goap_create();
@@ -612,6 +660,8 @@ int main(void) {
     test_plan_basic();
     test_plan_already_satisfied();
     test_plan_no_solution();
+    test_plan_depth_budget();
+    test_mem_usage();
     test_plan_cost_aware();
     test_plan_cycle_pruning();
     test_plan_goal_targeting();

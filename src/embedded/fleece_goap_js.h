@@ -115,6 +115,32 @@ typedef void (*FleeceGoapBrainEventFn)(FleeceGoapBrain* brain, FleeceGoapBrainEv
 // writes a small ring buffer; this callback copies the latest sample in.
 typedef void (*FleeceGoapWorldModelFn)(FleeceGoapBrain* brain, FleeceGoapBlackboard* bb, uint32_t tick, void* user_data);
 
+// --- Divergence diagnostics ------------------------------------------------
+//
+// An action's `eff` is a planner heuristic - A* uses it to simulate the future,
+// the executor never applies it - while `exec` is the real body. When the two
+// disagree (an eff claiming a goal becomes reachable though the body never
+// delivers, a field the body sets that eff forgot, ...), planning can chase a
+// phantom state forever. These diagnostics surface exactly that, per field.
+
+// One field where the declared effect diverges from what the body produced.
+// Byte pointers are borrowed from the blackboards and valid only during the
+// callback. A field predicted but absent from the actual output has
+// in_actual=false; one produced without being predicted has in_eff=false.
+typedef struct FleeceGoapDivergence {
+    const char* name;
+    bool in_eff;
+    bool in_actual;
+    const uint8_t* eff_value;
+    uint32_t eff_size;
+    const uint8_t* actual_value;
+    uint32_t actual_size;
+} FleeceGoapDivergence;
+
+typedef void (*FleeceGoapDivergenceFn)(FleeceGoapBrain* brain, uint32_t action_idx,
+                                       const FleeceGoapDivergence* diffs, uint32_t n_diffs,
+                                       void* user_data);
+
 // Create a brain driving `goap` against `embedded`'s state manager. Caller
 // keeps ownership of `goap` (must outlive the brain).
 FleeceGoapBrain* fleece_goap_brain_create(FleeceEmbedded* embedded, FleeceGoap* goap);
@@ -128,6 +154,12 @@ void fleece_goap_brain_set_event_callback(FleeceGoapBrain* brain, FleeceGoapBrai
 
 // Register the world-model hook (see FleeceGoapWorldModelFn). May be NULL to clear.
 void fleece_goap_brain_set_world_model(FleeceGoapBrain* brain, FleeceGoapWorldModelFn cb, void* user_data);
+
+// Register the divergence diagnostics (see FleeceGoapDivergenceFn). Enabling
+// them costs one extra effect-apply per exec tick, so leave NULL (default) on
+// resource-constrained targets and enable only when debugging the plan model.
+// May be NULL to clear.
+void fleece_goap_brain_set_divergence_cb(FleeceGoapBrain* brain, FleeceGoapDivergenceFn cb, void* user_data);
 
 // Cap how many ticks a single action may execute before the brain gives up on
 // it and replans (FLEECE_GOAP_BRAIN_EVENT_ABORTED). A wedged action - hardware

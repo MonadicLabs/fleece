@@ -13,6 +13,21 @@ extern "C" {
 
 typedef struct FleeceComms FleeceComms;
 
+// Monotonic telemetry counters. The comms module is transport-agnostic and
+// owns no clock, so it reports plain totals - a host that wants rates computes
+// them from its own time source. Sent side is counted inside the module; the
+// received side is credited either by fleece_comms_receive() or, for the
+// poll-callback->state_manager_import pattern used by the examples, by
+// fleece_comms_notify_received().
+typedef struct FleeceCommsStats {
+    uint64_t packets_sent;
+    uint64_t bytes_sent;
+    uint64_t packets_received;
+    uint64_t bytes_received;
+    uint64_t send_failures;   // fleece_comms_send rejected (uninitialized/bad args)
+    uint64_t recv_failures;   // receive/notify attempted while not initialized
+} FleeceCommsStats;
+
 // Callback invoked after a message is sent
 typedef void (*FleeceCommsSendCallback)(const char* destination, const uint8_t* data, uint32_t size, void* user_data);
 
@@ -64,6 +79,15 @@ void fleece_comms_set_receive_callback(FleeceComms* comms, FleeceCommsReceiveCal
 
 // Set the callback invoked once per fleece_comms_process_input() call
 void fleece_comms_set_poll_callback(FleeceComms* comms, FleeceCommsPollCallback callback, void* user_data);
+
+// Copy the current telemetry counters into *stats.
+void fleece_comms_get_stats(FleeceComms* comms, FleeceCommsStats* stats);
+
+// Credit the received-side counters for a frame that arrived through the poll
+// callback (i.e. bytes fed straight into fleece_state_manager_import without
+// ever passing through fleece_comms_receive). Returns 0 on success, -1 if not
+// initialized.
+int fleece_comms_notify_received(FleeceComms* comms, uint32_t size);
 
 #ifdef __cplusplus
 }

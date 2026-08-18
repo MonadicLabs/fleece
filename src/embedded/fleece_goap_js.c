@@ -573,6 +573,8 @@ struct FleeceGoapBrain {
     void* event_ud;
     FleeceGoapWorldModelFn world_model_cb;  // host telemetry injection (see header)
     void* world_model_ud;
+    FleeceGoapDivergenceFn divergence_cb;   // eff-predicted vs exec-produced (debug aid)
+    void* divergence_ud;
 };
 
 FleeceGoapBrain* fleece_goap_brain_create(FleeceEmbedded* embedded, FleeceGoap* goap) {
@@ -657,6 +659,48 @@ static int brain_fresh_bb(FleeceGoapBrain* b, FleeceGoapBlackboard* bb) {
     return 0;
 }
 
+// Report where the action's declared effect (`eff`, used by the planner's A*)
+// diverges from what its runtime body (`exec`) actually produced. This is a
+// debug aid for catching model errors - an eff claiming a goal becomes
+// reachable while the real body never delivers it. Small divergences are
+// normal (eff is a heuristic); the callback just surfaces them.
+static void report_divergences(FleeceGoapBrain* b, uint32_t action_idx,
+                               const FleeceGoapBlackboard* pred,
+                               const FleeceGoapBlackboard* actual) {
+    enum { MAX_DIFFS = 16 };
+    FleeceGoapDivergence diffs[MAX_DIFFS];
+    uint32_t n = 0;
+
+    for (uint32_t i = 0; i < pred->count && n < MAX_DIFFS; i++) {
+        const FleeceGoapField* pf = &pred->fields[i];
+        uint32_t asz = 0;
+        const uint8_t* av = fleece_goap_bb_get(actual, pf->name, &asz);
+        if (av && asz == pf->size && memcmp(av, pf->data, pf->size) == 0) continue;
+        diffs[n].name = pf->name;
+        diffs[n].in_eff = true;
+        diffs[n].in_actual = (av != NULL);
+        diffs[n].eff_value = pf->data;
+        diffs[n].eff_size = pf->size;
+        diffs[n].actual_value = av;
+        diffs[n].actual_size = asz;
+        n++;
+    }
+    for (uint32_t i = 0; i < actual->count && n < MAX_DIFFS; i++) {
+        const FleeceGoapField* af = &actual->fields[i];
+        if (fleece_goap_bb_index(pred, af->name) != UINT32_MAX) continue;
+        diffs[n].name = af->name;
+        diffs[n].in_eff = false;
+        diffs[n].in_actual = true;
+        diffs[n].eff_value = NULL;
+        diffs[n].eff_size = 0;
+        diffs[n].actual_value = af->data;
+        diffs[n].actual_size = af->size;
+        n++;
+    }
+
+    if (n > 0) b->divergence_cb(b, action_idx, diffs, n, b->divergence_ud);
+}
+
 int fleece_goap_brain_tick(FleeceGoapBrain* b) {
     if (!b) return -1;
     b->tick_count++;
@@ -683,12 +727,22 @@ int fleece_goap_brain_tick(FleeceGoapBrain* b) {
                 FleeceGoapBlackboard dst = {0};
                 bool done = false;
                 int rc = js_action_exec(b->eval, (uint32_t)b->action_idx, &bb, b->exec_progress, &dst, &done);
-                fleece_goap_bb_release(&bb);
                 if (rc != 0) {
                     fleece_goap_bb_release(&dst);
+                    fleece_goap_bb_release(&bb);
                     b->action_idx = -1;
                     return 0;  // exec failed - next tick replans
                 }
+                // Diagnostics (off by default): compare what the action's eff
+                // predicted (A* model) with what exec actually produced.
+                if (b->divergence_cb) {
+                    FleeceGoapBlackboard pred = {0};
+                    if (b->eval->eval.action_apply(b->eval, (uint32_t)b->action_idx, &bb, &pred) == 0) {
+                        report_divergences(b, (uint32_t)b->action_idx, &pred, &dst);
+                        fleece_goap_bb_release(&pred);
+                    }
+                }
+                fleece_goap_bb_release(&bb);
                 if (fleece_goap_js_bb_commit(b->embedded, &dst) != 0) {
                     fleece_goap_bb_release(&dst);
                     return -1;
@@ -726,6 +780,12 @@ void fleece_goap_brain_set_world_model(FleeceGoapBrain* b, FleeceGoapWorldModelF
     if (!b) return;
     b->world_model_cb = cb;
     b->world_model_ud = user_data;
+}
+
+void fleece_goap_brain_set_divergence_cb(FleeceGoapBrain* b, FleeceGoapDivergenceFn cb, void* user_data) {
+    if (!b) return;
+    b->divergence_cb = cb;
+    b->divergence_ud = user_data;
 }
 
 void fleece_goap_brain_set_max_action_ticks(FleeceGoapBrain* b, uint32_t max_ticks) {

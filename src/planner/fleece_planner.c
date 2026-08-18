@@ -79,6 +79,7 @@ struct FleeceGoap {
     uint32_t mission_cap;
     uint32_t max_iters;
     uint32_t max_nodes;
+    uint32_t max_plan_depth;
 };
 
 struct FleeceGoapPlan {
@@ -337,6 +338,7 @@ typedef struct SearchNode {
     FleeceGoapBlackboard bb;
     uint32_t parent;      // index into the node list, or UINT32_MAX for root
     uint32_t action_idx;  // action applied to reach this node, or UINT32_MAX
+    uint32_t depth;       // actions taken to reach this node (root = 0)
     double g;
     double f;
 } SearchNode;
@@ -592,6 +594,7 @@ FleeceGoapPlan* fleece_goap_plan(FleeceGoap* goap, const FleeceGoapBlackboard* s
     SearchNode root;
     root.parent = UINT32_MAX;
     root.action_idx = UINT32_MAX;
+    root.depth = 0;
     root.g = 0.0;
     if (fleece_goap_bb_clone(start, &root.bb) != 0) goto out;
     root.f = (double)count_unsatisfied(goap, targets, n_targets, &root.bb, eval);
@@ -679,12 +682,20 @@ FleeceGoapPlan* fleece_goap_plan(FleeceGoap* goap, const FleeceGoapBlackboard* s
                 continue;
             }
 
-            SearchNode next;
-            next.bb = dst;  // ownership transferred
-            next.parent = node_idx;
-            next.action_idx = a;
-            next.g = node->g + c;
-            next.f = next.g + (double)count_unsatisfied(goap, targets, n_targets, &dst, eval);
+        SearchNode next;
+        next.bb = dst;  // ownership transferred
+        next.parent = node_idx;
+        next.action_idx = a;
+        next.depth = node->depth + 1;
+        next.g = node->g + c;
+        next.f = next.g + (double)count_unsatisfied(goap, targets, n_targets, &dst, eval);
+        // Depth cap: a plan longer than max_plan_depth is never synthesized.
+        // We still expand a full-depth node (it may be a valid goal of exactly
+        // max_plan_depth actions), but its successors would exceed the cap.
+        if (next.depth > goap->max_plan_depth) {
+            fleece_goap_bb_release(&dst);
+            continue;
+        }
             if (nodes_push(&nodes, &next) != 0) {
                 fleece_goap_bb_release(&dst);
                 goto out;
@@ -736,6 +747,7 @@ FleeceGoap* fleece_goap_create(void) {
     if (!goap) return NULL;
     goap->max_iters = FLEECE_GOAP_DEFAULT_MAX_ITERS;
     goap->max_nodes = FLEECE_GOAP_DEFAULT_MAX_NODES;
+    goap->max_plan_depth = FLEECE_GOAP_DEFAULT_MAX_PLAN_DEPTH;
     return goap;
 }
 
@@ -788,6 +800,39 @@ void fleece_goap_set_max_iters(FleeceGoap* goap, uint32_t max_iters) {
 
 void fleece_goap_set_max_nodes(FleeceGoap* goap, uint32_t max_nodes) {
     if (goap && max_nodes > 0) goap->max_nodes = max_nodes;
+}
+
+void fleece_goap_set_max_plan_depth(FleeceGoap* goap, uint32_t max_depth) {
+    if (goap && max_depth > 0) goap->max_plan_depth = max_depth;
+}
+
+uint32_t fleece_goap_get_mem_usage(const FleeceGoap* goap) {
+    if (!goap) return 0;
+    uint32_t bytes = (uint32_t)sizeof(FleeceGoap);
+
+    bytes += goap->action_cap * (uint32_t)sizeof(GoapAction);
+    for (uint32_t i = 0; i < goap->action_count; i++) {
+        bytes += goap->actions[i].pre_count * (uint32_t)sizeof(char*);
+        for (uint32_t j = 0; j < goap->actions[i].pre_count; j++)
+            if (goap->actions[i].pre[j]) bytes += (uint32_t)(strlen(goap->actions[i].pre[j]) + 1);
+        bytes += goap->actions[i].eff_count * (uint32_t)sizeof(char*);
+        for (uint32_t j = 0; j < goap->actions[i].eff_count; j++)
+            if (goap->actions[i].eff[j]) bytes += (uint32_t)(strlen(goap->actions[i].eff[j]) + 1);
+    }
+
+    bytes += goap->goal_cap * (uint32_t)sizeof(GoapGoal);
+
+    bytes += goap->utility_cap * (uint32_t)sizeof(GoapUtility);
+    for (uint32_t i = 0; i < goap->utility_count; i++)
+        bytes += goap->utilities[i].point_count * (uint32_t)sizeof(FleeceGoapPoint);
+
+    bytes += goap->mission_cap * (uint32_t)sizeof(GoapMission);
+    for (uint32_t i = 0; i < goap->mission_count; i++) {
+        bytes += goap->missions[i].goal_count * (uint32_t)sizeof(char*);
+        for (uint32_t j = 0; j < goap->missions[i].goal_count; j++)
+            if (goap->missions[i].goal_ids[j]) bytes += (uint32_t)(strlen(goap->missions[i].goal_ids[j]) + 1);
+    }
+    return bytes;
 }
 
 int fleece_goap_add_action(FleeceGoap* goap, const FleeceGoapActionDef* def) {

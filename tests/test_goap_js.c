@@ -290,6 +290,77 @@ static void world_model_test_cb(FleeceGoapBrain* brain, FleeceGoapBlackboard* bb
     fleece_goap_bb_set(bb, "telemetry", (const uint8_t*)"\"fresh\"", 7, false);
 }
 
+typedef struct {
+    uint32_t calls;
+    char last_name[32];
+    char eff_val[16];
+    char actual_val[16];
+} DivState;
+
+static void divergence_test_cb(FleeceGoapBrain* brain, uint32_t action_idx,
+                               const FleeceGoapDivergence* diffs, uint32_t n_diffs, void* ud) {
+    (void)brain; (void)action_idx;
+    DivState* s = (DivState*)ud;
+    s->calls++;
+    if (n_diffs > 0) {
+        snprintf(s->last_name, sizeof(s->last_name), "%s", diffs[0].name);
+        if (diffs[0].eff_value) {
+            char t[16];
+            uint32_t m = diffs[0].eff_size;
+            if (m >= sizeof(t)) m = sizeof(t) - 1;
+            memcpy(t, diffs[0].eff_value, m); t[m] = '\0';
+            snprintf(s->eff_val, sizeof(s->eff_val), "%s", t);
+        }
+        if (diffs[0].actual_value) {
+            char t[16];
+            uint32_t m = diffs[0].actual_size;
+            if (m >= sizeof(t)) m = sizeof(t) - 1;
+            memcpy(t, diffs[0].actual_value, m); t[m] = '\0';
+            snprintf(s->actual_val, sizeof(s->actual_val), "%s", t);
+        }
+    }
+}
+
+static void test_divergence_diagnostics(FleeceEmbedded* embedded) {
+    printf("Running divergence-diagnostics tests...\n");
+
+    FleeceGoap* g = fleece_goap_create();
+    CHECK(g != NULL, "goap create");
+    // eff predicts a=1 but the body produces a=2: a phantom-goal model error.
+    const char* eff[] = { "function(bb){ bb.self.a = 1; return bb; }" };
+    FleeceGoapActionDef a = {0};
+    a.id = "tricky"; a.name = "Tricky";
+    a.eff = eff; a.eff_count = 1;
+    a.exec = "function(bb, tick){ bb.self.a = 2; return true; }";
+    CHECK(fleece_goap_add_action(g, &a) == 0, "add tricky action");
+    FleeceGoapGoalDef goal = {0};
+    goal.id = "needA"; goal.name = "Need A";
+    goal.expr = "function(bb){ return bb.self.a === 1; }";
+    goal.priority = 1.0;
+    CHECK(fleece_goap_add_goal(g, &goal) == 0, "add goal");
+
+    FleeceGoapBrain* brain = fleece_goap_brain_create(embedded, g);
+    CHECK(brain != NULL, "brain create");
+    DivState st = {0};
+    fleece_goap_brain_set_divergence_cb(brain, divergence_test_cb, &st);
+
+    // Tick 1: plan/select path only - no exec, no divergence yet.
+    CHECK(fleece_goap_brain_tick(brain) == 0, "tick 1");
+    CHECK(st.calls == 0, "no divergence before any exec");
+    CHECK(fleece_goap_brain_action_id(brain) && strcmp(fleece_goap_brain_action_id(brain), "tricky") == 0,
+          "tricky selected (its eff satisfies the goal in A*)");
+
+    // Tick 2: exec runs - eff predicted a=1, body produced a=2 -> divergence.
+    CHECK(fleece_goap_brain_tick(brain) == 0, "tick 2");
+    CHECK(st.calls == 1, "divergence reported");
+    CHECK(strcmp(st.last_name, "a") == 0, "divergence on field a");
+    CHECK(strcmp(st.eff_val, "1") == 0, "eff predicted a=1");
+    CHECK(strcmp(st.actual_val, "2") == 0, "exec produced a=2");
+
+    fleece_goap_brain_destroy(brain);
+    fleece_goap_destroy(g);
+}
+
 static void test_world_model_hook(FleeceEmbedded* embedded) {
     printf("Running world-model hook tests...\n");
     FleeceStateManager* sm = (FleeceStateManager*)fleece_embedded_get_state_manager(embedded);
@@ -456,6 +527,7 @@ int main(void) {
     test_apply_action_public(embedded, goap);
     test_state_snapshot_and_commit(embedded);
     test_world_model_hook(embedded);
+    test_divergence_diagnostics(embedded);
     test_brain_behavior_loop(embedded);
 
     fleece_goap_destroy(goap);

@@ -36,6 +36,13 @@ extern "C" {
 #define FLEECE_GOAP_SOURCE_MAX 2048   // pre/eff/goal/cost/exec JS function sources
 #define FLEECE_GOAP_NOTE_MAX 128     // mission notes
 
+// Search-budget defaults (see fleece_goap_set_max_*). Bounding these is what
+// keeps planning from ever starving a real-time MCU loop, however pathological
+// the action library gets.
+#define FLEECE_GOAP_DEFAULT_MAX_ITERS 2048     // A* pop-and-goal-test iterations
+#define FLEECE_GOAP_DEFAULT_MAX_NODES 512      // frontier/visited state nodes
+#define FLEECE_GOAP_DEFAULT_MAX_PLAN_DEPTH 8   // max actions in a synthesized plan
+
 typedef struct FleeceGoap FleeceGoap;
 typedef struct FleeceGoapPlan FleeceGoapPlan;
 
@@ -156,10 +163,19 @@ int fleece_goap_add_goal(FleeceGoap* goap, const FleeceGoapGoalDef* def);
 int fleece_goap_add_utility(FleeceGoap* goap, const FleeceGoapUtilityDef* def);
 int fleece_goap_add_mission(FleeceGoap* goap, const FleeceGoapMissionDef* def);
 
-// Search budget knobs (defaults: 2048 iterations, 512 nodes). Replanning is
-// cheap for typical action libraries; these bound worst-case MCU CPU/RAM.
+// Search budget knobs (defaults: 2048 iterations, 512 nodes, 8 plan depth).
+// Replanning is cheap for typical action libraries; these bound worst-case MCU
+// CPU/RAM - and a depth cap stops the planner from synthesizing silly long
+// detour plans (e.g. reaching 'recharge' via a whole forage cycle) when a
+// shorter path exists.
 void fleece_goap_set_max_iters(FleeceGoap* goap, uint32_t max_iters);
 void fleece_goap_set_max_nodes(FleeceGoap* goap, uint32_t max_nodes);
+void fleece_goap_set_max_plan_depth(FleeceGoap* goap, uint32_t max_depth);
+
+// Approximate long-lived footprint of the action/goal/utility/mission tables in
+// bytes (fixed records + allocated strings + curve points), for sizing static
+// pools on MCU targets. Does not include the transient A* search buffers.
+uint32_t fleece_goap_get_mem_usage(const FleeceGoap* goap);
 
 // --- Evaluation callbacks ------------------------------------------------
 

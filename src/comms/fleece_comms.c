@@ -11,7 +11,7 @@
 struct FleeceComms {
     bool is_connected;
     bool is_initialized;
-    uint32_t packet_count;   // diagnostic counter: total packets sent (unbounded)
+    FleeceCommsStats stats;  // telemetry counters (see fleece_comms_get_stats)
 
     FleeceCommsSendCallback send_callback;
     void* send_callback_user_data;
@@ -31,7 +31,7 @@ FleeceComms* fleece_comms_create(void) {
     
     comms->is_connected = false;
     comms->is_initialized = false;
-    comms->packet_count = 0;
+    memset(&comms->stats, 0, sizeof(comms->stats));
     
     return comms;
 }
@@ -57,10 +57,12 @@ void fleece_comms_process_output(FleeceComms* comms) {
 
 int fleece_comms_send(FleeceComms* comms, const char* destination, const uint8_t* data, uint32_t size) {
     if (!comms || !comms->is_initialized || !destination || !data || size == 0) {
+        if (comms) comms->stats.send_failures++;
         return -1;
     }
-    
-    comms->packet_count++;
+
+    comms->stats.packets_sent++;
+    comms->stats.bytes_sent += size;
 
     if (comms->send_callback) {
         comms->send_callback(destination, data, size, comms->send_callback_user_data);
@@ -70,8 +72,11 @@ int fleece_comms_send(FleeceComms* comms, const char* destination, const uint8_t
 }
 
 int fleece_comms_receive(FleeceComms* comms, char* destination, uint8_t** data, uint32_t* size) {
-    if (!comms || !comms->is_initialized) return -1;
-    
+    if (!comms || !comms->is_initialized) {
+        if (comms) comms->stats.recv_failures++;
+        return -1;
+    }
+
     // In a real implementation, this would receive from radio
     // For now, it's a placeholder
     if (destination) strcpy(destination, "node_001");
@@ -80,6 +85,10 @@ int fleece_comms_receive(FleeceComms* comms, char* destination, uint8_t** data, 
 
     if (comms->receive_callback && *data && *size > 0) {
         comms->receive_callback(destination, *data, *size, comms->receive_callback_user_data);
+        comms->stats.packets_received++;
+        comms->stats.bytes_received += *size;
+    } else {
+        comms->stats.recv_failures++;
     }
 
     return 0;
@@ -131,4 +140,27 @@ void fleece_comms_set_poll_callback(FleeceComms* comms, FleeceCommsPollCallback 
 
     comms->poll_callback = callback;
     comms->poll_callback_user_data = user_data;
+}
+
+void fleece_comms_get_stats(FleeceComms* comms, FleeceCommsStats* stats) {
+    if (!stats) return;
+    if (!comms) {
+        memset(stats, 0, sizeof(*stats));
+        return;
+    }
+    *stats = comms->stats;
+}
+
+int fleece_comms_notify_received(FleeceComms* comms, uint32_t size) {
+    if (!comms || !comms->is_initialized) {
+        if (comms) comms->stats.recv_failures++;
+        return -1;
+    }
+    if (size == 0) {
+        comms->stats.recv_failures++;
+        return -1;
+    }
+    comms->stats.packets_received++;
+    comms->stats.bytes_received += size;
+    return 0;
 }
