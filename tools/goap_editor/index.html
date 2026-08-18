@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>fleece · GOAP Planner Studio</title>
+  <meta name="description" content="Author GOAP plans for the fleece swarm runtime and export them as byte-identical CBOR blobs." />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <header>
+    <div class="header-inner">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round">
+            <path d="M12 2.5 20 7v10l-8 4.5L4 17V7z" stroke="#5eead4"/>
+            <path d="M12 7.5 16.5 10v4L12 16.5 7.5 14v-4z" fill="none" stroke="#fbbf24"/>
+          </svg>
+        </div>
+        <div>
+          <h1>fleece <span>·</span> GOAP Planner Studio</h1>
+          <p class="tagline">author · validate · export swarm behavior plans</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <span class="pill" id="validity-pill" title="All JS sources valid">
+          <span class="dot" id="validity-dot"></span> <span id="validity-label">checking…</span>
+        </span>
+        <span class="pill" id="size-pill"><b id="size-label">0 B</b><span class="size-bytes" id="size-bytes"></span></span>
+        <button class="btn ghost" id="btn-sample" title="Reset to the example4 forager scenario">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+          Example
+        </button>
+        <button class="btn ghost" id="btn-import">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+          Import
+        </button>
+        <button class="btn primary" id="btn-export">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 8l5-5 5 5"/><path d="M12 3v12"/></svg>
+          Export
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="toolbar">
+      <div class="plan-name">
+        <label for="plan-name-input">Plan name</label>
+        <input type="text" id="plan-name-input" placeholder="Untitled plan" spellcheck="false" />
+      </div>
+      <nav class="tabs" id="tabs" aria-label="Sections">
+        <button class="tab active" data-tab="actions" data-accent="var(--accent)">
+          <span class="tab-dot"></span>Actions<span class="count" id="count-actions">0</span>
+        </button>
+        <button class="tab" data-tab="goals" data-accent="var(--amber)">
+          <span class="tab-dot"></span>Goals<span class="count" id="count-goals">0</span>
+        </button>
+        <button class="tab" data-tab="utilities" data-accent="var(--violet)">
+          <span class="tab-dot"></span>Utilities<span class="count" id="count-utilities">0</span>
+        </button>
+        <button class="tab" data-tab="missions" data-accent="var(--rose)">
+          <span class="tab-dot"></span>Missions<span class="count" id="count-missions">0</span>
+        </button>
+      </nav>
+    </div>
+
+    <section id="content"></section>
+  </main>
+
+  <footer>
+    Plan blobs are <code>['F','P',2] + CBOR</code>, byte-compatible with <code>fleece_goap_serialize()</code> ·
+    <code>eff</code> = planner heuristic only · <code>exec(bb, tick)</code> = the real action body
+  </footer>
+
+  <!-- Import modal -->
+  <div class="modal-overlay" id="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="modal-title">Import</h2>
+        <button class="icon-btn close" id="modal-close" title="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="seg" id="import-seg">
+          <button data-import-kind="json" class="active">JSON</button>
+          <button data-import-kind="blob">Plan blob (hex)</button>
+          <button data-import-kind="blob64">Plan blob (base64)</button>
+        </div>
+        <div class="hint" id="modal-hint">Paste a plan JSON document, then press Import.</div>
+        <textarea id="modal-textarea" spellcheck="false" placeholder='{"name":"Forager","actions":[…]}'></textarea>
+      </div>
+      <div class="modal-footer">
+        <button class="btn ghost" id="modal-cancel">Cancel</button>
+        <button class="btn primary" id="modal-ok">Import</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"><span class="toast-dot"></span><span id="toast-text"></span></div>
+
+  <script src="cbor.js"></script>
+  <script src="plan.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -753,8 +753,14 @@ static int call_lifecycle_fn(FleeceEmbedded* embedded, const char* fn_name) {
     return rc;
 }
 
-int fleece_embedded_call_init(FleeceEmbedded* embedded) { return call_lifecycle_fn(embedded, "init"); }
-int fleece_embedded_call_step(FleeceEmbedded* embedded) { return call_lifecycle_fn(embedded, "step"); }
+int fleece_embedded_call_init(FleeceEmbedded* embedded) {
+    if (embedded && embedded->rt) JS_UpdateStackTop(embedded->rt);
+    return call_lifecycle_fn(embedded, "init");
+}
+int fleece_embedded_call_step(FleeceEmbedded* embedded) {
+    if (embedded && embedded->rt) JS_UpdateStackTop(embedded->rt);
+    return call_lifecycle_fn(embedded, "step");
+}
 int fleece_embedded_call_reset(FleeceEmbedded* embedded) { return call_lifecycle_fn(embedded, "reset"); }
 int fleece_embedded_call_destroy(FleeceEmbedded* embedded) { return call_lifecycle_fn(embedded, "destroy"); }
 

@@ -11,8 +11,7 @@
 struct FleeceComms {
     bool is_connected;
     bool is_initialized;
-    uint32_t packet_count;
-    uint32_t max_packets;
+    uint32_t packet_count;   // diagnostic counter: total packets sent (unbounded)
 
     FleeceCommsSendCallback send_callback;
     void* send_callback_user_data;
@@ -33,7 +32,6 @@ FleeceComms* fleece_comms_create(void) {
     comms->is_connected = false;
     comms->is_initialized = false;
     comms->packet_count = 0;
-    comms->max_packets = 1024;  // Limit for microcontrollers
     
     return comms;
 }
@@ -48,9 +46,6 @@ void fleece_comms_destroy(FleeceComms* comms) {
 void fleece_comms_process_input(FleeceComms* comms) {
     if (!comms || !comms->is_initialized) return;
 
-    // Simulate receiving packets (in real implementation, this would read from radio)
-    printf("Processing incoming comms (packets received: %u)\n", comms->packet_count);
-
     if (comms->poll_callback) {
         comms->poll_callback(comms->poll_callback_user_data);
     }
@@ -58,9 +53,6 @@ void fleece_comms_process_input(FleeceComms* comms) {
 
 void fleece_comms_process_output(FleeceComms* comms) {
     if (!comms || !comms->is_initialized) return;
-    
-    // Simulate sending packets (in real implementation, this would write to radio)
-    printf("Processing outgoing comms (packets sent: %u)\n", comms->packet_count);
 }
 
 int fleece_comms_send(FleeceComms* comms, const char* destination, const uint8_t* data, uint32_t size) {
@@ -68,11 +60,6 @@ int fleece_comms_send(FleeceComms* comms, const char* destination, const uint8_t
         return -1;
     }
     
-    if (comms->packet_count >= comms->max_packets) {
-        return -1;  // Packet limit reached
-    }
-    
-    printf("Sending %u bytes to %s\n", size, destination);
     comms->packet_count++;
 
     if (comms->send_callback) {

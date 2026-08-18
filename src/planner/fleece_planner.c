@@ -98,7 +98,10 @@ static void copy_str(char* dst, size_t dst_sz, const char* src) {
         return;
     }
     size_t n = strlen(src);
-    if (n >= dst_sz) n = dst_sz - 1;
+    if (n >= dst_sz) {
+        n = dst_sz - 1;
+        fprintf(stderr, "fleece: source truncated to %zu bytes (was %zu); increase FLEECE_GOAP_SOURCE_MAX\n", n, strlen(src));
+    }
     memcpy(dst, src, n);
     dst[n] = '\0';
 }
@@ -479,6 +482,39 @@ int fleece_goap_select_goal(FleeceGoap* goap, const FleeceGoapBlackboard* bb, co
         }
     }
     return best;
+}
+
+// Rank unsatisfied goals by utility, highest first, into out[] (capped at
+// cap). Goals with utility <= threshold (or satisfied) are skipped. Returns
+// the number written. Unlike fleece_goap_select_goal this does not stop at the
+// single best goal: callers that need a fallback when a top goal cannot be
+// planned (e.g. a brain that should degrade to "recharge" when "forage" is
+// currently unplannable) can walk the list in order.
+uint32_t fleece_goap_rank_goals(FleeceGoap* goap, const FleeceGoapBlackboard* bb,
+                                const FleeceGoapEval* eval, double threshold,
+                                uint32_t* out, uint32_t cap) {
+    if (!goap || !eval || !eval->goal_satisfied || !out || cap == 0) return 0;
+
+    uint32_t n = 0;
+    for (uint32_t g = 0; g < goap->goal_count && n < cap; g++) {
+        bool sat = false;
+        if (eval->goal_satisfied(eval->user_data, g, bb, &sat) != 0 || sat) continue;
+        if (fleece_goap_goal_utility(goap, g, bb) <= threshold) continue;
+        out[n++] = g;
+    }
+
+    // Insertion sort by utility descending (goal sets are tiny - N^2 is fine).
+    for (uint32_t i = 1; i < n; i++) {
+        uint32_t key = out[i];
+        double kscore = fleece_goap_goal_utility(goap, key, bb);
+        int32_t j = (int32_t)i - 1;
+        while (j >= 0 && fleece_goap_goal_utility(goap, out[(uint32_t)j], bb) < kscore) {
+            out[(uint32_t)j + 1] = out[(uint32_t)j];
+            j--;
+        }
+        out[(uint32_t)j + 1] = key;
+    }
+    return n;
 }
 
 // ---------------------------------------------------------------------------

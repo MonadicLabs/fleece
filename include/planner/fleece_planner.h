@@ -33,7 +33,7 @@ extern "C" {
 #endif
 
 #define FLEECE_GOAP_NAME_MAX 32      // ids / names / dims / curve refs
-#define FLEECE_GOAP_SOURCE_MAX 512   // pre/eff/goal/cost JS function sources
+#define FLEECE_GOAP_SOURCE_MAX 2048   // pre/eff/goal/cost/exec JS function sources
 #define FLEECE_GOAP_NOTE_MAX 128     // mission notes
 
 typedef struct FleeceGoap FleeceGoap;
@@ -205,6 +205,15 @@ void fleece_goap_plan_destroy(FleeceGoapPlan* plan);
 // Highest-utility goal that is not yet satisfied and scores above `threshold`,
 // or -1 if none. Requires eval->goal_satisfied.
 int fleece_goap_select_goal(FleeceGoap* goap, const FleeceGoapBlackboard* bb, const FleeceGoapEval* eval, double threshold);
+
+// Rank unsatisfied goals by utility, highest first, into out[] (capped at
+// cap), skipping goals at or below `threshold`. Returns the number written.
+// Unlike select_goal this doesn't stop at the single best goal, so callers
+// that need a fallback when a top goal can't currently be planned can walk
+// the list in order.
+uint32_t fleece_goap_rank_goals(FleeceGoap* goap, const FleeceGoapBlackboard* bb,
+                                const FleeceGoapEval* eval, double threshold,
+                                uint32_t* out, uint32_t cap);
 
 // A goal's selection score on bb: utility curve over its `dim` field (or the
 // curve's constant value) times the goal's priority. 0 if the goal/curve is

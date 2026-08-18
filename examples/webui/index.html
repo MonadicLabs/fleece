@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>fleece · UAV Swarm Dashboard</title>
+  <meta name="description" content="Live view of a GPS-based UAV swarm driven entirely by the fleece GOAP runtime." />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <header>
+    <div class="header-inner">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round">
+            <path d="M12 2.5 20 7v10l-8 4.5L4 17V7z" stroke="#5eead4"/>
+            <path d="M12 7.5 16.5 10v4L12 16.5 7.5 14v-4z" fill="none" stroke="#fbbf24"/>
+          </svg>
+        </div>
+        <div>
+          <h1>fleece <span>·</span> UAV Swarm</h1>
+          <p class="tagline">GOAP-driven autonomous patrol &amp; recovery</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <span class="pill" id="conn-pill"><span class="dot" id="conn-dot"></span><span id="conn-label">connecting…</span></span>
+        <span class="pill stat"><b id="stat-tick">tick 0</b></span>
+        <span class="pill stat accent"><b id="stat-delivered">0</b><span> targets delivered</span></span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="map-card">
+      <div class="map-head">
+        <h2>GPS World <span class="map-sub" id="map-sub">patrol zone · base · targets · UAVs</span></h2>
+        <div class="legend">
+          <span class="lg"><i class="lg-dot scan"></i>patrol</span>
+          <span class="lg"><i class="lg-dot hunt"></i>intercept</span>
+          <span class="lg"><i class="lg-dot ret"></i>return</span>
+          <span class="lg"><i class="lg-dot charge"></i>charge</span>
+          <span class="lg"><i class="lg-dot target"></i>target</span>
+        </div>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="map" width="960" height="720"></canvas>
+        <div class="overlay" id="overlay">connecting to fleece…</div>
+      </div>
+    </section>
+
+    <aside class="side">
+      <section class="panel controls">
+        <h2>Controls</h2>
+        <div class="btn-row">
+          <button id="btn-play" class="btn primary">Pause</button>
+          <button id="btn-step" class="btn">Step</button>
+          <button id="btn-reset" class="btn danger">Reset</button>
+        </div>
+        <div class="speed">
+          <label for="speed">sim speed <b id="speed-label">1.0×</b></label>
+          <input type="range" id="speed" min="20" max="400" step="10" value="100" />
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Fleet</h2>
+        <div id="fleet" class="fleet"><p class="muted">waiting for telemetry…</p></div>
+      </section>
+
+      <section class="panel">
+        <h2>World</h2>
+        <dl class="world-stats">
+          <dt>Base</dt><dd class="base">(60, 420)</dd>
+          <dt>Patrol zone</dt><dd>(500, 120) r90</dd>
+          <dt>Targets</dt><dd id="stat-targets">–</dd>
+        </dl>
+      </section>
+    </aside>
+  </main>
+
+  <footer>
+    <p>every decision is a GOAP plan · fleece runtime + QuickJS + Reticulum mesh</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

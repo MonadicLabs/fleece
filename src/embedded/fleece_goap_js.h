@@ -98,7 +98,8 @@ int fleece_goap_js_apply_action(FleeceEmbedded* embedded, FleeceGoap* goap,
 typedef enum {
     FLEECE_GOAP_BRAIN_EVENT_REPLAN,        // new goal/action selected (see getters)
     FLEECE_GOAP_BRAIN_EVENT_ACTION_DONE,   // an action's effect was applied+committed
-    FLEECE_GOAP_BRAIN_EVENT_IDLE           // no unsatisfied goal above threshold
+    FLEECE_GOAP_BRAIN_EVENT_ABORTED,       // an action exceeded max_action_ticks and was dropped
+    FLEECE_GOAP_BRAIN_EVENT_IDLE           // no unsatisfied goal, or none currently plannable
 } FleeceGoapBrainEvent;
 
 // Called after a tick's decisions. brain is read-only during the callback;
@@ -115,6 +116,12 @@ int fleece_goap_brain_tick(FleeceGoapBrain* brain);
 
 // Register an event callback (e.g. for logging). May be NULL to clear.
 void fleece_goap_brain_set_event_callback(FleeceGoapBrain* brain, FleeceGoapBrainEventFn cb, void* user_data);
+
+// Cap how many ticks a single action may execute before the brain gives up on
+// it and replans (FLEECE_GOAP_BRAIN_EVENT_ABORTED). A wedged action - hardware
+// that never responds, a target that vanished mid-hunt - would otherwise pin
+// the agent forever. 0 (default) disables the watchdog.
+void fleece_goap_brain_set_max_action_ticks(FleeceGoapBrain* brain, uint32_t max_ticks);
 
 // Current brain state, for introspection/logging. NULL when none.
 const char* fleece_goap_brain_goal_id(const FleeceGoapBrain* brain);

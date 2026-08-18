@@ -39,11 +39,23 @@ struct FleeceGoapJsEval {
     uint32_t entry_next;   // FIFO position for eviction
 };
 
-static void goap_js_dump_exception(JSContext* ctx) {
+static void goap_js_dump_exception(JSContext* ctx, const char* where) {
     JSValue exc = JS_GetException(ctx);
     const char* msg = JS_ToCString(ctx, exc);
-    fprintf(stderr, "fleece: goap JS exception: %s\n", msg ? msg : "(unknown)");
+    fprintf(stderr, "fleece: goap JS exception [%s]: %s\n", where, msg ? msg : "(unknown)");
     if (msg) JS_FreeCString(ctx, msg);
+
+    // Include the JS stack when available - authored sources fail with
+    // exceptions that are much easier to diagnose with a traceback.
+    JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
+    if (JS_IsString(stack)) {
+        const char* st = JS_ToCString(ctx, stack);
+        if (st) {
+            fprintf(stderr, "fleece: goap JS stack:\n%s\n", st);
+            JS_FreeCString(ctx, st);
+        }
+    }
+    JS_FreeValue(ctx, stack);
     JS_FreeValue(ctx, exc);
 }
 
@@ -96,7 +108,7 @@ static JSValue goap_get_js_fn(FleeceGoapJsEval* je, uint32_t kind, uint32_t idx,
             e->src = strdup(src);
             e->fn = compile_goap_fn(ctx, src);
             if (JS_IsException(e->fn)) {
-                goap_js_dump_exception(ctx);
+                goap_js_dump_exception(ctx, "compile");
                 e->fn = JS_UNDEFINED;
             }
             return JS_DupValue(ctx, e->fn);
@@ -113,7 +125,7 @@ static JSValue goap_get_js_fn(FleeceGoapJsEval* je, uint32_t kind, uint32_t idx,
     slot->src = strdup(src);
     slot->fn = compile_goap_fn(ctx, src);
     if (JS_IsException(slot->fn)) {
-        goap_js_dump_exception(ctx);
+        goap_js_dump_exception(ctx, "compile");
         slot->fn = JS_UNDEFINED;
     }
     return JS_DupValue(ctx, slot->fn);
@@ -249,7 +261,7 @@ static int js_action_pre(void* user_data, uint32_t action_idx, const FleeceGoapB
         JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst*)&bbjs);
         JS_FreeValue(ctx, fn);
         if (JS_IsException(result)) {
-            goap_js_dump_exception(ctx);
+            goap_js_dump_exception(ctx, "pre");
             JS_FreeValue(ctx, bbjs);
             *out = false;
             return 0;
@@ -284,7 +296,7 @@ static int js_goal_satisfied(void* user_data, uint32_t goal_idx, const FleeceGoa
     JS_FreeValue(ctx, bbjs);
     JS_FreeValue(ctx, fn);
     if (JS_IsException(result)) {
-        goap_js_dump_exception(ctx);
+        goap_js_dump_exception(ctx, "goal");
         return 0;
     }
     *out = JS_ToBool(ctx, result) > 0;
@@ -310,7 +322,7 @@ static int js_action_cost(void* user_data, uint32_t action_idx, const FleeceGoap
         JS_FreeValue(ctx, bbjs);
         JS_FreeValue(ctx, v);
         if (JS_IsException(result)) {
-            goap_js_dump_exception(ctx);
+            goap_js_dump_exception(ctx, "compile");
             return 0;
         }
         double c;
@@ -348,7 +360,7 @@ static int js_action_apply(void* user_data, uint32_t action_idx, const FleeceGoa
         JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst*)&bbjs);
         JS_FreeValue(ctx, fn);
         if (JS_IsException(result)) {
-            goap_js_dump_exception(ctx);
+            goap_js_dump_exception(ctx, "pre");
             JS_FreeValue(ctx, bbjs);
             return -1;
         }
@@ -398,7 +410,7 @@ static int js_action_exec(FleeceGoapJsEval* je, uint32_t action_idx, const Fleec
     JS_FreeValue(ctx, tickv);
     JS_FreeValue(ctx, fn);
     if (JS_IsException(result)) {
-        goap_js_dump_exception(ctx);
+        goap_js_dump_exception(ctx, "exec");
         JS_FreeValue(ctx, bbjs);
         return -1;
     }
@@ -555,6 +567,7 @@ struct FleeceGoapBrain {
     int goal_idx;               // selected goal, -1 = none
     int action_idx;             // action being executed, -1 = none
     uint32_t exec_progress;     // ticks the current action has been executing
+    uint32_t max_action_ticks;  // watchdog: abort a wedged action after N ticks (0 = off)
     uint32_t tick_count;
     FleeceGoapBrainEventFn event_cb;
     void* event_ud;
@@ -584,6 +597,9 @@ void fleece_goap_brain_destroy(FleeceGoapBrain* b) {
 }
 
 // Plan for the highest-utility unsatisfied goal and select its first action.
+// If the best goal cannot currently be planned (its actions' preconditions
+// don't hold), fall back to the next-best goal rather than idling - a UAV that
+// can't scan on an empty battery should still be able to pick "recharge".
 static void brain_replan(FleeceGoapBrain* b, const FleeceGoapBlackboard* bb) {
     if (b->plan) {
         fleece_goap_plan_destroy(b->plan);
@@ -592,29 +608,41 @@ static void brain_replan(FleeceGoapBrain* b, const FleeceGoapBlackboard* bb) {
     b->goal_idx = -1;
     b->action_idx = -1;
 
-    int goal = fleece_goap_select_goal(b->goap, bb, &b->eval->eval, 0.0);
-    if (goal < 0) {
+    uint32_t cap = fleece_goap_goal_count(b->goap);
+    if (cap == 0) {
         if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_IDLE, b->event_ud);
         return;
     }
 
-    const char* gid = fleece_goap_goal_id(b->goap, (uint32_t)goal);
-    const char* goal_ids[1] = { gid };
-    b->plan = fleece_goap_plan(b->goap, bb, goal_ids, 1, &b->eval->eval);
-    if (!b->plan || fleece_goap_plan_length(b->plan) == 0) {
-        if (b->plan) {
-            fleece_goap_plan_destroy(b->plan);
-            b->plan = NULL;
+    uint32_t* ranked = (uint32_t*)malloc(cap * sizeof(uint32_t));
+    if (!ranked) {
+        if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_IDLE, b->event_ud);
+        return;
+    }
+    uint32_t n = fleece_goap_rank_goals(b->goap, bb, &b->eval->eval, 0.0, ranked, cap);
+
+    const char* goal_ids[1];
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t goal = ranked[i];
+        goal_ids[0] = fleece_goap_goal_id(b->goap, goal);
+        FleeceGoapPlan* plan = fleece_goap_plan(b->goap, bb, goal_ids, 1, &b->eval->eval);
+        if (!plan || fleece_goap_plan_length(plan) == 0) {
+            if (plan) fleece_goap_plan_destroy(plan);
+            continue;  // can't plan this goal right now - try the next best
         }
-        if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_IDLE, b->event_ud);
+
+        b->goal_idx = (int)goal;
+        const char* aid = fleece_goap_plan_action_id(plan, 0);
+        b->action_idx = (int)fleece_goap_find_action(b->goap, aid);
+        b->exec_progress = 0;
+        b->plan = plan;
+        if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_REPLAN, b->event_ud);
+        free(ranked);
         return;
     }
 
-    b->goal_idx = goal;
-    const char* aid = fleece_goap_plan_action_id(b->plan, 0);
-    b->action_idx = (int)fleece_goap_find_action(b->goap, aid);
-    b->exec_progress = 0;
-    if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_REPLAN, b->event_ud);
+    free(ranked);
+    if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_IDLE, b->event_ud);
 }
 
 int fleece_goap_brain_tick(FleeceGoapBrain* b) {
@@ -629,25 +657,33 @@ int fleece_goap_brain_tick(FleeceGoapBrain* b) {
     //    this tick.
     if (b->action_idx >= 0) {
         const char* esrc = fleece_goap_action_exec(b->goap, (uint32_t)b->action_idx);
+        bool aborted = false;
         if (esrc && esrc[0] != '\0') {
             b->exec_progress++;
-            FleeceGoapBlackboard bb = {0};
-            if (fleece_goap_js_bb_from_state(b->embedded, &bb) != 0) return -1;
-            FleeceGoapBlackboard dst = {0};
-            bool done = false;
-            int rc = js_action_exec(b->eval, (uint32_t)b->action_idx, &bb, b->exec_progress, &dst, &done);
-            fleece_goap_bb_release(&bb);
-            if (rc != 0) {
+            // Watchdog: a wedged action (hardware that never responds, a target
+            // that vanished mid-hunt) must not pin the agent forever - give up
+            // and replan. max_action_ticks == 0 disables this.
+            if (b->max_action_ticks > 0 && b->exec_progress >= b->max_action_ticks) {
+                aborted = true;
+            } else {
+                FleeceGoapBlackboard bb = {0};
+                if (fleece_goap_js_bb_from_state(b->embedded, &bb) != 0) return -1;
+                FleeceGoapBlackboard dst = {0};
+                bool done = false;
+                int rc = js_action_exec(b->eval, (uint32_t)b->action_idx, &bb, b->exec_progress, &dst, &done);
+                fleece_goap_bb_release(&bb);
+                if (rc != 0) {
+                    fleece_goap_bb_release(&dst);
+                    b->action_idx = -1;
+                    return 0;  // exec failed - next tick replans
+                }
+                if (fleece_goap_js_bb_commit(b->embedded, &dst) != 0) {
+                    fleece_goap_bb_release(&dst);
+                    return -1;
+                }
                 fleece_goap_bb_release(&dst);
-                b->action_idx = -1;
-                return 0;  // exec failed - next tick replans
+                if (!done) return 0;  // keep executing next tick
             }
-            if (fleece_goap_js_bb_commit(b->embedded, &dst) != 0) {
-                fleece_goap_bb_release(&dst);
-                return -1;
-            }
-            fleece_goap_bb_release(&dst);
-            if (!done) return 0;  // keep executing next tick
         }
 
         b->action_idx = -1;
@@ -656,7 +692,7 @@ int fleece_goap_brain_tick(FleeceGoapBrain* b) {
             fleece_goap_plan_destroy(b->plan);
             b->plan = NULL;
         }
-        if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_ACTION_DONE, b->event_ud);
+        if (b->event_cb) b->event_cb(b, aborted ? FLEECE_GOAP_BRAIN_EVENT_ABORTED : FLEECE_GOAP_BRAIN_EVENT_ACTION_DONE, b->event_ud);
         // fall through: re-execute planning now that the world changed
     }
 
@@ -672,6 +708,11 @@ void fleece_goap_brain_set_event_callback(FleeceGoapBrain* b, FleeceGoapBrainEve
     if (!b) return;
     b->event_cb = cb;
     b->event_ud = user_data;
+}
+
+void fleece_goap_brain_set_max_action_ticks(FleeceGoapBrain* b, uint32_t max_ticks) {
+    if (!b) return;
+    b->max_action_ticks = max_ticks;
 }
 
 const char* fleece_goap_brain_goal_id(const FleeceGoapBrain* b) {

@@ -65,10 +65,15 @@ foreach(test_src ${TEST_SRC})
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
-# Examples: one executable per examples/*.c file
+# Examples: one executable per examples/*.c file (http_server.c is a helper
+# linked into the examples that need it, not a standalone program).
 file(GLOB_RECURSE EXAMPLE_SRC "examples/*.c")
+list(FILTER EXAMPLE_SRC EXCLUDE REGEX "examples/http_server\\.c$")
 foreach(example_src ${EXAMPLE_SRC})
     get_filename_component(example_name ${example_src} NAME_WE)
     add_executable(${example_name} ${example_src})
     target_link_libraries(${example_name} fleece)
 endforeach()
+
+# example5 also needs the local HTTP helper
+target_sources(example5_uav_swarm PRIVATE examples/http_server.c)
