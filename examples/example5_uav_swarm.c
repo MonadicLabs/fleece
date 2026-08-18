@@ -477,9 +477,6 @@ static void env_tick(FleeceRuntime* runtime, void* ud) {
     env_set_double(sm, "battery", uav->battery);
     env_set_double(sm, "x", uav->x);
     env_set_double(sm, "y", uav->y);
-    // Continuous GPS-derived distance to home - gives the planner a model it
-    // can reason over ("return" sets it to 0, "charge" requires it small).
-    env_set_double(sm, "distHome", sqrt((uav->x - HOME_X) * (uav->x - HOME_X) + (uav->y - HOME_Y) * (uav->y - HOME_Y)));
 
     // Mirror the brain's current decision for the dashboard (read-only copy
     // so the httpd thread never touches live brain/state-manager memory).
@@ -522,6 +519,24 @@ static void env_tick(FleeceRuntime* runtime, void* ud) {
 }
 
 // ---------------------------------------------------------------------------
+// Live telemetry injected into the brain's bb every tick, on both the exec and
+// plan/select paths (fleece_goap_brain_set_world_model). This is the seam a
+// real PX4/MAVLink adapter would use: a telemetry thread fills a ring buffer
+// and this hook copies the latest sample into bb.self. distHome here replaces
+// the old env_tick mirror - it gives the planner a model to reason over
+// ("return" sets it to 0, "charge" requires it small).
+static void brain_world_model(FleeceGoapBrain* brain, FleeceGoapBlackboard* bb, uint32_t tick, void* ud) {
+    (void)brain; (void)tick;
+    UavCtx* ctx = (UavCtx*)ud;
+    UavPhysics* uav = &ctx->sim->uavs[ctx->index];  // same thread as env_tick, no lock needed
+    char b[64];
+    double dh = sqrt((uav->x - HOME_X) * (uav->x - HOME_X) + (uav->y - HOME_Y) * (uav->y - HOME_Y));
+    snprintf(b, sizeof(b), "%.17g", dh);
+    fleece_goap_bb_set(bb, "distHome", (const uint8_t*)b, (uint32_t)strlen(b), false);
+    // Mock autopilot state - foreshadows the PX4 adapter streaming mode/etc.
+    fleece_goap_bb_set(bb, "mode", (const uint8_t*)"\"offboard\"", 11, false);
+}
+
 // GOAP scenario: GPS-based behaviour authored as JS function sources.
 //   - no named locations: preconditions/goals reason over bb.self.x/.y and
 //     distances via Math.hypot; exec bodies command the autopilot by GPS.
@@ -869,6 +884,7 @@ static int init_uav(int index) {
     FleeceGoapBrain* brain = (FleeceGoapBrain*)fleece_runtime_get_goap_brain(runtime);
     fleece_goap_brain_set_event_callback(brain, brain_event, ctx);
     fleece_goap_brain_set_max_action_ticks(brain, 300);  // ~30s at 10Hz: drop wedged actions
+    fleece_goap_brain_set_world_model(brain, brain_world_model, ctx);  // live telemetry -> bb.self
 
     // Hardware: the autopilot/sensor verbs this UAV's brain may call. Note the
     // platform is PURELY a flight controller + sensor - coordination (target

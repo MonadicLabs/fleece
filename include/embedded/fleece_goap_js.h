@@ -106,6 +106,15 @@ typedef enum {
 // strings returned by the getters are valid only until the next tick.
 typedef void (*FleeceGoapBrainEventFn)(FleeceGoapBrain* brain, FleeceGoapBrainEvent event, void* user_data);
 
+// Host-supplied world-model hook: called by the brain once per tick, right
+// after the live state manager is snapshotted into `bb` (in both the exec path
+// and the plan/select path), so every authorized pre/goal/eff/exec sees fresh
+// telemetry. Inject live sensor state into the `self` namespace with
+// fleece_goap_bb_set(bb, name, data, size, false) - it commits and gossips like
+// any other self field. Typical use: a PX4/MAVLink (or mock) telemetry thread
+// writes a small ring buffer; this callback copies the latest sample in.
+typedef void (*FleeceGoapWorldModelFn)(FleeceGoapBrain* brain, FleeceGoapBlackboard* bb, uint32_t tick, void* user_data);
+
 // Create a brain driving `goap` against `embedded`'s state manager. Caller
 // keeps ownership of `goap` (must outlive the brain).
 FleeceGoapBrain* fleece_goap_brain_create(FleeceEmbedded* embedded, FleeceGoap* goap);
@@ -116,6 +125,9 @@ int fleece_goap_brain_tick(FleeceGoapBrain* brain);
 
 // Register an event callback (e.g. for logging). May be NULL to clear.
 void fleece_goap_brain_set_event_callback(FleeceGoapBrain* brain, FleeceGoapBrainEventFn cb, void* user_data);
+
+// Register the world-model hook (see FleeceGoapWorldModelFn). May be NULL to clear.
+void fleece_goap_brain_set_world_model(FleeceGoapBrain* brain, FleeceGoapWorldModelFn cb, void* user_data);
 
 // Cap how many ticks a single action may execute before the brain gives up on
 // it and replans (FLEECE_GOAP_BRAIN_EVENT_ABORTED). A wedged action - hardware

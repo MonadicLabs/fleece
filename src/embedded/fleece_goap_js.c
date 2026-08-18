@@ -571,6 +571,8 @@ struct FleeceGoapBrain {
     uint32_t tick_count;
     FleeceGoapBrainEventFn event_cb;
     void* event_ud;
+    FleeceGoapWorldModelFn world_model_cb;  // host telemetry injection (see header)
+    void* world_model_ud;
 };
 
 FleeceGoapBrain* fleece_goap_brain_create(FleeceEmbedded* embedded, FleeceGoap* goap) {
@@ -645,6 +647,16 @@ static void brain_replan(FleeceGoapBrain* b, const FleeceGoapBlackboard* bb) {
     if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_IDLE, b->event_ud);
 }
 
+// Snapshot the live state manager into a blackboard, then let the host's
+// world-model hook inject live telemetry into the `self` namespace (e.g.
+// freshly-streamed GPS/battery/mode). Authorized pre/goal/eff/exec functions
+// see these fields every tick; they commit like any other self field.
+static int brain_fresh_bb(FleeceGoapBrain* b, FleeceGoapBlackboard* bb) {
+    if (fleece_goap_js_bb_from_state(b->embedded, bb) != 0) return -1;
+    if (b->world_model_cb) b->world_model_cb(b, bb, b->tick_count, b->world_model_ud);
+    return 0;
+}
+
 int fleece_goap_brain_tick(FleeceGoapBrain* b) {
     if (!b) return -1;
     b->tick_count++;
@@ -667,7 +679,7 @@ int fleece_goap_brain_tick(FleeceGoapBrain* b) {
                 aborted = true;
             } else {
                 FleeceGoapBlackboard bb = {0};
-                if (fleece_goap_js_bb_from_state(b->embedded, &bb) != 0) return -1;
+                if (brain_fresh_bb(b, &bb) != 0) return -1;
                 FleeceGoapBlackboard dst = {0};
                 bool done = false;
                 int rc = js_action_exec(b->eval, (uint32_t)b->action_idx, &bb, b->exec_progress, &dst, &done);
@@ -698,7 +710,7 @@ int fleece_goap_brain_tick(FleeceGoapBrain* b) {
 
     // 2. (Re)plan: pick the best unsatisfied goal and its first action.
     FleeceGoapBlackboard bb = {0};
-    if (fleece_goap_js_bb_from_state(b->embedded, &bb) != 0) return -1;
+    if (brain_fresh_bb(b, &bb) != 0) return -1;
     brain_replan(b, &bb);
     fleece_goap_bb_release(&bb);
     return 0;
@@ -708,6 +720,12 @@ void fleece_goap_brain_set_event_callback(FleeceGoapBrain* b, FleeceGoapBrainEve
     if (!b) return;
     b->event_cb = cb;
     b->event_ud = user_data;
+}
+
+void fleece_goap_brain_set_world_model(FleeceGoapBrain* b, FleeceGoapWorldModelFn cb, void* user_data) {
+    if (!b) return;
+    b->world_model_cb = cb;
+    b->world_model_ud = user_data;
 }
 
 void fleece_goap_brain_set_max_action_ticks(FleeceGoapBrain* b, uint32_t max_ticks) {

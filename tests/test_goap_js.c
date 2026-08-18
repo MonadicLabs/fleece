@@ -283,6 +283,77 @@ static void test_state_snapshot_and_commit(FleeceEmbedded* embedded) {
     fleece_goap_bb_release(&bb);
 }
 
+static void world_model_test_cb(FleeceGoapBrain* brain, FleeceGoapBlackboard* bb, uint32_t tick, void* ud) {
+    (void)brain; (void)tick;
+    int* calls = (int*)ud;
+    (*calls)++;
+    fleece_goap_bb_set(bb, "telemetry", (const uint8_t*)"\"fresh\"", 7, false);
+}
+
+static void test_world_model_hook(FleeceEmbedded* embedded) {
+    printf("Running world-model hook tests...\n");
+    FleeceStateManager* sm = (FleeceStateManager*)fleece_embedded_get_state_manager(embedded);
+
+    FleeceGoap* g = fleece_goap_create();
+    CHECK(g != NULL, "goap create");
+    const char* pre[] = { "function(bb){ return bb.self.telemetry === 'fresh'; }" };
+    const char* eff[] = { "function(bb){ bb.self.done = 1; return bb; }" };
+    FleeceGoapActionDef a = {0};
+    a.id = "gated"; a.name = "Requires Live Telemetry";
+    a.pre = pre; a.pre_count = 1;
+    a.eff = eff; a.eff_count = 1;
+    a.exec = "function(bb, tick){ bb.self.done = 1; return true; }";
+    CHECK(fleece_goap_add_action(g, &a) == 0, "add gated action");
+    FleeceGoapGoalDef goal = {0};
+    goal.id = "goalMet"; goal.name = "Done";
+    goal.expr = "function(bb){ return bb.self.done === 1; }";
+    goal.priority = 1.0;
+    CHECK(fleece_goap_add_goal(g, &goal) == 0, "add goal");
+
+    FleeceGoapBrain* brain = fleece_goap_brain_create(embedded, g);
+    CHECK(brain != NULL, "brain create");
+
+    // Without a world-model hook the injected field is absent -> not plannable.
+    CHECK(fleece_goap_brain_tick(brain) == 0, "tick without hook");
+    CHECK(fleece_goap_brain_goal_id(brain) == NULL, "no goal without telemetry");
+
+    // Inject telemetry via the world-model hook every tick.
+    int calls = 0;
+    fleece_goap_brain_set_world_model(brain, world_model_test_cb, &calls);
+
+    // Tick 1: the plan/select path snapshots with the hook -> telemetry is
+    // visible to pre/goal -> goal plannable, gated selected (exec runs next tick).
+    CHECK(fleece_goap_brain_tick(brain) == 0, "tick with hook");
+    CHECK(calls == 1, "hook called once on the plan path");
+    CHECK(fleece_goap_brain_goal_id(brain) && strcmp(fleece_goap_brain_goal_id(brain), "goalMet") == 0,
+          "goal should be plannable with telemetry");
+    CHECK(fleece_goap_brain_action_id(brain) && strcmp(fleece_goap_brain_action_id(brain), "gated") == 0,
+          "gated action selected");
+
+    // Tick 2: the exec path snapshots with the hook too (call #2), the exec
+    // completes and commits done=1, then the replan path snapshots again (call #3).
+    CHECK(fleece_goap_brain_tick(brain) == 0, "exec tick");
+    CHECK(calls == 3, "hook called on both exec and replan paths");
+    uint8_t* got = NULL; uint32_t got_sz = 0;
+    CHECK(fleece_state_manager_get_named(sm, fleece_state_manager_get_node_id(sm), "done", &got, &got_sz) == 0,
+          "done should be committed after gated");
+    CHECK(got_sz == 1 && got[0] == '1', "done should be 1 after gated");
+    free(got); got = NULL; got_sz = 0;
+
+    // The injected field rides along in the exec's bb and commits like any
+    // other self field (it gossips with the self stream).
+    CHECK(fleece_state_manager_get_named(sm, fleece_state_manager_get_node_id(sm), "telemetry", &got, &got_sz) == 0,
+          "telemetry should commit as a self field");
+    CHECK(got_sz == 7 && memcmp(got, "\"fresh\"", 7) == 0, "telemetry should equal fresh");
+    free(got); got = NULL; got_sz = 0;
+
+    // Goal satisfied -> idle on subsequent ticks.
+    CHECK(fleece_goap_brain_goal_id(brain) == NULL, "goal satisfied -> idle");
+
+    fleece_goap_brain_destroy(brain);
+    fleece_goap_destroy(g);
+}
+
 static void test_brain_behavior_loop(FleeceEmbedded* embedded) {
     printf("Running brain behavior-loop tests...\n");
     FleeceStateManager* sm = (FleeceStateManager*)fleece_embedded_get_state_manager(embedded);
@@ -384,6 +455,7 @@ int main(void) {
     test_planning_and_selection(embedded, goap);
     test_apply_action_public(embedded, goap);
     test_state_snapshot_and_commit(embedded);
+    test_world_model_hook(embedded);
     test_brain_behavior_loop(embedded);
 
     fleece_goap_destroy(goap);
