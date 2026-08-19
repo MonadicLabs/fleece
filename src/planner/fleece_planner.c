@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 #include "planner/fleece_planner.h"
+#include "fleece_alloc.h"
 #include "fleece_cbor.h"
 
 // Engine-agnostic GOAP planner. The planner owns its action/goal/utility
@@ -110,7 +111,7 @@ static void copy_str(char* dst, size_t dst_sz, const char* src) {
 static char* dup_str(const char* src) {
     if (!src) src = "";
     size_t n = strlen(src);
-    char* out = (char*)malloc(n + 1);
+    char* out = (char*)fleece_malloc(n + 1);
     if (!out) return NULL;
     memcpy(out, src, n + 1);
     return out;
@@ -120,7 +121,7 @@ static int ensure_cap(void** arr, uint32_t* cap, uint32_t needed, size_t elem_si
     if (needed <= *cap) return 0;
     uint32_t new_cap = *cap ? *cap : 4;
     while (new_cap < needed) new_cap *= 2;
-    void* grown = realloc(*arr, new_cap * elem_size);
+    void* grown = fleece_realloc(*arr, new_cap * elem_size);
     if (!grown) return -1;
     *arr = grown;
     *cap = new_cap;
@@ -128,8 +129,8 @@ static int ensure_cap(void** arr, uint32_t* cap, uint32_t needed, size_t elem_si
 }
 
 static void free_strings(char** arr, uint32_t count) {
-    for (uint32_t i = 0; i < count; i++) free(arr[i]);
-    free(arr);
+    for (uint32_t i = 0; i < count; i++) fleece_free(arr[i]);
+    fleece_free(arr);
 }
 
 // Best-effort parse of a JSON number (e.g. "3", "3.5", "-2e3").
@@ -178,10 +179,10 @@ int fleece_goap_bb_set(FleeceGoapBlackboard* bb, const char* name, const uint8_t
         bb->fields[idx].is_shared = is_shared;
     }
 
-    uint8_t* copy = (uint8_t*)malloc(size);
+    uint8_t* copy = (uint8_t*)fleece_malloc(size);
     if (!copy) return -1;
     memcpy(copy, data, size);
-    free(bb->fields[idx].data);
+    fleece_free(bb->fields[idx].data);
     bb->fields[idx].data = copy;
     bb->fields[idx].size = size;
     bb->fields[idx].is_shared = is_shared;
@@ -192,7 +193,7 @@ int fleece_goap_bb_delete(FleeceGoapBlackboard* bb, const char* name) {
     if (!bb || !name) return -1;
     uint32_t idx = fleece_goap_bb_index(bb, name);
     if (idx == UINT32_MAX) return 0;
-    free(bb->fields[idx].data);
+    fleece_free(bb->fields[idx].data);
     for (uint32_t i = idx; i + 1 < bb->count; i++) {
         bb->fields[i] = bb->fields[i + 1];
     }
@@ -216,8 +217,8 @@ int fleece_goap_bb_clone(const FleeceGoapBlackboard* src, FleeceGoapBlackboard* 
 
 void fleece_goap_bb_release(FleeceGoapBlackboard* bb) {
     if (!bb) return;
-    for (uint32_t i = 0; i < bb->count; i++) free(bb->fields[i].data);
-    free(bb->fields);
+    for (uint32_t i = 0; i < bb->count; i++) fleece_free(bb->fields[i].data);
+    fleece_free(bb->fields);
     bb->fields = NULL;
     bb->count = 0;
     bb->cap = 0;
@@ -227,7 +228,7 @@ void fleece_goap_bb_release(FleeceGoapBlackboard* bb) {
 // name. Caller frees. Returns NULL on OOM.
 static char* make_state_key(const FleeceGoapBlackboard* bb, uint32_t* out_len) {
     *out_len = 0;
-    const FleeceGoapField** sorted = (const FleeceGoapField**)malloc((bb->count ? bb->count : 1) * sizeof(const FleeceGoapField*));
+    const FleeceGoapField** sorted = (const FleeceGoapField**)fleece_malloc((bb->count ? bb->count : 1) * sizeof(const FleeceGoapField*));
     if (!sorted) return NULL;
     for (uint32_t i = 0; i < bb->count; i++) sorted[i] = &bb->fields[i];
     for (uint32_t i = 1; i < bb->count; i++) {
@@ -242,9 +243,9 @@ static char* make_state_key(const FleeceGoapBlackboard* bb, uint32_t* out_len) {
 
     size_t total = 0;
     for (uint32_t i = 0; i < bb->count; i++) total += 2 + strlen(sorted[i]->name) + 1 + sorted[i]->size;  // ns prefix + name + sep + json
-    char* buf = (char*)malloc(total ? total : 1);
+    char* buf = (char*)fleece_malloc(total ? total : 1);
     if (!buf) {
-        free(sorted);
+        fleece_free(sorted);
         return NULL;
     }
     size_t p = 0;
@@ -260,7 +261,7 @@ static char* make_state_key(const FleeceGoapBlackboard* bb, uint32_t* out_len) {
             p += sorted[i]->size;
         }
     }
-    free(sorted);
+    fleece_free(sorted);
     *out_len = (uint32_t)p;
     return buf;
 }
@@ -294,16 +295,16 @@ static uint64_t fnv1a64(const uint8_t* data, uint32_t len) {
 static int visited_init(VisitedSet* set, uint32_t max_nodes) {
     set->cap = max_nodes * 2 + 1;
     set->count = 0;
-    set->slots = (VisitedEntry*)calloc(set->cap, sizeof(VisitedEntry));
+    set->slots = (VisitedEntry*)fleece_calloc(set->cap, sizeof(VisitedEntry));
     return set->slots ? 0 : -1;
 }
 
 static void visited_free(VisitedSet* set) {
     if (!set->slots) return;
     for (uint32_t i = 0; i < set->cap; i++) {
-        if (set->slots[i].used) free(set->slots[i].key);
+        if (set->slots[i].used) fleece_free(set->slots[i].key);
     }
-    free(set->slots);
+    fleece_free(set->slots);
     set->slots = NULL;
 }
 
@@ -369,7 +370,7 @@ static int nodes_push(NodeList* list, const SearchNode* node) {
 static int heap_push(Heap* heap, uint32_t idx, double f) {
     if (heap->len == heap->cap) {
         uint32_t new_cap = heap->cap ? heap->cap * 2 : 16;
-        HeapEntry* grown = (HeapEntry*)realloc(heap->items, new_cap * sizeof(HeapEntry));
+        HeapEntry* grown = (HeapEntry*)fleece_realloc(heap->items, new_cap * sizeof(HeapEntry));
         if (!grown) return -1;
         heap->items = grown;
         heap->cap = new_cap;
@@ -405,7 +406,7 @@ static bool heap_pop(Heap* heap, uint32_t* idx) {
 
 static void release_nodes(NodeList* list) {
     for (uint32_t i = 0; i < list->count; i++) fleece_goap_bb_release(&list->items[i].bb);
-    free(list->items);
+    fleece_free(list->items);
     list->items = NULL;
     list->count = 0;
     list->cap = 0;
@@ -562,12 +563,12 @@ FleeceGoapPlan* fleece_goap_plan(FleeceGoap* goap, const FleeceGoapBlackboard* s
     uint32_t* targets = NULL;
     uint32_t n_targets = 0;
     if (goal_ids && n_goals > 0) {
-        targets = (uint32_t*)malloc(n_goals * sizeof(uint32_t));
+        targets = (uint32_t*)fleece_malloc(n_goals * sizeof(uint32_t));
         if (!targets) return NULL;
         for (uint32_t i = 0; i < n_goals; i++) {
             uint32_t idx = fleece_goap_find_goal(goap, goal_ids[i]);
             if (idx == UINT32_MAX) {
-                free(targets);
+                fleece_free(targets);
                 return NULL;
             }
             targets[i] = idx;
@@ -576,7 +577,7 @@ FleeceGoapPlan* fleece_goap_plan(FleeceGoap* goap, const FleeceGoapBlackboard* s
     } else {
         n_targets = goap->goal_count;
         if (n_targets > 0) {
-            targets = (uint32_t*)malloc(n_targets * sizeof(uint32_t));
+            targets = (uint32_t*)fleece_malloc(n_targets * sizeof(uint32_t));
             if (!targets) return NULL;
             for (uint32_t i = 0; i < n_targets; i++) targets[i] = i;
         }
@@ -616,7 +617,7 @@ FleeceGoapPlan* fleece_goap_plan(FleeceGoap* goap, const FleeceGoapBlackboard* s
         SearchNode* node = &nodes.items[node_idx];
 
         if (goals_met(goap, targets, n_targets, &node->bb, eval)) {
-            plan = (FleeceGoapPlan*)calloc(1, sizeof(FleeceGoapPlan));
+            plan = (FleeceGoapPlan*)fleece_calloc(1, sizeof(FleeceGoapPlan));
             if (!plan) goto out;
             plan->iters = iters;
             plan->total_cost = node->g;
@@ -629,7 +630,7 @@ FleeceGoapPlan* fleece_goap_plan(FleeceGoap* goap, const FleeceGoapBlackboard* s
                 cur = nodes.items[cur].parent;
             }
             uint32_t n_actions = depth - 1;
-            uint32_t* rev = (uint32_t*)malloc(depth * sizeof(uint32_t));
+            uint32_t* rev = (uint32_t*)fleece_malloc(depth * sizeof(uint32_t));
             if (!rev) goto out;
             cur = node_idx;
             uint32_t k = 0;
@@ -637,23 +638,23 @@ FleeceGoapPlan* fleece_goap_plan(FleeceGoap* goap, const FleeceGoapBlackboard* s
                 rev[k++] = nodes.items[cur].action_idx;
                 cur = nodes.items[cur].parent;
             }
-            plan->action_ids = (char**)malloc((n_actions ? n_actions : 1) * sizeof(char*));
+            plan->action_ids = (char**)fleece_malloc((n_actions ? n_actions : 1) * sizeof(char*));
             if (!plan->action_ids) {
-                free(rev);
+                fleece_free(rev);
                 goto out;
             }
             for (uint32_t i = 0; i < n_actions; i++) {
                 uint32_t ai = rev[k - 2 - i];
                 plan->action_ids[i] = dup_str(goap->actions[ai].id);
                 if (!plan->action_ids[i]) {
-                    for (uint32_t j = 0; j < i; j++) free(plan->action_ids[j]);
-                    free(plan->action_ids);
-                    free(rev);
+                    for (uint32_t j = 0; j < i; j++) fleece_free(plan->action_ids[j]);
+                    fleece_free(plan->action_ids);
+                    fleece_free(rev);
                     goto out;
                 }
             }
             plan->length = n_actions;
-            free(rev);
+            fleece_free(rev);
             goto out;
         }
 
@@ -677,7 +678,7 @@ FleeceGoapPlan* fleece_goap_plan(FleeceGoap* goap, const FleeceGoapBlackboard* s
                 goto out;
             }
             if (!visited_add(&visited, (uint8_t*)key, key_len)) {
-                free(key);
+                fleece_free(key);
                 fleece_goap_bb_release(&dst);
                 continue;
             }
@@ -708,9 +709,9 @@ FleeceGoapPlan* fleece_goap_plan(FleeceGoap* goap, const FleeceGoapBlackboard* s
 
 out:
     release_nodes(&nodes);
-    free(heap.items);
+    fleece_free(heap.items);
     visited_free(&visited);
-    free(targets);
+    fleece_free(targets);
     return plan;
 }
 
@@ -733,9 +734,9 @@ uint32_t fleece_goap_plan_iters(const FleeceGoapPlan* plan) {
 
 void fleece_goap_plan_destroy(FleeceGoapPlan* plan) {
     if (!plan) return;
-    for (uint32_t i = 0; i < plan->length; i++) free(plan->action_ids[i]);
-    free(plan->action_ids);
-    free(plan);
+    for (uint32_t i = 0; i < plan->length; i++) fleece_free(plan->action_ids[i]);
+    fleece_free(plan->action_ids);
+    fleece_free(plan);
 }
 
 // ---------------------------------------------------------------------------
@@ -743,7 +744,7 @@ void fleece_goap_plan_destroy(FleeceGoapPlan* plan) {
 // ---------------------------------------------------------------------------
 
 FleeceGoap* fleece_goap_create(void) {
-    FleeceGoap* goap = (FleeceGoap*)calloc(1, sizeof(FleeceGoap));
+    FleeceGoap* goap = (FleeceGoap*)fleece_calloc(1, sizeof(FleeceGoap));
     if (!goap) return NULL;
     goap->max_iters = FLEECE_GOAP_DEFAULT_MAX_ITERS;
     goap->max_nodes = FLEECE_GOAP_DEFAULT_MAX_NODES;
@@ -757,12 +758,12 @@ void fleece_goap_reset(FleeceGoap* goap) {
         free_strings(goap->actions[i].pre, goap->actions[i].pre_count);
         free_strings(goap->actions[i].eff, goap->actions[i].eff_count);
     }
-    free(goap->actions);
-    free(goap->goals);
-    for (uint32_t i = 0; i < goap->utility_count; i++) free(goap->utilities[i].points);
-    free(goap->utilities);
+    fleece_free(goap->actions);
+    fleece_free(goap->goals);
+    for (uint32_t i = 0; i < goap->utility_count; i++) fleece_free(goap->utilities[i].points);
+    fleece_free(goap->utilities);
     for (uint32_t i = 0; i < goap->mission_count; i++) free_strings(goap->missions[i].goal_ids, goap->missions[i].goal_count);
-    free(goap->missions);
+    fleece_free(goap->missions);
     goap->actions = NULL;
     goap->action_count = 0;
     goap->action_cap = 0;
@@ -781,7 +782,7 @@ void fleece_goap_reset(FleeceGoap* goap) {
 void fleece_goap_destroy(FleeceGoap* goap) {
     if (!goap) return;
     fleece_goap_reset(goap);
-    free(goap);
+    fleece_free(goap);
 }
 
 const char* fleece_goap_name(const FleeceGoap* goap) {
@@ -848,7 +849,7 @@ int fleece_goap_add_action(FleeceGoap* goap, const FleeceGoapActionDef* def) {
     a->dur = def->dur;
 
     if (def->pre_count > 0 && def->pre) {
-        a->pre = (char**)calloc(def->pre_count, sizeof(char*));
+        a->pre = (char**)fleece_calloc(def->pre_count, sizeof(char*));
         if (!a->pre) goto fail;
         for (uint32_t i = 0; i < def->pre_count; i++) {
             a->pre[i] = dup_str(def->pre[i]);
@@ -857,7 +858,7 @@ int fleece_goap_add_action(FleeceGoap* goap, const FleeceGoapActionDef* def) {
         a->pre_count = def->pre_count;
     }
     if (def->eff_count > 0 && def->eff) {
-        a->eff = (char**)calloc(def->eff_count, sizeof(char*));
+        a->eff = (char**)fleece_calloc(def->eff_count, sizeof(char*));
         if (!a->eff) goto fail;
         for (uint32_t i = 0; i < def->eff_count; i++) {
             a->eff[i] = dup_str(def->eff[i]);
@@ -899,7 +900,7 @@ int fleece_goap_add_utility(FleeceGoap* goap, const FleeceGoapUtilityDef* def) {
     u->x_max = def->x_max;
 
     if (def->point_count > 0 && def->points) {
-        u->points = (FleeceGoapPoint*)malloc(def->point_count * sizeof(FleeceGoapPoint));
+        u->points = (FleeceGoapPoint*)fleece_malloc(def->point_count * sizeof(FleeceGoapPoint));
         if (!u->points) return -1;
         memcpy(u->points, def->points, def->point_count * sizeof(FleeceGoapPoint));
         u->point_count = def->point_count;
@@ -927,7 +928,7 @@ int fleece_goap_add_mission(FleeceGoap* goap, const FleeceGoapMissionDef* def) {
     copy_str(m->name, sizeof(m->name), def->name);
     copy_str(m->note, sizeof(m->note), def->note);
     if (def->goal_count > 0 && def->goal_ids) {
-        m->goal_ids = (char**)calloc(def->goal_count, sizeof(char*));
+        m->goal_ids = (char**)fleece_calloc(def->goal_count, sizeof(char*));
         if (!m->goal_ids) return -1;
         for (uint32_t i = 0; i < def->goal_count; i++) {
             m->goal_ids[i] = dup_str(def->goal_ids[i]);
@@ -1155,7 +1156,7 @@ static void serialize_body(const FleeceGoap* g, uint8_t* buf, size_t* pos) {
 int fleece_goap_serialize(const FleeceGoap* goap, uint8_t** blob, uint32_t* blob_size) {
     if (!goap || !blob || !blob_size) return -1;
     size_t body = serialize_body_size(goap);
-    uint8_t* buf = (uint8_t*)malloc(3 + body);
+    uint8_t* buf = (uint8_t*)fleece_malloc(3 + body);
     if (!buf) return -1;
     size_t pos = 0;
     buf[pos++] = FLEECE_PLAN_MAGIC0;
@@ -1188,7 +1189,7 @@ static char* read_text_dyn(const uint8_t* buf, uint32_t size, size_t* pos) {
     if (!fleece_cbor_read_head(buf, size, pos, &major, &value)) return NULL;
     if (major != 3) return NULL;
     if (!fleece_cbor_bounds_ok(*pos, value, size)) return NULL;
-    char* out = (char*)malloc((size_t)value + 1);
+    char* out = (char*)fleece_malloc((size_t)value + 1);
     if (!out) return NULL;
     memcpy(out, &buf[*pos], value);
     out[value] = '\0';
@@ -1241,7 +1242,7 @@ int fleece_goap_deserialize(FleeceGoap* goap, const uint8_t* blob, uint32_t blob
         char** pre = NULL;
         uint32_t pre_count = 0;
         if (value > 0) {
-            pre = (char**)calloc((size_t)value, sizeof(char*));
+            pre = (char**)fleece_calloc((size_t)value, sizeof(char*));
             if (!pre) goto fail;
             for (uint64_t j = 0; j < value; j++) {
                 pre[j] = read_text_dyn(blob, blob_size, &pos);
@@ -1261,7 +1262,7 @@ int fleece_goap_deserialize(FleeceGoap* goap, const uint8_t* blob, uint32_t blob
         char** eff = NULL;
         uint32_t eff_count = 0;
         if (value > 0) {
-            eff = (char**)calloc((size_t)value, sizeof(char*));
+            eff = (char**)fleece_calloc((size_t)value, sizeof(char*));
             if (!eff) {
                 free_strings(pre, pre_count);
                 pre = NULL;
@@ -1291,7 +1292,7 @@ int fleece_goap_deserialize(FleeceGoap* goap, const uint8_t* blob, uint32_t blob
         }
         free_strings(pre, pre_count);
         free_strings(eff, eff_count);
-        free(s1); free(s2); free(s3); free(s4); free(s5);
+        fleece_free(s1); fleece_free(s2); fleece_free(s3); fleece_free(s4); fleece_free(s5);
         s1 = s2 = s3 = s4 = s5 = NULL;
     }
 
@@ -1314,7 +1315,7 @@ int fleece_goap_deserialize(FleeceGoap* goap, const uint8_t* blob, uint32_t blob
         if (!s4) goto fail;
         def.curve_id = s4;
         if (fleece_goap_add_goal(goap, &def) != 0) goto fail;
-        free(s1); free(s2); free(s3); free(s4);
+        fleece_free(s1); fleece_free(s2); fleece_free(s3); fleece_free(s4);
         s1 = s2 = s3 = s4 = NULL;
     }
 
@@ -1339,13 +1340,13 @@ int fleece_goap_deserialize(FleeceGoap* goap, const uint8_t* blob, uint32_t blob
         uint32_t point_count = 0;
         if (value > 0) {
             uint64_t n_pts = value;
-            pts = (FleeceGoapPoint*)malloc((size_t)n_pts * sizeof(FleeceGoapPoint));
+            pts = (FleeceGoapPoint*)fleece_malloc((size_t)n_pts * sizeof(FleeceGoapPoint));
             if (!pts) goto fail;
             for (uint64_t j = 0; j < n_pts; j++) {
                 if (!fleece_cbor_read_head(blob, blob_size, &pos, &major, &value) || major != 4 || value != 2 ||
                     !fleece_cbor_read_num(blob, blob_size, &pos, &pts[j].x) ||
                     !fleece_cbor_read_num(blob, blob_size, &pos, &pts[j].y)) {
-                    free(pts);
+                    fleece_free(pts);
                     goto fail;
                 }
             }
@@ -1354,11 +1355,11 @@ int fleece_goap_deserialize(FleeceGoap* goap, const uint8_t* blob, uint32_t blob
         def.points = pts;
         def.point_count = point_count;
         if (fleece_goap_add_utility(goap, &def) != 0) {
-            free(pts);
+            fleece_free(pts);
             goto fail;
         }
-        free(pts);
-        free(s1); free(s2); free(s3);
+        fleece_free(pts);
+        fleece_free(s1); fleece_free(s2); fleece_free(s3);
         s1 = s2 = s3 = NULL;
     }
 
@@ -1378,7 +1379,7 @@ int fleece_goap_deserialize(FleeceGoap* goap, const uint8_t* blob, uint32_t blob
         char** gids = NULL;
         uint32_t gid_count = 0;
         if (value > 0) {
-            gids = (char**)calloc((size_t)value, sizeof(char*));
+            gids = (char**)fleece_calloc((size_t)value, sizeof(char*));
             if (!gids) goto fail;
             for (uint64_t j = 0; j < value; j++) {
                 gids[j] = read_text_dyn(blob, blob_size, &pos);
@@ -1401,20 +1402,20 @@ int fleece_goap_deserialize(FleeceGoap* goap, const uint8_t* blob, uint32_t blob
         def.note = s3;
         if (fleece_goap_add_mission(goap, &def) != 0) {
             free_strings(gids, gid_count);
-            free(s3);
+            fleece_free(s3);
             gids = NULL;
             s3 = NULL;
             goto fail;
         }
         free_strings(gids, gid_count);
-        free(s1); free(s2); free(s3);
+        fleece_free(s1); fleece_free(s2); fleece_free(s3);
         s1 = s2 = s3 = NULL;
     }
 
-    free(s1); free(s2); free(s3); free(s4); free(s5);
+    fleece_free(s1); fleece_free(s2); fleece_free(s3); fleece_free(s4); fleece_free(s5);
     return 0;
 
 fail:
-    free(s1); free(s2); free(s3); free(s4); free(s5);
+    fleece_free(s1); fleece_free(s2); fleece_free(s3); fleece_free(s4); fleece_free(s5);
     return -1;
 }

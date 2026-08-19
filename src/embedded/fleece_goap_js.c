@@ -7,6 +7,7 @@
 #include "quickjs.h"
 
 #include "fleece_embedded.h"
+#include "fleece_alloc.h"
 #include "state/fleece_state_manager.h"
 #include "fleece_goap_js.h"
 
@@ -66,7 +67,7 @@ static void goap_js_dump_exception(JSContext* ctx, const char* where) {
 static JSValue compile_goap_fn(JSContext* ctx, const char* src) {
     size_t slen = strlen(src);
     size_t alloc = slen + 2;  // "(" + src + ")" - no NUL in the parse length
-    char* buf = (char*)malloc(alloc + 1);
+    char* buf = (char*)fleece_malloc(alloc + 1);
     if (!buf) return JS_EXCEPTION;
     buf[0] = '(';
     memcpy(buf + 1, src, slen);
@@ -74,13 +75,13 @@ static JSValue compile_goap_fn(JSContext* ctx, const char* src) {
     buf[slen + 2] = '\0';
 
     JSValue result = JS_Eval(ctx, buf, alloc, "<goap fn>", JS_EVAL_TYPE_GLOBAL);
-    free(buf);
+    fleece_free(buf);
     return result;
 }
 
 static void goap_fn_entry_free(FleeceGoapJsEval* je, GoapFnEntry* e) {
     JS_FreeValue((JSContext*)fleece_embedded_get_context(je->embedded), e->fn);
-    free(e->src);
+    fleece_free(e->src);
     e->used = false;
     e->src = NULL;
 }
@@ -144,12 +145,12 @@ static JSValue goap_bb_to_js(FleeceGoapJsEval* je, const FleeceGoapBlackboard* b
 
     for (uint32_t i = 0; i < bb->count; i++) {
         const FleeceGoapField* f = &bb->fields[i];
-        char* scratch = (char*)malloc((size_t)f->size + 1);
+        char* scratch = (char*)fleece_malloc((size_t)f->size + 1);
         if (!scratch) continue;
         memcpy(scratch, f->data, f->size);
         scratch[f->size] = '\0';
         JSValue v = JS_ParseJSON(ctx, scratch, f->size, "<bb>");
-        free(scratch);
+        fleece_free(scratch);
         if (JS_IsException(v)) {
             JS_FreeValue(ctx, JS_GetException(ctx));
             continue;
@@ -430,7 +431,7 @@ static int js_action_exec(FleeceGoapJsEval* je, uint32_t action_idx, const Fleec
 
 FleeceGoapJsEval* fleece_goap_js_eval_create(FleeceEmbedded* embedded, FleeceGoap* goap) {
     if (!embedded || !goap) return NULL;
-    FleeceGoapJsEval* je = (FleeceGoapJsEval*)calloc(1, sizeof(FleeceGoapJsEval));
+    FleeceGoapJsEval* je = (FleeceGoapJsEval*)fleece_calloc(1, sizeof(FleeceGoapJsEval));
     if (!je) return NULL;
     je->embedded = embedded;
     je->goap = goap;
@@ -443,9 +444,9 @@ FleeceGoapJsEval* fleece_goap_js_eval_create(FleeceEmbedded* embedded, FleeceGoa
     cap += fleece_goap_action_count(goap);  // exec sources
     cap += fleece_goap_goal_count(goap);
     if (cap == 0) cap = 1;
-    je->entries = (GoapFnEntry*)calloc(cap, sizeof(GoapFnEntry));
+    je->entries = (GoapFnEntry*)fleece_calloc(cap, sizeof(GoapFnEntry));
     if (!je->entries) {
-        free(je);
+        fleece_free(je);
         return NULL;
     }
     je->entry_cap = cap;
@@ -462,11 +463,11 @@ void fleece_goap_js_eval_destroy(FleeceGoapJsEval* je) {
     for (uint32_t i = 0; i < je->entry_cap; i++) {
         if (je->entries[i].used) {
             JS_FreeValue((JSContext*)fleece_embedded_get_context(je->embedded), je->entries[i].fn);
-            free(je->entries[i].src);
+            fleece_free(je->entries[i].src);
         }
     }
-    free(je->entries);
-    free(je);
+    fleece_free(je->entries);
+    fleece_free(je);
 }
 
 const FleeceGoapEval* fleece_goap_js_eval_get(const FleeceGoapJsEval* je) {
@@ -490,10 +491,10 @@ int fleece_goap_js_bb_from_state(FleeceEmbedded* embedded, FleeceGoapBlackboard*
         uint32_t size = 0;
         if (fleece_state_manager_get_named(sm, self_id, names[i], &data, &size) == 0 && data) {
             if (fleece_goap_bb_set(bb, names[i], data, size, false) != 0) {
-                free(data);
+                fleece_free(data);
                 return -1;
             }
-            free(data);
+            fleece_free(data);
         }
     }
 
@@ -504,10 +505,10 @@ int fleece_goap_js_bb_from_state(FleeceEmbedded* embedded, FleeceGoapBlackboard*
         uint32_t size = 0;
         if (fleece_state_manager_get_named(sm, FLEECE_SHARED_OWNER_ID, names[i], &data, &size) == 0 && data) {
             if (fleece_goap_bb_set(bb, names[i], data, size, true) != 0) {
-                free(data);
+                fleece_free(data);
                 return -1;
             }
-            free(data);
+            fleece_free(data);
         }
     }
     return 0;
@@ -579,11 +580,11 @@ struct FleeceGoapBrain {
 
 FleeceGoapBrain* fleece_goap_brain_create(FleeceEmbedded* embedded, FleeceGoap* goap) {
     if (!embedded || !goap) return NULL;
-    FleeceGoapBrain* b = (FleeceGoapBrain*)calloc(1, sizeof(FleeceGoapBrain));
+    FleeceGoapBrain* b = (FleeceGoapBrain*)fleece_calloc(1, sizeof(FleeceGoapBrain));
     if (!b) return NULL;
     b->eval = fleece_goap_js_eval_create(embedded, goap);
     if (!b->eval) {
-        free(b);
+        fleece_free(b);
         return NULL;
     }
     b->embedded = embedded;
@@ -597,7 +598,7 @@ void fleece_goap_brain_destroy(FleeceGoapBrain* b) {
     if (!b) return;
     if (b->plan) fleece_goap_plan_destroy(b->plan);
     fleece_goap_js_eval_destroy(b->eval);
-    free(b);
+    fleece_free(b);
 }
 
 // Plan for the highest-utility unsatisfied goal and select its first action.
@@ -618,7 +619,7 @@ static void brain_replan(FleeceGoapBrain* b, const FleeceGoapBlackboard* bb) {
         return;
     }
 
-    uint32_t* ranked = (uint32_t*)malloc(cap * sizeof(uint32_t));
+    uint32_t* ranked = (uint32_t*)fleece_malloc(cap * sizeof(uint32_t));
     if (!ranked) {
         if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_IDLE, b->event_ud);
         return;
@@ -641,11 +642,11 @@ static void brain_replan(FleeceGoapBrain* b, const FleeceGoapBlackboard* bb) {
         b->exec_progress = 0;
         b->plan = plan;
         if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_REPLAN, b->event_ud);
-        free(ranked);
+        fleece_free(ranked);
         return;
     }
 
-    free(ranked);
+    fleece_free(ranked);
     if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_IDLE, b->event_ud);
 }
 

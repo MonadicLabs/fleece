@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "quickjs.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -15,8 +17,16 @@ typedef struct FleeceEmbedded FleeceEmbedded;
 typedef struct FleeceStateManager FleeceStateManager;
 typedef struct FleecePlatform FleecePlatform;
 
-// Create a new embedded JS instance
+// Create a new embedded JS instance (default libc allocator).
 FleeceEmbedded* fleece_embedded_create(void);
+
+// Create a new embedded JS instance using the supplied allocator. Pass mf == NULL
+// (or zeroed functions) to use the allocator configured by
+// fleece_embedded_set_allocator() - i.e. fleece_embedded_create().
+// Pass an explicit JSMallocFunctions to give the QuickJS engine its own
+// dedicated arena (e.g. a fixed-size static pool sized for the JS GC heap),
+// separate from the fleece-side allocator.
+FleeceEmbedded* fleece_embedded_create_with_allocator(const JSMallocFunctions* mf, void* opaque);
 
 // Destroy embedded JS instance
 void fleece_embedded_destroy(FleeceEmbedded* embedded);
@@ -72,6 +82,21 @@ void* fleece_embedded_get_context(FleeceEmbedded* embedded);
 
 // Get the bound state manager (FleeceStateManager*), or NULL if none was set.
 void* fleece_embedded_get_state_manager(FleeceEmbedded* embedded);
+
+// Install the allocator used by the whole fleece stack - the library's own
+// allocations (state-manager field values, GOAP planner A* tables,
+// embedded/comms/runtime/platform structs, JS context scratch buffers) AND
+// the QuickJS engine's GC heap, which is auto-wrapped into a JSMallocFunctions
+// on the next fleece_embedded_create(). Defaults to libc
+// malloc/calloc/realloc/free. Call before creating any fleece object to plug in
+// a static pool/arena. Pass NULL for all four to reset to the defaults.
+// To give the JS engine a separate dedicated arena, skip this and use
+// fleece_embedded_create_with_allocator() with an explicit JSMallocFunctions
+// instead.
+void fleece_embedded_set_allocator(void* (*malloc_fn)(size_t),
+                                   void (*free_fn)(void*),
+                                   void* (*calloc_fn)(size_t, size_t),
+                                   void* (*realloc_fn)(void*, size_t));
 
 #ifdef __cplusplus
 }

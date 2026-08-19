@@ -7,6 +7,7 @@
 #include "quickjs.h"
 
 #include "fleece_embedded.h"
+#include "fleece_alloc.h"
 #include "state/fleece_state_manager.h"
 #include "platform/fleece_platform.h"
 
@@ -19,6 +20,56 @@
 
 // Default peer liveness TTL, in runtime loop ticks (see fleece_embedded_set_peer_ttl_ticks).
 #define FLEECE_DEFAULT_PEER_TTL_TICKS 50
+
+// Pluggable allocator defaults (see include/fleece_alloc.h). These are the
+// standard libc implementations; fleece_embedded_set_allocator() replaces
+// them to point at a static pool/arena on memory-constrained targets.
+void* (*fleece_malloc_fn)(size_t size) = malloc;
+void (*fleece_free_fn)(void* ptr) = free;
+void* (*fleece_calloc_fn)(size_t count, size_t size) = calloc;
+void* (*fleece_realloc_fn)(void* ptr, size_t size) = realloc;
+
+void fleece_embedded_set_allocator(void* (*malloc_fn)(size_t),
+                                   void (*free_fn)(void*),
+                                   void* (*calloc_fn)(size_t, size_t),
+                                   void* (*realloc_fn)(void*, size_t)) {
+    if (!malloc_fn && !free_fn && !calloc_fn && !realloc_fn) {
+        fleece_malloc_fn = malloc;
+        fleece_free_fn = free;
+        fleece_calloc_fn = calloc;
+        fleece_realloc_fn = realloc;
+        return;
+    }
+    if (malloc_fn) fleece_malloc_fn = malloc_fn;
+    if (free_fn) fleece_free_fn = free_fn;
+    if (calloc_fn) fleece_calloc_fn = calloc_fn;
+    if (realloc_fn) fleece_realloc_fn = realloc_fn;
+}
+
+// The QuickJS engine allocates through a JSMallocFunctions pair (functions
+// that take a `void* opaque`). The fleece-side allocator (see fleece_alloc.h)
+// has no opaque, so when the caller doesn't supply an explicit engine
+// allocator we wrap the fleece functions into a JSMallocFunctions so a single
+// fleece_embedded_set_allocator() call covers the whole library, JS engine
+// included. The wrapper closes over no state - it forwards straight to the
+// (pluggable) fleece_*_fn pointers, which are read at call time, so a later
+// fleece_embedded_set_allocator() still takes effect on the next create.
+
+static void* fleece_js_malloc(void* opaque, size_t size) { (void)opaque; return fleece_malloc_fn(size); }
+static void* fleece_js_calloc(void* opaque, size_t count, size_t size) { (void)opaque; return fleece_calloc_fn(count, size); }
+static void* fleece_js_realloc(void* opaque, void* ptr, size_t size) { (void)opaque; return fleece_realloc_fn(ptr, size); }
+static void fleece_js_free(void* opaque, void* ptr) { (void)opaque; fleece_free_fn(ptr); }
+
+// Build the auto-wrap JSMallocFunctions from the current fleece allocator.
+static JSMallocFunctions fleece_js_alloc_adapter(void) {
+    JSMallocFunctions mf;
+    mf.js_calloc = fleece_js_calloc;
+    mf.js_malloc = fleece_js_malloc;
+    mf.js_free = fleece_js_free;
+    mf.js_realloc = fleece_js_realloc;
+    mf.js_malloc_usable_size = NULL;  // QuickJS substitutes a "unknown" fallback
+    return mf;
+}
 
 struct FleeceEmbedded {
     JSRuntime* rt;
@@ -213,17 +264,17 @@ static JSValue get_named_value(JSContext* ctx, FleeceStateManager* manager, uint
         return JS_UNDEFINED;
     }
 
-    char* scratch = (char*)malloc((size_t)size + 1);
+    char* scratch = (char*)fleece_malloc((size_t)size + 1);
     if (!scratch) {
-        free(data);
+        fleece_free(data);
         return JS_ThrowOutOfMemory(ctx);
     }
     memcpy(scratch, data, size);
     scratch[size] = '\0';
-    free(data);
+    fleece_free(data);
 
     JSValue result = JS_ParseJSON(ctx, scratch, size, "<state>");
-    free(scratch);
+    fleece_free(scratch);
     if (JS_IsException(result)) {
         // Stored bytes aren't valid JSON (shouldn't happen via our own setters) -
         // surface as undefined on read rather than throwing.
@@ -588,21 +639,21 @@ static JSValue js_platform_call(JSContext* ctx, JSValueConst this_val, int argc,
     JS_FreeCString(ctx, name);
 
     if (!result_json || result_size == 0) {
-        free(result_json);
+        fleece_free(result_json);
         return JS_UNDEFINED;
     }
 
-    char* scratch = (char*)malloc((size_t)result_size + 1);
+    char* scratch = (char*)fleece_malloc((size_t)result_size + 1);
     if (!scratch) {
-        free(result_json);
+        fleece_free(result_json);
         return JS_ThrowOutOfMemory(ctx);
     }
     memcpy(scratch, result_json, result_size);
     scratch[result_size] = '\0';
-    free(result_json);
+    fleece_free(result_json);
 
     JSValue result = JS_ParseJSON(ctx, scratch, result_size, "<platform result>");
-    free(scratch);
+    fleece_free(scratch);
     if (JS_IsException(result)) {
         JS_FreeValue(ctx, JS_GetException(ctx));
         return JS_UNDEFINED;
@@ -611,14 +662,26 @@ static JSValue js_platform_call(JSContext* ctx, JSValueConst this_val, int argc,
 }
 
 FleeceEmbedded* fleece_embedded_create(void) {
-    FleeceEmbedded* embedded = (FleeceEmbedded*)calloc(1, sizeof(FleeceEmbedded));
+    return fleece_embedded_create_with_allocator(NULL, NULL);
+}
+
+FleeceEmbedded* fleece_embedded_create_with_allocator(const JSMallocFunctions* mf, void* opaque) {
+    FleeceEmbedded* embedded = (FleeceEmbedded*)fleece_calloc(1, sizeof(FleeceEmbedded));
     if (!embedded) {
         return NULL;
     }
 
-    embedded->rt = JS_NewRuntime();
+    if (mf && mf->js_malloc && mf->js_free) {
+        // Explicit engine allocator (e.g. a dedicated JS arena on an MCU).
+        embedded->rt = JS_NewRuntime2(mf, opaque);
+    } else {
+        // No explicit engine allocator: wrap the fleece allocator configured
+        // by fleece_embedded_set_allocator() so one call covers everything.
+        JSMallocFunctions auto_mf = fleece_js_alloc_adapter();
+        embedded->rt = JS_NewRuntime2(&auto_mf, NULL);
+    }
     if (!embedded->rt) {
-        free(embedded);
+        fleece_free(embedded);
         return NULL;
     }
     JS_SetMemoryLimit(embedded->rt, FLEECE_JS_MEMORY_LIMIT);
@@ -627,7 +690,7 @@ FleeceEmbedded* fleece_embedded_create(void) {
     embedded->ctx = JS_NewContext(embedded->rt);
     if (!embedded->ctx) {
         JS_FreeRuntime(embedded->rt);
-        free(embedded);
+        fleece_free(embedded);
         return NULL;
     }
     JS_SetContextOpaque(embedded->ctx, embedded);
@@ -641,7 +704,7 @@ void fleece_embedded_destroy(FleeceEmbedded* embedded) {
 
     if (embedded->ctx) JS_FreeContext(embedded->ctx);
     if (embedded->rt) JS_FreeRuntime(embedded->rt);
-    free(embedded);
+    fleece_free(embedded);
 }
 
 int fleece_embedded_set_state_manager(FleeceEmbedded* embedded, FleeceStateManager* manager) {
@@ -785,13 +848,13 @@ int fleece_embedded_set_value(FleeceEmbedded* embedded, const char* name, const 
     }
     JSContext* ctx = embedded->ctx;
 
-    char* scratch = (char*)malloc((size_t)size + 1);
+    char* scratch = (char*)fleece_malloc((size_t)size + 1);
     if (!scratch) return -1;
     memcpy(scratch, data, size);
     scratch[size] = '\0';
 
     JSValue val = JS_ParseJSON(ctx, scratch, size, "<set_value>");
-    free(scratch);
+    fleece_free(scratch);
     if (JS_IsException(val)) {
         dump_exception(ctx);
         JS_FreeValue(ctx, val);
@@ -840,7 +903,7 @@ int fleece_embedded_get_value(FleeceEmbedded* embedded, const char* name, uint8_
     JS_FreeValue(ctx, json);
     if (!text) return -1;
 
-    uint8_t* buf = (uint8_t*)malloc(len);
+    uint8_t* buf = (uint8_t*)fleece_malloc(len);
     if (!buf && len > 0) {
         JS_FreeCString(ctx, text);
         return -1;

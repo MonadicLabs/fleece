@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include "fleece_state_manager.h"
+#include "fleece_alloc.h"
 #include "fleece_cbor.h"
 
 #define FLEECE_MAX_TRACKED_PEERS 32
@@ -66,14 +67,14 @@ FleeceStateManager* fleece_state_manager_create_with_node_id(uint64_t node_id) {
         return NULL;  // reserved for shared/"world" fields, not a real node identity
     }
 
-    FleeceStateManager* manager = (FleeceStateManager*)calloc(1, sizeof(FleeceStateManager));
+    FleeceStateManager* manager = (FleeceStateManager*)fleece_calloc(1, sizeof(FleeceStateManager));
     if (!manager) {
         return NULL;
     }
 
-    manager->fields = (struct FieldEntry*)calloc(FIELD_CAPACITY, sizeof(struct FieldEntry));
+    manager->fields = (struct FieldEntry*)fleece_calloc(FIELD_CAPACITY, sizeof(struct FieldEntry));
     if (!manager->fields) {
-        free(manager);
+        fleece_free(manager);
         return NULL;
     }
 
@@ -95,12 +96,12 @@ void fleece_state_manager_destroy(FleeceStateManager* manager) {
 
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         if (manager->fields[i].exists && !manager->fields[i].is_tombstone) {
-            free(manager->fields[i].data);
+            fleece_free(manager->fields[i].data);
         }
     }
 
-    free(manager->fields);
-    free(manager);
+    fleece_free(manager->fields);
+    fleece_free(manager);
 }
 
 uint64_t fleece_state_manager_get_node_id(FleeceStateManager* manager) {
@@ -175,7 +176,7 @@ static int upsert_field(FleeceStateManager* manager, uint32_t key, uint64_t owne
                          const char* name, const uint8_t* data, uint32_t size, uint64_t timestamp, bool is_tombstone) {
     uint8_t* new_data = NULL;
     if (!is_tombstone) {
-        new_data = (uint8_t*)malloc(size);
+        new_data = (uint8_t*)fleece_malloc(size);
         if (!new_data) {
             return -1;
         }
@@ -185,7 +186,7 @@ static int upsert_field(FleeceStateManager* manager, uint32_t key, uint64_t owne
     struct FieldEntry* field = find_slot_owned(manager, key, owner_node_id);
     if (!field) {
         if (manager->field_count >= manager->field_capacity) {
-            free(new_data);
+            fleece_free(new_data);
             return -1;  // Field limit reached
         }
         field = &manager->fields[manager->field_count++];
@@ -205,7 +206,7 @@ static int upsert_field(FleeceStateManager* manager, uint32_t key, uint64_t owne
         strncpy(field->name, name, FLEECE_FIELD_NAME_MAX - 1);
         field->name[FLEECE_FIELD_NAME_MAX - 1] = '\0';
     }
-    free(old_data);
+    fleece_free(old_data);
 
     return 0;
 }
@@ -228,7 +229,7 @@ int fleece_state_manager_get(FleeceStateManager* manager, uint32_t key, uint8_t*
         return -1;
     }
 
-    *data = (uint8_t*)malloc(field->size);
+    *data = (uint8_t*)fleece_malloc(field->size);
     if (!*data) {
         return -1;
     }
@@ -253,7 +254,7 @@ int fleece_state_manager_remove(FleeceStateManager* manager, uint32_t key) {
         return -1;
     }
 
-    free(field->data);
+    fleece_free(field->data);
     field->data = NULL;
     field->size = 0;
     field->is_tombstone = true;
@@ -311,7 +312,7 @@ int fleece_state_manager_remove_named(FleeceStateManager* manager, const char* n
         return -1;
     }
 
-    free(field->data);
+    fleece_free(field->data);
     field->data = NULL;
     field->size = 0;
     field->is_tombstone = true;
@@ -329,7 +330,7 @@ int fleece_state_manager_get_named(FleeceStateManager* manager, uint64_t owner_n
         return -1;
     }
 
-    *data = (uint8_t*)malloc(field->size);
+    *data = (uint8_t*)fleece_malloc(field->size);
     if (!*data) {
         return -1;
     }
@@ -364,7 +365,7 @@ int fleece_state_manager_remove_shared(FleeceStateManager* manager, const char* 
         return -1;
     }
 
-    free(field->data);
+    fleece_free(field->data);
     field->data = NULL;
     field->size = 0;
     field->is_tombstone = true;
@@ -506,7 +507,7 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t owner_filte
     }
     body_size += fleece_cbor_array_header_size(count);
 
-    uint8_t* buf = (uint8_t*)malloc(3 + body_size);
+    uint8_t* buf = (uint8_t*)fleece_malloc(3 + body_size);
     if (!buf) {
         return -1;
     }

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "platform/fleece_platform.h"
+#include "fleece_alloc.h"
 
 #define FLEECE_PLATFORM_MAX_FUNCTIONS 32
 
@@ -17,11 +18,11 @@ struct FleecePlatform {
 };
 
 FleecePlatform* fleece_platform_create(void) {
-    return (FleecePlatform*)calloc(1, sizeof(FleecePlatform));
+    return (FleecePlatform*)fleece_calloc(1, sizeof(FleecePlatform));
 }
 
 void fleece_platform_destroy(FleecePlatform* platform) {
-    free(platform);
+    fleece_free(platform);
 }
 
 static int find_slot(FleecePlatform* platform, const char* name) {

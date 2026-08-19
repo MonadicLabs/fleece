@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "fleece_runtime.h"
+#include "fleece_alloc.h"
 #include "fleece_state_manager.h"
 #include "fleece_comms.h"
 #include "fleece_embedded.h"
@@ -56,7 +57,7 @@ static void runtime_gossip_receive(const char* source, const uint8_t* data, uint
 }
 
 static FleeceRuntime* runtime_create_internal(FleeceStateManager* state_manager) {
-    FleeceRuntime* runtime = (FleeceRuntime*)calloc(1, sizeof(FleeceRuntime));
+    FleeceRuntime* runtime = (FleeceRuntime*)fleece_calloc(1, sizeof(FleeceRuntime));
     if (!runtime) {
         fleece_state_manager_destroy(state_manager);
         return NULL;
@@ -119,7 +120,7 @@ void fleece_runtime_destroy(FleeceRuntime* runtime) {
         fleece_state_manager_destroy(runtime->state_manager);
     }
 
-    free(runtime);
+    fleece_free(runtime);
     global_runtime = NULL;
 }
 
@@ -188,7 +189,7 @@ int fleece_runtime_start(FleeceRuntime* runtime) {
             : fleece_state_manager_export_delta(runtime->state_manager, runtime->self_gossip_watermark, &self_frame, &self_frame_size);
         if (self_rc == 0) {
             fleece_comms_send(runtime->comms, "broadcast", self_frame, self_frame_size);
-            free(self_frame);
+            fleece_free(self_frame);
         }
         runtime->self_gossip_watermark = fleece_state_manager_get_local_timestamp(runtime->state_manager);
 
@@ -199,7 +200,7 @@ int fleece_runtime_start(FleeceRuntime* runtime) {
             : fleece_state_manager_export_shared_delta(runtime->state_manager, runtime->shared_gossip_watermark, &shared_frame, &shared_frame_size);
         if (shared_rc == 0) {
             fleece_comms_send(runtime->comms, "broadcast", shared_frame, shared_frame_size);
-            free(shared_frame);
+            fleece_free(shared_frame);
         }
         runtime->shared_gossip_watermark = fleece_state_manager_get_local_timestamp(runtime->state_manager);
 

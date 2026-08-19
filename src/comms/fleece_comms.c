@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "fleece_comms.h"
+#include "fleece_alloc.h"
 
 struct FleeceComms {
     bool is_connected;
@@ -24,7 +25,7 @@ struct FleeceComms {
 };
 
 FleeceComms* fleece_comms_create(void) {
-    FleeceComms* comms = (FleeceComms*)calloc(1, sizeof(FleeceComms));
+    FleeceComms* comms = (FleeceComms*)fleece_calloc(1, sizeof(FleeceComms));
     if (!comms) {
         return NULL;
     }
@@ -40,7 +41,7 @@ void fleece_comms_destroy(FleeceComms* comms) {
     if (!comms) return;
     
     fleece_comms_close(comms);
-    free(comms);
+    fleece_free(comms);
 }
 
 void fleece_comms_process_input(FleeceComms* comms) {
