@@ -884,6 +884,7 @@ static int init_uav(int index) {
     FleeceGoapBrain* brain = (FleeceGoapBrain*)fleece_runtime_get_goap_brain(runtime);
     fleece_goap_brain_set_event_callback(brain, brain_event, ctx);
     fleece_goap_brain_set_max_action_ticks(brain, 300);  // ~30s at 10Hz: drop wedged actions
+    fleece_goap_brain_set_goal_cooldown_ticks(brain, 20);  // ~2s at 10Hz: don't re-search an unplannable goal every tick
     fleece_goap_brain_set_world_model(brain, brain_world_model, ctx);  // live telemetry -> bb.self
 
     // Hardware: the autopilot/sensor verbs this UAV's brain may call. Note the

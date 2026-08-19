@@ -94,18 +94,21 @@ struct FleeceGoapPlan {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-static void copy_str(char* dst, size_t dst_sz, const char* src) {
+// Returns 0 on success, -1 if src didn't fit dst_sz (dst is left empty).
+static int copy_str(char* dst, size_t dst_sz, const char* src) {
     if (!src) {
         dst[0] = '\0';
-        return;
+        return 0;
     }
     size_t n = strlen(src);
     if (n >= dst_sz) {
-        n = dst_sz - 1;
-        fprintf(stderr, "fleece: source truncated to %zu bytes (was %zu); increase FLEECE_GOAP_SOURCE_MAX\n", n, strlen(src));
+        dst[0] = '\0';
+        fprintf(stderr, "fleece: source too long (%zu bytes, max %zu); increase FLEECE_GOAP_SOURCE_MAX\n", n, dst_sz - 1);
+        return -1;
     }
     memcpy(dst, src, n);
     dst[n] = '\0';
+    return 0;
 }
 
 static char* dup_str(const char* src) {
@@ -173,7 +176,10 @@ int fleece_goap_bb_set(FleeceGoapBlackboard* bb, const char* name, const uint8_t
     if (idx == UINT32_MAX) {
         if (ensure_cap((void**)&bb->fields, &bb->cap, bb->count + 1, sizeof(FleeceGoapField)) != 0) return -1;
         idx = bb->count++;
-        copy_str(bb->fields[idx].name, sizeof(bb->fields[idx].name), name);
+        if (copy_str(bb->fields[idx].name, sizeof(bb->fields[idx].name), name) != 0) {
+            bb->count--;
+            return -1;
+        }
         bb->fields[idx].data = NULL;
         bb->fields[idx].size = 0;
         bb->fields[idx].is_shared = is_shared;
@@ -791,8 +797,7 @@ const char* fleece_goap_name(const FleeceGoap* goap) {
 
 int fleece_goap_set_name(FleeceGoap* goap, const char* name) {
     if (!goap) return -1;
-    copy_str(goap->name, sizeof(goap->name), name);
-    return 0;
+    return copy_str(goap->name, sizeof(goap->name), name);
 }
 
 void fleece_goap_set_max_iters(FleeceGoap* goap, uint32_t max_iters) {
@@ -841,11 +846,11 @@ int fleece_goap_add_action(FleeceGoap* goap, const FleeceGoapActionDef* def) {
     if (ensure_cap((void**)&goap->actions, &goap->action_cap, goap->action_count + 1, sizeof(GoapAction)) != 0) return -1;
     GoapAction* a = &goap->actions[goap->action_count];
     memset(a, 0, sizeof(*a));
-    copy_str(a->id, sizeof(a->id), def->id);
-    copy_str(a->name, sizeof(a->name), def->name);
-    copy_str(a->cost, sizeof(a->cost), def->cost);
-    copy_str(a->exec, sizeof(a->exec), def->exec);
-    copy_str(a->dest, sizeof(a->dest), def->dest);
+    if (copy_str(a->id, sizeof(a->id), def->id) != 0) return -1;
+    if (copy_str(a->name, sizeof(a->name), def->name) != 0) return -1;
+    if (copy_str(a->cost, sizeof(a->cost), def->cost) != 0) return -1;
+    if (copy_str(a->exec, sizeof(a->exec), def->exec) != 0) return -1;
+    if (copy_str(a->dest, sizeof(a->dest), def->dest) != 0) return -1;
     a->dur = def->dur;
 
     if (def->pre_count > 0 && def->pre) {
@@ -878,13 +883,16 @@ fail:
 int fleece_goap_add_goal(FleeceGoap* goap, const FleeceGoapGoalDef* def) {
     if (!goap || !def || !def->id) return -1;
     if (ensure_cap((void**)&goap->goals, &goap->goal_cap, goap->goal_count + 1, sizeof(GoapGoal)) != 0) return -1;
-    GoapGoal* g = &goap->goals[goap->goal_count++];
+    GoapGoal* g = &goap->goals[goap->goal_count];
     memset(g, 0, sizeof(*g));
-    copy_str(g->id, sizeof(g->id), def->id);
-    copy_str(g->name, sizeof(g->name), def->name);
-    copy_str(g->expr, sizeof(g->expr), def->expr);
-    copy_str(g->curve_id, sizeof(g->curve_id), def->curve_id);
+    if (copy_str(g->id, sizeof(g->id), def->id) != 0 ||
+        copy_str(g->name, sizeof(g->name), def->name) != 0 ||
+        copy_str(g->expr, sizeof(g->expr), def->expr) != 0 ||
+        copy_str(g->curve_id, sizeof(g->curve_id), def->curve_id) != 0) {
+        return -1;
+    }
     g->priority = def->priority;
+    goap->goal_count++;
     return 0;
 }
 
@@ -893,9 +901,9 @@ int fleece_goap_add_utility(FleeceGoap* goap, const FleeceGoapUtilityDef* def) {
     if (ensure_cap((void**)&goap->utilities, &goap->utility_cap, goap->utility_count + 1, sizeof(GoapUtility)) != 0) return -1;
     GoapUtility* u = &goap->utilities[goap->utility_count];
     memset(u, 0, sizeof(*u));
-    copy_str(u->id, sizeof(u->id), def->id);
-    copy_str(u->name, sizeof(u->name), def->name);
-    copy_str(u->dim, sizeof(u->dim), def->dim);
+    if (copy_str(u->id, sizeof(u->id), def->id) != 0) return -1;
+    if (copy_str(u->name, sizeof(u->name), def->name) != 0) return -1;
+    if (copy_str(u->dim, sizeof(u->dim), def->dim) != 0) return -1;
     u->x_min = def->x_min;
     u->x_max = def->x_max;
 
@@ -924,9 +932,9 @@ int fleece_goap_add_mission(FleeceGoap* goap, const FleeceGoapMissionDef* def) {
     if (ensure_cap((void**)&goap->missions, &goap->mission_cap, goap->mission_count + 1, sizeof(GoapMission)) != 0) return -1;
     GoapMission* m = &goap->missions[goap->mission_count];
     memset(m, 0, sizeof(*m));
-    copy_str(m->id, sizeof(m->id), def->id);
-    copy_str(m->name, sizeof(m->name), def->name);
-    copy_str(m->note, sizeof(m->note), def->note);
+    if (copy_str(m->id, sizeof(m->id), def->id) != 0) return -1;
+    if (copy_str(m->name, sizeof(m->name), def->name) != 0) return -1;
+    if (copy_str(m->note, sizeof(m->note), def->note) != 0) return -1;
     if (def->goal_count > 0 && def->goal_ids) {
         m->goal_ids = (char**)fleece_calloc(def->goal_count, sizeof(char*));
         if (!m->goal_ids) return -1;

@@ -569,6 +569,8 @@ struct FleeceGoapBrain {
     int action_idx;             // action being executed, -1 = none
     uint32_t exec_progress;     // ticks the current action has been executing
     uint32_t max_action_ticks;  // watchdog: abort a wedged action after N ticks (0 = off)
+    uint32_t* goal_cooldown_until;  // per-goal-index tick_count value before which brain_replan skips it
+    uint32_t goal_cooldown_ticks;   // 0 (default) = cooldown off, always retry every ranked goal
     uint32_t tick_count;
     FleeceGoapBrainEventFn event_cb;
     void* event_ud;
@@ -587,6 +589,15 @@ FleeceGoapBrain* fleece_goap_brain_create(FleeceEmbedded* embedded, FleeceGoap* 
         fleece_free(b);
         return NULL;
     }
+    uint32_t goal_count = fleece_goap_goal_count(goap);
+    if (goal_count > 0) {
+        b->goal_cooldown_until = (uint32_t*)fleece_calloc(goal_count, sizeof(uint32_t));
+        if (!b->goal_cooldown_until) {
+            fleece_goap_js_eval_destroy(b->eval);
+            fleece_free(b);
+            return NULL;
+        }
+    }
     b->embedded = embedded;
     b->goap = goap;
     b->goal_idx = -1;
@@ -598,6 +609,7 @@ void fleece_goap_brain_destroy(FleeceGoapBrain* b) {
     if (!b) return;
     if (b->plan) fleece_goap_plan_destroy(b->plan);
     fleece_goap_js_eval_destroy(b->eval);
+    fleece_free(b->goal_cooldown_until);
     fleece_free(b);
 }
 
@@ -629,10 +641,14 @@ static void brain_replan(FleeceGoapBrain* b, const FleeceGoapBlackboard* bb) {
     const char* goal_ids[1];
     for (uint32_t i = 0; i < n; i++) {
         uint32_t goal = ranked[i];
+        if (b->goal_cooldown_ticks > 0 && b->goal_cooldown_until[goal] > b->tick_count) {
+            continue;  // failed to plan recently - don't re-search it every tick
+        }
         goal_ids[0] = fleece_goap_goal_id(b->goap, goal);
         FleeceGoapPlan* plan = fleece_goap_plan(b->goap, bb, goal_ids, 1, &b->eval->eval);
         if (!plan || fleece_goap_plan_length(plan) == 0) {
             if (plan) fleece_goap_plan_destroy(plan);
+            if (b->goal_cooldown_ticks > 0) b->goal_cooldown_until[goal] = b->tick_count + b->goal_cooldown_ticks;
             continue;  // can't plan this goal right now - try the next best
         }
 
@@ -792,6 +808,11 @@ void fleece_goap_brain_set_divergence_cb(FleeceGoapBrain* b, FleeceGoapDivergenc
 void fleece_goap_brain_set_max_action_ticks(FleeceGoapBrain* b, uint32_t max_ticks) {
     if (!b) return;
     b->max_action_ticks = max_ticks;
+}
+
+void fleece_goap_brain_set_goal_cooldown_ticks(FleeceGoapBrain* b, uint32_t ticks) {
+    if (!b) return;
+    b->goal_cooldown_ticks = ticks;
 }
 
 const char* fleece_goap_brain_goal_id(const FleeceGoapBrain* b) {

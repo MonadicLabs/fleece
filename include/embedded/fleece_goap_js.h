@@ -167,6 +167,12 @@ void fleece_goap_brain_set_divergence_cb(FleeceGoapBrain* brain, FleeceGoapDiver
 // the agent forever. 0 (default) disables the watchdog.
 void fleece_goap_brain_set_max_action_ticks(FleeceGoapBrain* brain, uint32_t max_ticks);
 
+// Skip a goal for N ticks after it fails to produce a plan, instead of
+// re-running a full A* search against it every tick while unplannable
+// (e.g. dead battery blocking "recharge" forever). 0 (default) disables
+// this and always retries every ranked goal every tick.
+void fleece_goap_brain_set_goal_cooldown_ticks(FleeceGoapBrain* brain, uint32_t ticks);
+
 // Current brain state, for introspection/logging. NULL when none.
 const char* fleece_goap_brain_goal_id(const FleeceGoapBrain* brain);
 const char* fleece_goap_brain_action_id(const FleeceGoapBrain* brain);

@@ -308,6 +308,53 @@ static void test_registration(void) {
     printf("Done: registration tests\n");
 }
 
+static void test_source_truncation(void) {
+    printf("Running source truncation tests...\n");
+
+    char long_id[FLEECE_GOAP_NAME_MAX + 16];
+    memset(long_id, 'x', sizeof(long_id) - 1);
+    long_id[sizeof(long_id) - 1] = '\0';
+
+    char long_exec[FLEECE_GOAP_SOURCE_MAX + 16];
+    memset(long_exec, 'y', sizeof(long_exec) - 1);
+    long_exec[sizeof(long_exec) - 1] = '\0';
+
+    FleeceGoap* g = fleece_goap_create();
+    CHECK(g != NULL, "create should succeed");
+
+    // add_goal: oversized id should fail outright, not register a partial goal.
+    FleeceGoapGoalDef goal = {0};
+    goal.id = long_id; goal.name = "bad"; goal.expr = "function(bb){ return true; }"; goal.priority = 1.0;
+    CHECK(fleece_goap_add_goal(g, &goal) == -1, "add_goal with oversized id should fail");
+    CHECK(fleece_goap_goal_count(g) == 0, "failed add_goal should not register a partial goal");
+
+    // A well-formed goal afterwards should still register fine at index 0.
+    goal.id = "ok";
+    CHECK(fleece_goap_add_goal(g, &goal) == 0, "add_goal after a failed attempt should still succeed");
+    CHECK(fleece_goap_goal_count(g) == 1, "goal count should be 1 after the successful add");
+    CHECK(strcmp(fleece_goap_goal_id(g, 0), "ok") == 0, "surviving goal should be the well-formed one");
+
+    // add_action: oversized exec source should fail outright.
+    FleeceGoapActionDef act = {0};
+    act.id = "a"; act.name = "A"; act.exec = long_exec;
+    CHECK(fleece_goap_add_action(g, &act) == -1, "add_action with oversized exec should fail");
+    CHECK(fleece_goap_action_count(g) == 0, "failed add_action should not register a partial action");
+
+    fleece_goap_destroy(g);
+
+    // bb_set: oversized field name should fail and not register a partial field.
+    FleeceGoapBlackboard bb = {0};
+    CHECK(fleece_goap_bb_set(&bb, long_id, (const uint8_t*)"1", 1, false) == -1,
+          "bb_set with oversized field name should fail");
+    CHECK(bb.count == 0, "failed bb_set should not leave a partial field behind");
+    CHECK(setd(&bb, "battery", 42.0, false) == 0, "bb_set should still work after a failed attempt");
+    double v = 0;
+    CHECK(getd(&bb, "battery", &v) && v == 42.0, "surviving field should read back correctly");
+    fleece_goap_bb_release(&bb);
+
+    printf("Done: source truncation tests\n");
+}
+
 static void test_utility_and_selection(void) {
     printf("Running utility/selection tests...\n");
     FleeceGoap* g = fleece_goap_create();
@@ -656,6 +703,7 @@ int main(void) {
     printf("=== Fleece GOAP Planner Tests ===\n");
     test_blackboard_ops();
     test_registration();
+    test_source_truncation();
     test_utility_and_selection();
     test_plan_basic();
     test_plan_already_satisfied();

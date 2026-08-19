@@ -425,6 +425,87 @@ static void test_world_model_hook(FleeceEmbedded* embedded) {
     fleece_goap_destroy(g);
 }
 
+static void test_goal_cooldown(FleeceEmbedded* embedded) {
+    printf("Running goal cooldown tests...\n");
+    FleeceStateManager* sm = (FleeceStateManager*)fleece_embedded_get_state_manager(embedded);
+
+    // Two competing goals: "recharge" (higher priority, initially unplannable -
+    // its only action needs a charger the world doesn't have yet) and a
+    // low-priority "noop" goal that's always immediately plannable.
+    FleeceGoap* g = fleece_goap_create();
+    CHECK(g != NULL, "goap create");
+
+    FleeceGoapActionDef charge = {0};
+    const char* pre_charge[] = { "function(bb){ return bb.self.atCharger === 1; }" };
+    const char* eff_charge[] = { "function(bb){ bb.self.charged = 1; return bb; }" };
+    charge.id = "chargeAction"; charge.name = "Charge";
+    charge.pre = pre_charge; charge.pre_count = 1;
+    charge.eff = eff_charge; charge.eff_count = 1;
+    charge.exec = "function(bb, tick){ bb.self.charged = 1; return true; }";
+    CHECK(fleece_goap_add_action(g, &charge) == 0, "add charge action");
+
+    FleeceGoapActionDef noop = {0};
+    const char* pre_noop[] = { "function(bb){ return true; }" };
+    const char* eff_noop[] = { "function(bb){ bb.self.done = 1; return bb; }" };
+    noop.id = "noop"; noop.name = "Noop";
+    noop.pre = pre_noop; noop.pre_count = 1;
+    noop.eff = eff_noop; noop.eff_count = 1;
+    noop.exec = "function(bb, tick){ bb.self.done = 1; return true; }";
+    CHECK(fleece_goap_add_action(g, &noop) == 0, "add noop action");
+
+    FleeceGoapGoalDef recharge = {0};
+    recharge.id = "recharge"; recharge.name = "Recharge";
+    recharge.expr = "function(bb){ return bb.self.charged === 1; }";
+    recharge.priority = 2.0;
+    CHECK(fleece_goap_add_goal(g, &recharge) == 0, "add recharge goal");
+
+    FleeceGoapGoalDef idleGoal = {0};
+    idleGoal.id = "idleGoal"; idleGoal.name = "Idle";
+    idleGoal.expr = "function(bb){ return bb.self.done === 1; }";
+    idleGoal.priority = 1.0;
+    CHECK(fleece_goap_add_goal(g, &idleGoal) == 0, "add idle goal");
+
+    // Explicitly seed every self field these goals/actions read, since sm is
+    // shared across this file's tests (e.g. "done" was left at 1 by an
+    // earlier test).
+    fleece_state_manager_set_named(sm, "atCharger", (const uint8_t*)"0", 1);
+    fleece_state_manager_set_named(sm, "charged", (const uint8_t*)"0", 1);
+    fleece_state_manager_set_named(sm, "done", (const uint8_t*)"0", 1);
+
+    FleeceGoapBrain* brain = fleece_goap_brain_create(embedded, g);
+    CHECK(brain != NULL, "brain create");
+    fleece_goap_brain_set_goal_cooldown_ticks(brain, 3);
+
+    // Tick 1: recharge (higher priority) is ranked first but unplannable ->
+    // cooldown_until[recharge] = tick_count(1) + 3 = 4. Falls back to idleGoal.
+    CHECK(fleece_goap_brain_tick(brain) == 0, "tick 1");
+    CHECK(fleece_goap_brain_goal_id(brain) && strcmp(fleece_goap_brain_goal_id(brain), "idleGoal") == 0,
+          "tick 1 should fall back to idleGoal");
+
+    // The charger becomes available before recharge's cooldown expires.
+    fleece_state_manager_set_named(sm, "atCharger", (const uint8_t*)"1", 1);
+
+    // Tick 2: noop's exec completes (done=1), replan runs. idleGoal is now
+    // satisfied; recharge is plannable again but still cooling down
+    // (tick_count == 2 < 4) -> brain goes idle instead of re-searching it.
+    CHECK(fleece_goap_brain_tick(brain) == 0, "tick 2");
+    CHECK(fleece_goap_brain_tick_count(brain) == 2, "tick count should be 2");
+    CHECK(fleece_goap_brain_goal_id(brain) == NULL, "recharge should stay on cooldown at tick 2");
+
+    // Tick 3: still cooling down (3 < 4).
+    CHECK(fleece_goap_brain_tick(brain) == 0, "tick 3");
+    CHECK(fleece_goap_brain_goal_id(brain) == NULL, "recharge should still be on cooldown at tick 3");
+
+    // Tick 4: cooldown has expired (4 >= 4) and the charger is available ->
+    // recharge is retried and selected.
+    CHECK(fleece_goap_brain_tick(brain) == 0, "tick 4");
+    CHECK(fleece_goap_brain_goal_id(brain) && strcmp(fleece_goap_brain_goal_id(brain), "recharge") == 0,
+          "recharge should be retried once its cooldown expires");
+
+    fleece_goap_brain_destroy(brain);
+    fleece_goap_destroy(g);
+}
+
 static void test_brain_behavior_loop(FleeceEmbedded* embedded) {
     printf("Running brain behavior-loop tests...\n");
     FleeceStateManager* sm = (FleeceStateManager*)fleece_embedded_get_state_manager(embedded);
@@ -528,6 +609,7 @@ int main(void) {
     test_state_snapshot_and_commit(embedded);
     test_world_model_hook(embedded);
     test_divergence_diagnostics(embedded);
+    test_goal_cooldown(embedded);
     test_brain_behavior_loop(embedded);
 
     fleece_goap_destroy(goap);
