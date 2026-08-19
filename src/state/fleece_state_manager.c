@@ -45,7 +45,20 @@ static const uint32_t FIELD_CAPACITY = 128;  // Max fields for microcontrollers 
 
 #define FLEECE_GOSSIP_MAGIC0 'F'
 #define FLEECE_GOSSIP_MAGIC1 'G'
-#define FLEECE_GOSSIP_VERSION 2
+#define FLEECE_GOSSIP_VERSION 3
+
+// Protocol v3: every gossip frame carries the sender's per-stream high-water
+// mark (the highest record timestamp it holds for that stream) alongside the
+// owner id and records. A receiver can then detect that it is *behind* - it
+// missed a delta - by comparing the advertised hw against the highest record
+// timestamp it actually stores for that stream, and request a full resync on
+// demand instead of relying on a periodic full-state broadcast.
+//
+// Known limitation (same tradeoff the benchmark validated): the comparison is
+// against a single scalar hw per stream. It reliably detects "I'm missing the
+// stream's newest record", but can miss a gap on a non-newest field (LWW means
+// only the newest version of each field matters, and a stale non-max field is
+// repaired on that field's next update or at the next on-demand resync).
 
 static uint32_t hash_name(const char* name) {
     uint32_t hash = 2166136261u;  // FNV-1a 32-bit
@@ -488,8 +501,19 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t owner_filte
 
     bool is_shared_stream = (owner_filter == FLEECE_SHARED_OWNER_ID);
 
+    // High-water mark of the stream: the highest record timestamp the sender
+    // holds for this stream (all named fields, regardless of the delta cutoff).
+    // Embedded in every frame so receivers can detect they are behind.
+    uint64_t hw = 0;
+    for (uint32_t i = 0; i < manager->field_capacity; i++) {
+        struct FieldEntry* f = &manager->fields[i];
+        if (!f->exists || f->node_id != owner_filter || f->name[0] == '\0') continue;
+        if (f->timestamp > hw) hw = f->timestamp;
+    }
+
     uint32_t count = 0;
-    size_t body_size = fleece_cbor_array_header_size(2) + fleece_cbor_uint_size(owner_filter);
+    size_t body_size = fleece_cbor_array_header_size(3) + fleece_cbor_uint_size(owner_filter)
+                     + fleece_cbor_uint_size(hw);
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         struct FieldEntry* f = &manager->fields[i];
         if (!f->exists || f->node_id != owner_filter || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
@@ -517,8 +541,9 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t owner_filte
     buf[pos++] = FLEECE_GOSSIP_MAGIC1;
     buf[pos++] = FLEECE_GOSSIP_VERSION;
 
-    fleece_cbor_write_array_header(buf, &pos, 2);
+    fleece_cbor_write_array_header(buf, &pos, 3);
     fleece_cbor_write_uint(buf, &pos, owner_filter);
+    fleece_cbor_write_uint(buf, &pos, hw);
     fleece_cbor_write_array_header(buf, &pos, count);
 
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
@@ -561,7 +586,14 @@ int fleece_state_manager_export_shared_delta(FleeceStateManager* manager, uint64
     return export_fields_since(manager, FLEECE_SHARED_OWNER_ID, since_timestamp, frame_data, frame_size);
 }
 
-int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size) {
+// Shared import core (see the two public wrappers below). Parses a v3 gossip
+// frame [owner_node_id, hw, [records]], merges its records with LWW, then -
+// if behind_self/behind_shared are non-NULL - reports whether the receiver is
+// now *behind* on that stream: the advertised hw is higher than the highest
+// record timestamp the receiver actually stores for it. Only the flag matching
+// the frame's own stream is ever set.
+static int import_impl(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size,
+                       bool* behind_self, bool* behind_shared) {
     if (!manager || !frame_data) {
         return -1;
     }
@@ -576,8 +608,8 @@ int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* fram
     uint8_t major;
     uint64_t value;
 
-    // Outer array: [owner_node_id, records]
-    if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 4 || value != 2) return -1;
+    // Outer array: [owner_node_id, hw, records]
+    if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 4 || value != 3) return -1;
 
     if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
     uint64_t owner_node_id = value;
@@ -587,6 +619,9 @@ int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* fram
     }
 
     bool is_shared_stream = (owner_node_id == FLEECE_SHARED_OWNER_ID);
+
+    if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
+    uint64_t advertised_hw = value;
 
     touch_peer(manager, owner_node_id);  // even an empty delta counts as "heard from"
 
@@ -632,5 +667,57 @@ int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* fram
         }
     }
 
+    // Gap detection: after merging, is the receiver still behind the sender's
+    // advertised high-water mark for this stream?
+    uint64_t max_ts = 0;
+    uint64_t stored_owner = is_shared_stream ? FLEECE_SHARED_OWNER_ID : owner_node_id;
+    for (uint32_t i = 0; i < manager->field_capacity; i++) {
+        struct FieldEntry* f = &manager->fields[i];
+        if (!f->exists || f->node_id != stored_owner) continue;
+        if (f->timestamp > max_ts) max_ts = f->timestamp;
+    }
+    bool behind = (max_ts < advertised_hw);
+    if (behind_self) *behind_self = !is_shared_stream && behind;
+    if (behind_shared) *behind_shared = is_shared_stream && behind;
+
     return 0;
+}
+
+int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size) {
+    return import_impl(manager, frame_data, frame_size, NULL, NULL);
+}
+
+int fleece_state_manager_import_ex(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size,
+                                   bool* behind_self, bool* behind_shared) {
+    return import_impl(manager, frame_data, frame_size, behind_self, behind_shared);
+}
+
+// --- Per-stream high-water marks ------------------------------------------
+// Max record timestamp the manager holds for a stream. Used by the runtime's
+// on-demand resync (probe peers whose hw we're behind on) and by tests to
+// assert convergence. Same helper the exporter and importer use internally.
+
+static uint64_t max_timestamp_for_owner(FleeceStateManager* manager, uint64_t owner_node_id) {
+    uint64_t hw = 0;
+    for (uint32_t i = 0; i < manager->field_capacity; i++) {
+        struct FieldEntry* f = &manager->fields[i];
+        if (!f->exists || f->node_id != owner_node_id) continue;
+        if (f->timestamp > hw) hw = f->timestamp;
+    }
+    return hw;
+}
+
+uint64_t fleece_state_manager_get_self_hw(FleeceStateManager* manager) {
+    if (!manager) return 0;
+    return max_timestamp_for_owner(manager, manager->node_id);
+}
+
+uint64_t fleece_state_manager_get_shared_hw(FleeceStateManager* manager) {
+    if (!manager) return 0;
+    return max_timestamp_for_owner(manager, FLEECE_SHARED_OWNER_ID);
+}
+
+uint64_t fleece_state_manager_get_peer_self_hw(FleeceStateManager* manager, uint64_t peer_id) {
+    if (!manager || peer_id == FLEECE_SHARED_OWNER_ID) return 0;
+    return max_timestamp_for_owner(manager, peer_id);
 }

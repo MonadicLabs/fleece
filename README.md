@@ -74,7 +74,7 @@ The core execution model follows a synchronized **4-phase coordination cycle**, 
 - **Real CBOR (RFC 8949)** gossip frames for all state (see `fleece_state_manager_export`/`_import`/`_export_delta`) - a minimal encoder/decoder supporting just the CBOR major types actually needed (uint, byte string, text string, array, bool), not a general-purpose codec
 - **Minimal overhead** for bandwidth-constrained links
 - **Field-level versioning** via per-field timestamp + owner node id (shared/`world` records additionally carry the true author's id, `origin_node_id`, distinct from the storage owner - see Consistency below)
-- **Delta export** by default (only fields changed since a watermark timestamp), with a full export every `FLEECE_GOSSIP_FULL_RESYNC_TICKS` ticks as anti-entropy
+- **Delta export** by default (only fields changed since a watermark timestamp). Every frame carries the sender's per-stream **high-water mark** (max record timestamp), so a receiver that dropped a delta detects it is behind on import and pulls a full snapshot from that peer on demand (see `fleece_state_manager_import_ex`); a liveness probe re-requests from peers not heard from in `FLEECE_RESYNC_PROBE_TICKS` ticks. This on-demand anti-entropy replaces the old periodic full-state broadcast.
 
 ### Constraints
 - **Memory-optimized data structures**

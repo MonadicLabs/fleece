@@ -64,6 +64,16 @@ foreach(test_src ${TEST_SRC})
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
+# Benchmarks: headless scale/link-loss simulators. Built like tests but not
+# registered with ctest - they report metrics (convergence ticks, throughput,
+# alloc churn) rather than pass/fail. Run one directly, e.g. ./bench_swarm.
+file(GLOB_RECURSE BENCH_SRC "benchmarks/*.c")
+foreach(bench_src ${BENCH_SRC})
+    get_filename_component(bench_name ${bench_src} NAME_WE)
+    add_executable(${bench_name} ${bench_src})
+    target_link_libraries(${bench_name} fleece)
+endforeach()
+
 # Examples: one executable per examples/*.c file (http_server.c is a helper
 # linked into the examples that need it, not a standalone program).
 file(GLOB_RECURSE EXAMPLE_SRC "examples/*.c")

@@ -18,9 +18,20 @@
 
 // Runtime implementation
 
-// How often (in loop ticks) to send a full gossip export instead of a delta,
-// so peers eventually recover from a dropped packet without waiting forever.
-#define FLEECE_GOSSIP_FULL_RESYNC_TICKS 50
+// On-demand resync protocol (replaces the periodic full-state broadcast).
+// Delta gossip is the steady-state traffic; a node that detects it is behind
+// on a peer's stream (see fleece_state_manager_import_ex) requests a full
+// snapshot from that peer with a tiny unicast control frame, and peers reply
+// with a full export. A liveness probe re-requests from peers that haven't
+// confirmed sync within the probe interval, so a node that never hears from a
+// peer at all still recovers instead of stalling forever.
+#define FLEECE_RESYNC_REQUEST_MAGIC0 'F'
+#define FLEECE_RESYNC_REQUEST_MAGIC1 'R'
+#define FLEECE_RESYNC_VERSION 1
+#define FLEECE_RESYNC_STREAM_SELF 0
+#define FLEECE_RESYNC_STREAM_SHARED 1
+#define FLEECE_RESYNC_PROBE_TICKS 100  // re-request from a peer not heard from this long
+#define FLEECE_MAX_RESYNC_TARGETS 32   // matches FLEECE_MAX_TRACKED_PEERS in the state manager
 
 struct FleeceRuntime {
     volatile sig_atomic_t is_running;
@@ -36,6 +47,20 @@ struct FleeceRuntime {
     FleeceGoapBrain* goap_brain;        // optional behavior-loop driver (see fleece_runtime_set_goap)
     void (*tick_cb)(FleeceRuntime*, void*);  // optional per-tick C hook (see fleece_runtime_set_tick_callback)
     void* tick_ud;
+
+    // On-demand resync bookkeeping, keyed by the comms source address of each
+    // peer we gossip with. A target is created when a gossip frame arrives from
+    // a source; need_self/need_shared are set when import_ex reports we are
+    // behind on that source's stream, and cleared when a frame confirms we are
+    // current. The probe (FLEECE_RESYNC_PROBE_TICKS) re-requests from targets
+    // we haven't confirmed sync with in a while - handles "never heard from".
+    struct ResyncTarget {
+        char source[64];
+        uint64_t last_heard_tick;  // last tick a gossip frame arrived from this source
+        bool need_self;
+        bool need_shared;
+        bool exists;
+    } resync_targets[FLEECE_MAX_RESYNC_TARGETS];
 };
 
 static FleeceRuntime* global_runtime = NULL;
@@ -47,13 +72,102 @@ static void signal_handler(int signum) {
     }
 }
 
-// Merges a gossip frame received from a peer into the local swarm view.
+// Locates (creating if needed) the resync bookkeeping entry for `source`.
+static struct ResyncTarget* resync_target_for(FleeceRuntime* runtime, const char* source) {
+    if (!source || !source[0]) return NULL;
+
+    for (int i = 0; i < FLEECE_MAX_RESYNC_TARGETS; i++) {
+        if (runtime->resync_targets[i].exists && strcmp(runtime->resync_targets[i].source, source) == 0) {
+            return &runtime->resync_targets[i];
+        }
+    }
+    for (int i = 0; i < FLEECE_MAX_RESYNC_TARGETS; i++) {
+        if (!runtime->resync_targets[i].exists) {
+            strncpy(runtime->resync_targets[i].source, source, sizeof(runtime->resync_targets[i].source) - 1);
+            runtime->resync_targets[i].source[sizeof(runtime->resync_targets[i].source) - 1] = '\0';
+            runtime->resync_targets[i].last_heard_tick = runtime->gossip_tick_count;
+            runtime->resync_targets[i].need_self = false;
+            runtime->resync_targets[i].need_shared = false;
+            runtime->resync_targets[i].exists = true;
+            return &runtime->resync_targets[i];
+        }
+    }
+    return NULL;  // table full - silently skip; gap detection is best-effort
+}
+
+// Sends a tiny unicast control frame asking `target` for a full snapshot of one
+// stream (self or shared). The receiver answers with a full export (see
+// runtime_gossip_receive).
+static void send_resync_request(FleeceRuntime* runtime, const char* target, uint8_t stream) {
+    uint8_t req[4] = {
+        FLEECE_RESYNC_REQUEST_MAGIC0,
+        FLEECE_RESYNC_REQUEST_MAGIC1,
+        FLEECE_RESYNC_VERSION,
+        stream
+    };
+    fleece_comms_send(runtime->comms, target, req, sizeof(req));
+}
+
+// Receives a gossip or resync-request frame. Requests are answered with a full
+// export of the requested stream, unicast back to the requester. Gossip frames
+// are merged and the receiver's resync bookkeeping is updated from the
+// import_ex gap report: a stream we're behind on gets a need flag (so we pull),
+// a stream we're current on clears it.
 static void runtime_gossip_receive(const char* source, const uint8_t* data, uint32_t size, void* user_data) {
-    (void)source;
     FleeceRuntime* runtime = (FleeceRuntime*)user_data;
     if (!runtime || !data || size == 0) return;
 
-    fleece_state_manager_import(runtime->state_manager, data, size);
+    // Resync request control frame: ['F']['R'][version][stream] -> answer with
+    // a full export of the requested stream, addressed back to the requester.
+    if (size >= 4 && data[0] == FLEECE_RESYNC_REQUEST_MAGIC0 && data[1] == FLEECE_RESYNC_REQUEST_MAGIC1) {
+        if (data[2] != FLEECE_RESYNC_VERSION) return;
+        uint8_t* frame = NULL;
+        uint32_t frame_size = 0;
+        int rc = (data[3] == FLEECE_RESYNC_STREAM_SHARED)
+            ? fleece_state_manager_export_shared(runtime->state_manager, &frame, &frame_size)
+            : fleece_state_manager_export(runtime->state_manager, &frame, &frame_size);
+        if (rc == 0) {
+            fleece_comms_send(runtime->comms, source, frame, frame_size);
+            fleece_free(frame);
+        }
+        return;
+    }
+
+    bool behind_self = false;
+    bool behind_shared = false;
+    if (fleece_state_manager_import_ex(runtime->state_manager, data, size, &behind_self, &behind_shared) != 0) {
+        return;  // malformed frame - ignore
+    }
+
+    struct ResyncTarget* target = resync_target_for(runtime, source);
+    if (!target) return;
+    target->last_heard_tick = runtime->gossip_tick_count;
+    if (behind_self) target->need_self = true;
+    else target->need_self = false;
+    if (behind_shared) target->need_shared = true;
+    else target->need_shared = false;
+}
+
+// Phase 3 (on-demand part): request full snapshots from every peer we know we
+// are behind on, and re-probe peers we haven't heard from in a while.
+static void runtime_send_resync_requests(FleeceRuntime* runtime) {
+    for (int i = 0; i < FLEECE_MAX_RESYNC_TARGETS; i++) {
+        struct ResyncTarget* t = &runtime->resync_targets[i];
+        if (!t->exists) continue;
+
+        // Gap-driven: we imported a frame whose advertised hw exceeds what we
+        // hold for this source's stream, so a delta was dropped - pull it now.
+        if (t->need_self) send_resync_request(runtime, t->source, FLEECE_RESYNC_STREAM_SELF);
+        if (t->need_shared) send_resync_request(runtime, t->source, FLEECE_RESYNC_STREAM_SHARED);
+
+        // Liveness probe: haven't heard from this peer in a while - it may have
+        // updates we never received (or we joined late). Cheap, throttled pull.
+        if (runtime->gossip_tick_count - t->last_heard_tick >= FLEECE_RESYNC_PROBE_TICKS) {
+            send_resync_request(runtime, t->source, FLEECE_RESYNC_STREAM_SELF);
+            send_resync_request(runtime, t->source, FLEECE_RESYNC_STREAM_SHARED);
+            t->last_heard_tick = runtime->gossip_tick_count;  // throttle to once per interval
+        }
+    }
 }
 
 static FleeceRuntime* runtime_create_internal(FleeceStateManager* state_manager) {
@@ -173,21 +287,19 @@ int fleece_runtime_start(FleeceRuntime* runtime) {
             fleece_goap_brain_tick(runtime->goap_brain);
         }
 
-        // Phase 3: Gossip (State Synchronization) - two independent streams, each
-        // delta-by-default with a periodic full resync (anti-entropy) so a peer
-        // can recover from a dropped packet instead of missing an update forever:
+        // Phase 3: Gossip (State Synchronization) - two independent streams,
+        // each delta-by-default; on-demand full resync replaces the old periodic
+        // full-state broadcast (anti-entropy), so steady-state traffic is just
+        // the deltas plus the occasional pull when a gap is detected:
         //   - self: this node's own fields (owner = its own node id)
         //   - shared: the "world" collection (owner = FLEECE_SHARED_OWNER_ID),
         //     which any node may write/relay - not tied to any single node's liveness.
-        // Peers' frames arrive via runtime_gossip_receive() and merge into swarm/world.
-        bool full_resync = (runtime->gossip_tick_count % FLEECE_GOSSIP_FULL_RESYNC_TICKS) == 0;
-
+        // Peers' frames arrive via runtime_gossip_receive() and merge into
+        // swarm/world; that handler also flags streams we are behind on, and
+        // runtime_send_resync_requests() below pulls the missing snapshots.
         uint8_t* self_frame = NULL;
         uint32_t self_frame_size = 0;
-        int self_rc = full_resync
-            ? fleece_state_manager_export(runtime->state_manager, &self_frame, &self_frame_size)
-            : fleece_state_manager_export_delta(runtime->state_manager, runtime->self_gossip_watermark, &self_frame, &self_frame_size);
-        if (self_rc == 0) {
+        if (fleece_state_manager_export_delta(runtime->state_manager, runtime->self_gossip_watermark, &self_frame, &self_frame_size) == 0) {
             fleece_comms_send(runtime->comms, "broadcast", self_frame, self_frame_size);
             fleece_free(self_frame);
         }
@@ -195,14 +307,13 @@ int fleece_runtime_start(FleeceRuntime* runtime) {
 
         uint8_t* shared_frame = NULL;
         uint32_t shared_frame_size = 0;
-        int shared_rc = full_resync
-            ? fleece_state_manager_export_shared(runtime->state_manager, &shared_frame, &shared_frame_size)
-            : fleece_state_manager_export_shared_delta(runtime->state_manager, runtime->shared_gossip_watermark, &shared_frame, &shared_frame_size);
-        if (shared_rc == 0) {
+        if (fleece_state_manager_export_shared_delta(runtime->state_manager, runtime->shared_gossip_watermark, &shared_frame, &shared_frame_size) == 0) {
             fleece_comms_send(runtime->comms, "broadcast", shared_frame, shared_frame_size);
             fleece_free(shared_frame);
         }
         runtime->shared_gossip_watermark = fleece_state_manager_get_local_timestamp(runtime->state_manager);
+
+        runtime_send_resync_requests(runtime);
 
         runtime->gossip_tick_count++;
 

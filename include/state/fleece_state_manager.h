@@ -178,12 +178,16 @@ int fleece_state_manager_set_shared_cas(FleeceStateManager* manager, const char*
 // Gossip wire frames are real CBOR (RFC 8949), not a bespoke format: a 3-byte
 // ['F']['G'][version] prefix (a quick sanity/version check that isn't itself
 // part of the CBOR payload) followed by a CBOR-encoded
-// [owner_node_id, [record, record, ...]] array. A self-stream record is
-// [is_tombstone, name, timestamp, data]; a shared/"world"-stream record
-// additionally carries its author up front: [origin_node_id, is_tombstone,
-// name, timestamp, data] (see fleece_state_manager_merge_shared). Only the
-// CBOR major types actually needed here are supported (uint, bstring,
-// tstring, array, bool) - this is not a general-purpose CBOR codec.
+// [owner_node_id, hw, [record, record, ...]] array. `hw` is the sender's
+// per-stream high-water mark: the highest record timestamp it holds for that
+// stream, embedded so a receiver can detect it has fallen behind (missed a
+// delta) and request a full resync on demand - see fleece_state_manager_import_ex.
+// A self-stream record is [is_tombstone, name, timestamp, data]; a
+// shared/"world"-stream record additionally carries its author up front:
+// [origin_node_id, is_tombstone, name, timestamp, data] (see
+// fleece_state_manager_merge_shared). Only the CBOR major types actually needed
+// here are supported (uint, bstring, tstring, array, bool) - this is not a
+// general-purpose CBOR codec.
 
 // Export the local node's own named fields as a gossip wire frame (full state)
 int fleece_state_manager_export(FleeceStateManager* manager, uint8_t** frame_data, uint32_t* frame_size);
@@ -205,6 +209,31 @@ int fleece_state_manager_export_shared_delta(FleeceStateManager* manager, uint64
 // owner_node_id (a real peer id, or FLEECE_SHARED_OWNER_ID) determines where
 // the fields land and which record shape (see above) to expect.
 int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size);
+
+// Import with on-demand resync support. Same merge as fleece_state_manager_import,
+// and additionally reports (via behind_self / behind_shared - both optional,
+// NULL is fine) whether the receiver is now *behind* on the stream the frame
+// carried: the sender's advertised high-water mark exceeds the highest record
+// timestamp the receiver stores for that stream, meaning a delta was dropped
+// and a full resync from this peer is warranted. Only the flag matching the
+// frame's own stream is set; the other is left untouched. The caller can then
+// request a full export from the sender (see fleece_runtime.c Phase 3).
+//
+// Known limitation: the gap check compares a single scalar hw per stream. It
+// reliably detects "I'm missing the stream's newest record", but can miss a
+// gap on a non-newest field; LWW means only the newest version of each field
+// matters, and a stale non-max field is repaired on that field's next update
+// or at the next on-demand resync.
+int fleece_state_manager_import_ex(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size,
+                                   bool* behind_self, bool* behind_shared);
+
+// Per-stream high-water marks: the highest record timestamp the manager holds
+// for its own self stream, the shared stream, or a stored peer's self stream.
+// Convenience for the runtime's on-demand resync probe and for convergence
+// checks (all nodes should agree once the swarm has synchronized).
+uint64_t fleece_state_manager_get_self_hw(FleeceStateManager* manager);
+uint64_t fleece_state_manager_get_shared_hw(FleeceStateManager* manager);
+uint64_t fleece_state_manager_get_peer_self_hw(FleeceStateManager* manager, uint64_t peer_id);
 
 #ifdef __cplusplus
 }

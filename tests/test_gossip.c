@@ -124,10 +124,12 @@ static void test_self_owned_rejection(void) {
 }
 
 // Frames are real CBOR (see fleece_state_manager.c) behind a 3-byte
-// ['F']['G'][version] prefix: [owner_node_id, [records...]], where a
-// self-stream record is [is_tombstone, name, timestamp, data]. These are
-// small hand-built CBOR fragments (all values kept < 24 so each head is a
-// single byte: (major << 5) | value) - see RFC 8949 for the encoding.
+// ['F']['G'][version] prefix: [owner_node_id, hw, [records...]], where a
+// self-stream record is [is_tombstone, name, timestamp, data] and `hw` is the
+// sender's per-stream high-water mark (max record timestamp) - the value a
+// receiver compares against to detect it is behind. These are small hand-built
+// CBOR fragments (all values kept < 24 so each head is a single byte:
+// (major << 5) | value) - see RFC 8949 for the encoding.
 #define CBOR_ARRAY(n) (uint8_t)(0x80 | (n))
 #define CBOR_UINT(n)  (uint8_t)(0x00 | (n))
 #define CBOR_BOOL_FALSE 0xF4
@@ -151,31 +153,35 @@ static void test_malformed_frames(void) {
     uint8_t bad_version[8] = {'F', 'G', 99, 0, 0, 0, 0, 0};
     CHECK(fleece_state_manager_import(m, bad_version, sizeof(bad_version)) != 0, "wrong version should be rejected");
 
-    // Valid magic/version/outer-array/owner/record-count (claims 5 records) but
-    // truncated to zero bytes for the records themselves - the CBOR parser
+    // Valid magic/version/outer-array/owner/hw/record-count (claims 5 records)
+    // but truncated to zero bytes for the records themselves - the CBOR parser
     // must bounds-check every item read, not just the fixed-size header.
-    uint8_t truncated_records[] = {'F', 'G', 2, CBOR_ARRAY(2), CBOR_UINT(5), CBOR_ARRAY(5)};
+    uint8_t truncated_records[] = {'F', 'G', 3, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_UINT(0), CBOR_ARRAY(5)};
     CHECK(fleece_state_manager_import(m, truncated_records, sizeof(truncated_records)) != 0, "truncated field records should be rejected without crashing");
 
-    // Outer array declares 3 elements instead of the required 2 (type/shape confusion).
-    uint8_t wrong_outer_arity[] = {'F', 'G', 2, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_ARRAY(0)};
+    // Outer array declares 2 elements instead of the required 3 (type/shape confusion).
+    uint8_t wrong_outer_arity[] = {'F', 'G', 3, CBOR_ARRAY(2), CBOR_UINT(5), CBOR_ARRAY(0)};
     CHECK(fleece_state_manager_import(m, wrong_outer_arity, sizeof(wrong_outer_arity)) != 0, "wrong outer array arity should be rejected");
 
     // owner_node_id encoded as a text string instead of a uint (major-type confusion).
-    uint8_t wrong_owner_type[] = {'F', 'G', 2, CBOR_ARRAY(2), CBOR_TEXT(0), CBOR_ARRAY(0)};
+    uint8_t wrong_owner_type[] = {'F', 'G', 3, CBOR_ARRAY(3), CBOR_TEXT(0), CBOR_UINT(0), CBOR_ARRAY(0)};
     CHECK(fleece_state_manager_import(m, wrong_owner_type, sizeof(wrong_owner_type)) != 0, "non-uint owner_node_id should be rejected");
 
-    // A single well-formed record (owner=5, is_tombstone=false, name="x", ts=1,
+    // hw (the high-water mark) encoded as a text string instead of a uint.
+    uint8_t wrong_hw_type[] = {'F', 'G', 3, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_TEXT(0), CBOR_ARRAY(0)};
+    CHECK(fleece_state_manager_import(m, wrong_hw_type, sizeof(wrong_hw_type)) != 0, "non-uint high-water mark should be rejected");
+
+    // A single well-formed record (owner=5, hw=0, is_tombstone=false, name="x", ts=1,
     // data=[1 byte]) but the byte-string length claims 9 bytes when only 1 remains.
     uint8_t oversized_data_len[] = {
-        'F', 'G', 2, CBOR_ARRAY(2), CBOR_UINT(5), CBOR_ARRAY(1),
+        'F', 'G', 3, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_UINT(0), CBOR_ARRAY(1),
         CBOR_ARRAY(4), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x', CBOR_UINT(1), CBOR_BYTES(9), 0xAB
     };
     CHECK(fleece_state_manager_import(m, oversized_data_len, sizeof(oversized_data_len)) != 0, "a data length exceeding the remaining buffer should be rejected");
 
     // Same shape, but the record's own inner array claims 3 elements instead of 4.
     uint8_t wrong_record_arity[] = {
-        'F', 'G', 2, CBOR_ARRAY(2), CBOR_UINT(5), CBOR_ARRAY(1),
+        'F', 'G', 3, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_UINT(0), CBOR_ARRAY(1),
         CBOR_ARRAY(3), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x'
     };
     CHECK(fleece_state_manager_import(m, wrong_record_arity, sizeof(wrong_record_arity)) != 0, "wrong per-record array arity should be rejected");
@@ -183,11 +189,12 @@ static void test_malformed_frames(void) {
     // A well-formed, fully in-bounds record should actually be accepted (positive control
     // proving the above rejections are about the corruption, not the hand-built encoding itself).
     uint8_t valid_record[] = {
-        'F', 'G', 2, CBOR_ARRAY(2), CBOR_UINT(5), CBOR_ARRAY(1),
-        CBOR_ARRAY(4), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x', CBOR_UINT(1), CBOR_BYTES(1), 0xAB
+        'F', 'G', 3, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_UINT(3), CBOR_ARRAY(1),
+        CBOR_ARRAY(4), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x', CBOR_UINT(3), CBOR_BYTES(1), 0xAB
     };
     CHECK(fleece_state_manager_import(m, valid_record, sizeof(valid_record)) == 0, "a well-formed hand-built CBOR frame should be accepted");
     CHECK(fleece_state_manager_exists_named(m, 5, "x"), "the accepted record's field should actually be readable back");
+    CHECK(fleece_state_manager_get_peer_self_hw(m, 5) == 3, "peer hw should reflect the accepted record's timestamp");
 
     fleece_state_manager_destroy(m);
     printf("Done: malformed frame test (no crash)\n");
@@ -437,6 +444,110 @@ static void test_shared_field_tie_break_convergence(void) {
     printf("Done: shared field tie-break convergence test\n");
 }
 
+// The on-demand resync driver: a receiver that misses a delta must detect it is
+// behind via the sender's advertised high-water mark and pull a full snapshot.
+// Scenario: A writes x(ts1), y(ts2); R syncs (not behind). A then updates x(ts3)
+// and broadcasts a delta that R drops. A's next (empty) delta still advertises
+// hw=ts3 - importing it must report behind_self=true so the runtime pulls a full
+// export, after which R is current again.
+static void test_behind_detection(void) {
+    printf("Running behind-detection test...\n");
+
+    FleeceStateManager* a = fleece_state_manager_create_with_node_id(0xEEEE9999EEEE9999ULL);
+    FleeceStateManager* r = fleece_state_manager_create_with_node_id(0xFFFF8888FFFF8888ULL);
+    uint64_t a_id = fleece_state_manager_get_node_id(a);
+
+    fleece_state_manager_set_named(a, "x", (const uint8_t*)"1", 1);
+    fleece_state_manager_set_named(a, "y", (const uint8_t*)"2", 1);
+    uint64_t watermark = fleece_state_manager_get_local_timestamp(a);
+
+    // Initial full sync: R is fully caught up.
+    uint8_t* frame = NULL;
+    uint32_t frame_size = 0;
+    fleece_state_manager_export(a, &frame, &frame_size);
+    bool behind_self = true, behind_shared = true;
+    CHECK(fleece_state_manager_import_ex(r, frame, frame_size, &behind_self, &behind_shared) == 0, "full export should import cleanly");
+    free(frame);
+    CHECK(!behind_self && !behind_shared, "a receiver holding everything should not be flagged behind");
+
+    // A updates x -> the delta would carry it, but R "drops" the packet. A then
+    // advances its watermark (as the runtime does after each send), so its next
+    // delta is empty yet still advertises the higher hw.
+    fleece_state_manager_set_named(a, "x", (const uint8_t*)"3", 1);
+    frame = NULL;
+    frame_size = 0;
+    fleece_state_manager_export_delta(a, watermark, &frame, &frame_size);
+    CHECK(frame_size > 0, "the delta carrying x@ts3 should be non-empty");
+    free(frame);  // dropped - R never sees it
+    watermark = fleece_state_manager_get_local_timestamp(a);
+
+    frame = NULL;
+    frame_size = 0;
+    fleece_state_manager_export_delta(a, watermark, &frame, &frame_size);
+    CHECK(fleece_state_manager_import_ex(r, frame, frame_size, &behind_self, &behind_shared) == 0, "the empty delta should import cleanly");
+    free(frame);
+    CHECK(behind_self, "a dropped delta must be detected via the advertised high-water mark");
+    CHECK(!behind_shared, "an unrelated shared stream must not be flagged behind");
+    CHECK(fleece_state_manager_get_peer_self_hw(r, a_id) < fleece_state_manager_get_self_hw(a), "R should still hold less than A's current hw");
+
+    // The runtime pulls a full snapshot - behind is cleared.
+    frame = NULL;
+    frame_size = 0;
+    fleece_state_manager_export(a, &frame, &frame_size);
+    CHECK(fleece_state_manager_import_ex(r, frame, frame_size, &behind_self, &behind_shared) == 0, "the pulled full export should import cleanly");
+    free(frame);
+    CHECK(!behind_self, "after the full resync, R should no longer be behind");
+
+    uint8_t* data = NULL;
+    uint32_t size = 0;
+    fleece_state_manager_get_named(r, a_id, "x", &data, &size);
+    CHECK(data != NULL && size == 1 && data[0] == '3', "the pulled snapshot must carry the missed update");
+    free(data);
+
+    fleece_state_manager_destroy(a);
+    fleece_state_manager_destroy(r);
+    printf("Done: behind-detection test\n");
+}
+
+// Shared-stream analogue: same gap, but on the shared/"world" stream, and
+// import_ex must flag behind_shared (not behind_self).
+static void test_behind_detection_shared(void) {
+    printf("Running behind-detection (shared) test...\n");
+
+    FleeceStateManager* a = fleece_state_manager_create_with_node_id(0x7777AAAA7777AAAAULL);
+    FleeceStateManager* r = fleece_state_manager_create_with_node_id(0x8888BBBB8888BBBBULL);
+
+    fleece_state_manager_set_shared(a, "world", (const uint8_t*)"\"v1\"", 4);
+    uint64_t watermark = fleece_state_manager_get_local_timestamp(a);
+
+    uint8_t* frame = NULL;
+    uint32_t frame_size = 0;
+    fleece_state_manager_export_shared(a, &frame, &frame_size);
+    bool behind_self = true, behind_shared = true;
+    fleece_state_manager_import_ex(r, frame, frame_size, &behind_self, &behind_shared);
+    free(frame);
+    CHECK(!behind_self && !behind_shared, "a synchronized receiver should not be flagged behind on either stream");
+
+    fleece_state_manager_set_shared(a, "world", (const uint8_t*)"\"v2\"", 4);  // delta dropped by R
+    frame = NULL;
+    frame_size = 0;
+    fleece_state_manager_export_shared_delta(a, watermark, &frame, &frame_size);
+    free(frame);
+    watermark = fleece_state_manager_get_local_timestamp(a);
+
+    frame = NULL;
+    frame_size = 0;
+    fleece_state_manager_export_shared_delta(a, watermark, &frame, &frame_size);  // empty, hw advanced
+    fleece_state_manager_import_ex(r, frame, frame_size, &behind_self, &behind_shared);
+    free(frame);
+    CHECK(behind_shared, "the shared stream gap should be flagged via behind_shared");
+    CHECK(!behind_self, "the self stream must not be flagged by a shared-frame gap");
+
+    fleece_state_manager_destroy(a);
+    fleece_state_manager_destroy(r);
+    printf("Done: behind-detection (shared) test\n");
+}
+
 static void test_set_shared_cas(void) {
     printf("Running set_shared_cas test...\n");
 
@@ -503,6 +614,10 @@ int main(void) {
     test_shared_fields_survive_discoverer_death();
     printf("\n");
     test_shared_field_tie_break_convergence();
+    printf("\n");
+    test_behind_detection();
+    printf("\n");
+    test_behind_detection_shared();
     printf("\n");
     test_set_shared_cas();
     printf("\n");
