@@ -179,6 +179,16 @@ fleece_embedded_destroy(embedded);
 ```
 (`fleece_runtime_*` does all of this wiring for you - the snippet above is what it does internally.)
 
+#### Memory Allocator
+On memory-constrained targets (ESP32-P4, STM32H7, ...) fleece lets you plug in your own allocator instead of relying on a system heap. A single call redirects **both** the library's own allocations (state-manager field values, GOAP planner A* tables, embedded/comms/runtime structs, JS scratch buffers) and the QuickJS engine's GC heap:
+```c
+// my_pool_malloc/free/calloc/realloc back a static pool/arena you supply.
+fleece_embedded_set_allocator(my_pool_malloc, my_pool_free, my_pool_calloc, my_pool_realloc);
+
+FleeceRuntime* runtime = fleece_runtime_create();  // all allocations go through the pool
+```
+Passing all four NULL resets to the default libc allocator. If you'd rather keep the JS GC heap in its own dedicated arena (its lifetime/size profile differs from fleece's transient allocations), skip the above and pass an explicit QuickJS `JSMallocFunctions` pair to `fleece_embedded_create_with_allocator()` instead. See `include/fleece_alloc.h` and `tests/test_alloc.c`.
+
 #### FleecePlatform
 A pure name→function registry - fleece defines **no** functions of its own (no `arm`, no `moveTo`, nothing robot-specific). Register whatever verbs fit your actual hardware, and scripts call them as `platform.<name>(...)`. With nothing registered, `platform` is simply empty.
 ```c
@@ -205,15 +215,14 @@ fleece/
 │   ├── embedded/         # Embedded JS interface (self/swarm/world/platform bindings)
 │   ├── planner/          # GOAP planner interface
 │   ├── platform/         # Platform function registry interface
-│   └── core/             # Dead/unused parallel runtime - not wired into anything
+│   └── fleece_alloc.h    # Pluggable allocator hooks (see "Memory Allocator" below)
 ├── src/
 │   ├── runtime/          # Runtime implementation
 │   ├── state/            # State manager implementation
 │   ├── comms/           # Comms implementation (single-process simulation, no real transport)
 │   ├── embedded/         # QuickJS-ng integration and self/swarm/world/platform bindings
 │   ├── planner/          # GOAP planner (search, goal selection, CBOR plan blob)
-│   ├── platform/        # Platform function registry implementation
-│   └── core/            # Dead/unused - see include/core
+│   └── platform/        # Platform function registry implementation
 ├── third_party/
 │   └── quickjs/          # QuickJS-ng, git submodule
 ├── examples/             # Example applications (one executable per .c file)
@@ -235,7 +244,8 @@ fleece/
 │   ├── test_embedded.c      # self/swarm/world QuickJS binding tests
 │   ├── test_planner.c       # GOAP planner + CBOR plan blob tests
 │   ├── test_goap_js.c       # QuickJS eval bridge + behavior-loop brain tests
-│   └── test_platform.c      # Platform registry + JS binding tests
+│   ├── test_platform.c      # Platform registry + JS binding tests
+│   └── test_alloc.c         # Pluggable allocator hooks (library + JS engine)
 ├── CMakeLists.txt        # Build system
 ├── README.md            # Project documentation
 └── CLAUDE.md            # Development guidelines
