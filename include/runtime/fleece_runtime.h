@@ -88,6 +88,22 @@ int fleece_runtime_set_goap(FleeceRuntime* runtime, struct FleeceGoap* goap);
 // before fleece_runtime_start().
 void* fleece_runtime_get_goap_brain(FleeceRuntime* runtime);
 
+// Swaps in a new GOAP table while the runtime keeps running - the safe way
+// to switch missions (e.g. one just received and fleece_goap_deserialize'd
+// over the mesh), unlike fleece_goap_reset()'ing the SAME table a running
+// brain still holds cached action/goal indices into (that dangles them; do
+// not do that). This works because it builds an entirely NEW brain from
+// scratch (fresh goal_idx/action_idx/plan/tick_count) rather than mutating
+// the live one, so nothing from the old mission's in-flight plan carries
+// over - callable any number of times, first attach or replace alike (does
+// NOT require fleece_runtime_set_goap() to have been called first). Any
+// event/world-model/divergence/max-ticks/cooldown callbacks a caller wants
+// on the new brain must be re-registered - a fresh FleeceGoapBrain starts
+// with none of the old brain's callbacks. The caller retains ownership of
+// both the old and new `goap` (this never destroys either) and must keep
+// `new_goap` alive until the runtime is destroyed or replaced again.
+int fleece_runtime_replace_goap(FleeceRuntime* runtime, struct FleeceGoap* new_goap);
+
 #ifdef __cplusplus
 }
 #endif

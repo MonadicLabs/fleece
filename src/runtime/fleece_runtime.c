@@ -303,7 +303,28 @@ int fleece_runtime_start(FleeceRuntime* runtime) {
             fleece_comms_send(runtime->comms, "broadcast", self_frame, self_frame_size);
             fleece_free(self_frame);
         }
-        runtime->self_gossip_watermark = fleece_state_manager_get_local_timestamp(runtime->state_manager);
+        // The watermark must track this STREAM's own high-water mark (the
+        // highest field.timestamp actually eligible for export_delta's
+        // filter), not the manager's global local_timestamp clock. That
+        // clock also advances on every import (merge_named/merge_shared's
+        // own max(local, remote) bump - see fleece_state_manager.c) and on
+        // every LOCAL field write regardless of stream, so a node that has
+        // ticked a while before first hearing a given peer already has a
+        // local_timestamp well past that peer's own (independently
+        // clocked, so typically much lower) field timestamps. Advancing
+        // the watermark to that global clock skips straight past those
+        // merged-but-not-yet-exported fields: since export_delta only
+        // ever looks at field.timestamp > since_timestamp, and a field's
+        // own timestamp never changes once merged (until its origin
+        // writes a newer one), the entry becomes permanently invisible to
+        // every future export - found via a 3-node relay chain (A-B-C, A
+        // and C not directly connected) where B correctly relayed one
+        // neighbor's data onward but never the other's, depending purely
+        // on which one's frame happened to arrive before B's own clock
+        // ticked past its timestamp. get_self_hw()/get_shared_hw() report
+        // the real per-stream ceiling instead, so the watermark can never
+        // advance past data this export actually had a chance to include.
+        runtime->self_gossip_watermark = fleece_state_manager_get_self_hw(runtime->state_manager);
 
         uint8_t* shared_frame = NULL;
         uint32_t shared_frame_size = 0;
@@ -311,7 +332,7 @@ int fleece_runtime_start(FleeceRuntime* runtime) {
             fleece_comms_send(runtime->comms, "broadcast", shared_frame, shared_frame_size);
             fleece_free(shared_frame);
         }
-        runtime->shared_gossip_watermark = fleece_state_manager_get_local_timestamp(runtime->state_manager);
+        runtime->shared_gossip_watermark = fleece_state_manager_get_shared_hw(runtime->state_manager);
 
         runtime_send_resync_requests(runtime);
 
@@ -374,6 +395,16 @@ int fleece_runtime_set_goap(FleeceRuntime* runtime, FleeceGoap* goap) {
 
 void* fleece_runtime_get_goap_brain(FleeceRuntime* runtime) {
     return runtime ? runtime->goap_brain : NULL;
+}
+
+int fleece_runtime_replace_goap(FleeceRuntime* runtime, FleeceGoap* new_goap) {
+    if (!runtime || !new_goap) return -1;
+    if (runtime->goap_brain) {
+        fleece_goap_brain_destroy(runtime->goap_brain);
+        runtime->goap_brain = NULL;
+    }
+    runtime->goap_brain = fleece_goap_brain_create(runtime->embedded, new_goap);
+    return runtime->goap_brain ? 0 : -1;
 }
 
 void fleece_runtime_set_tick_callback(FleeceRuntime* runtime, void (*cb)(FleeceRuntime*, void*), void* user_data) {
