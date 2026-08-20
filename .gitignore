@@ -4,3 +4,5 @@ build_*/
 *.a
 *.so
 *.dylib
+__pycache__/
+.pytest_cache/

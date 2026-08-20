@@ -242,6 +242,7 @@ int fleece_goap_goal_satisfied(const FleeceGoap* goap, uint32_t goal_idx, const 
 // Table introspection (used by the JS layer and tests).
 uint32_t fleece_goap_action_count(const FleeceGoap* goap);
 const char* fleece_goap_action_id(const FleeceGoap* goap, uint32_t idx);
+const char* fleece_goap_action_name(const FleeceGoap* goap, uint32_t idx);
 uint32_t fleece_goap_action_pre_count(const FleeceGoap* goap, uint32_t idx);
 const char* fleece_goap_action_pre(const FleeceGoap* goap, uint32_t idx, uint32_t i);
 uint32_t fleece_goap_action_eff_count(const FleeceGoap* goap, uint32_t idx);
@@ -252,11 +253,26 @@ const char* fleece_goap_action_dest(const FleeceGoap* goap, uint32_t idx);
 double fleece_goap_action_dur(const FleeceGoap* goap, uint32_t idx);
 uint32_t fleece_goap_goal_count(const FleeceGoap* goap);
 const char* fleece_goap_goal_id(const FleeceGoap* goap, uint32_t idx);
+const char* fleece_goap_goal_name(const FleeceGoap* goap, uint32_t idx);
 const char* fleece_goap_goal_expr(const FleeceGoap* goap, uint32_t idx);
 double fleece_goap_goal_priority(const FleeceGoap* goap, uint32_t idx);
 const char* fleece_goap_goal_curve_id(const FleeceGoap* goap, uint32_t idx);
 uint32_t fleece_goap_find_action(const FleeceGoap* goap, const char* id);
 uint32_t fleece_goap_find_goal(const FleeceGoap* goap, const char* id);
+
+// Utility curves (piecewise-linear, referenced by goals via curve_id).
+uint32_t fleece_goap_utility_count(const FleeceGoap* goap);
+const char* fleece_goap_utility_id(const FleeceGoap* goap, uint32_t idx);
+const char* fleece_goap_utility_name(const FleeceGoap* goap, uint32_t idx);
+const char* fleece_goap_utility_dim(const FleeceGoap* goap, uint32_t idx);
+double fleece_goap_utility_x_min(const FleeceGoap* goap, uint32_t idx);
+double fleece_goap_utility_x_max(const FleeceGoap* goap, uint32_t idx);
+uint32_t fleece_goap_utility_point_count(const FleeceGoap* goap, uint32_t idx);
+// Out-of-range idx/i returns {0, 0}; there is no other sentinel value for a
+// point, so callers must range-check via fleece_goap_utility_count/point_count.
+FleeceGoapPoint fleece_goap_utility_point(const FleeceGoap* goap, uint32_t idx, uint32_t i);
+uint32_t fleece_goap_find_utility(const FleeceGoap* goap, const char* id);
+
 uint32_t fleece_goap_mission_count(const FleeceGoap* goap);
 const char* fleece_goap_mission_id(const FleeceGoap* goap, uint32_t idx);
 const char* fleece_goap_mission_name(const FleeceGoap* goap, uint32_t idx);

@@ -286,6 +286,9 @@ static void test_registration(void) {
 
     const char* act = fleece_goap_action_id(g, 0);
     CHECK(act != NULL && strcmp(act, "deploy") == 0, "action_id should return registered id");
+    CHECK(fleece_goap_action_name(g, 0) != NULL && strcmp(fleece_goap_action_name(g, 0), "Deploy to Zone") == 0,
+          "action_name should return registered name");
+    CHECK(fleece_goap_action_name(g, 999) == NULL, "action_name should return NULL for an out-of-range idx");
     CHECK(strcmp(fleece_goap_action_pre(g, 0, 0), "function(bb){ return bb.self.location === 'base'; }") == 0,
           "action pre source should be stored");
     CHECK(strcmp(fleece_goap_action_eff(g, 0, 0), "function(bb){ bb.self.location = 'zone'; bb.self.battery -= 1; return bb; }") == 0,
@@ -303,9 +306,50 @@ static void test_registration(void) {
           "goal expr should be stored");
     CHECK(fleece_goap_goal_priority(g, 0) == 2.0, "goal priority should be stored");
     CHECK(strcmp(fleece_goap_goal_curve_id(g, 0), "u2") == 0, "goal curve id should be stored");
+    CHECK(strcmp(fleece_goap_goal_name(g, 0), "Gather 1 food") == 0, "goal_name should return registered name");
+    CHECK(fleece_goap_goal_name(g, 999) == NULL, "goal_name should return NULL for an out-of-range idx");
 
+    (void)idx;
     fleece_goap_destroy(g);
     printf("Done: registration tests\n");
+}
+
+static void test_utility_introspection(void) {
+    printf("Running utility introspection tests...\n");
+    FleeceGoap* g = fleece_goap_create();
+    register_scenario(g);
+
+    CHECK(fleece_goap_utility_count(g) == 2, "should have 2 utility curves");
+    CHECK(fleece_goap_find_utility(g, "u2") == 1, "find_utility should locate u2");
+    CHECK(fleece_goap_find_utility(g, "nope") == UINT32_MAX, "find_utility should fail for unknown id");
+
+    CHECK(strcmp(fleece_goap_utility_id(g, 0), "u1") == 0, "utility_id should return registered id");
+    CHECK(strcmp(fleece_goap_utility_name(g, 0), "Constant") == 0, "utility_name should return registered name");
+    CHECK(fleece_goap_utility_dim(g, 0) != NULL && fleece_goap_utility_dim(g, 0)[0] == '\0',
+          "u1's dim should be empty (constant curve)");
+    CHECK(fleece_goap_utility_x_min(g, 0) == 0.0 && fleece_goap_utility_x_max(g, 0) == 1.0,
+          "u1's x range should be stored");
+    CHECK(fleece_goap_utility_point_count(g, 0) == 2, "u1 should have 2 points");
+    FleeceGoapPoint p0 = fleece_goap_utility_point(g, 0, 0);
+    FleeceGoapPoint p1 = fleece_goap_utility_point(g, 0, 1);
+    CHECK(p0.x == 0 && p0.y == 0.9, "u1 point 0 should round-trip");
+    CHECK(p1.x == 1 && p1.y == 0.9, "u1 point 1 should round-trip");
+
+    CHECK(strcmp(fleece_goap_utility_id(g, 1), "u2") == 0, "utility_id should return registered id for u2");
+    CHECK(strcmp(fleece_goap_utility_name(g, 1), "Hunger") == 0, "utility_name should return registered name for u2");
+    CHECK(strcmp(fleece_goap_utility_dim(g, 1), "foodCount") == 0, "u2's dim should be stored");
+    CHECK(fleece_goap_utility_point_count(g, 1) == 4, "u2 should have 4 points");
+    FleeceGoapPoint p3 = fleece_goap_utility_point(g, 1, 3);
+    CHECK(p3.x == 3 && p3.y == 0.05, "u2's last point should round-trip");
+
+    // Out-of-range access must not crash and must return sentinel zeros/NULLs.
+    CHECK(fleece_goap_utility_id(g, 999) == NULL, "utility_id should return NULL for an out-of-range idx");
+    CHECK(fleece_goap_utility_point_count(g, 999) == 0, "utility_point_count should return 0 for an out-of-range idx");
+    FleeceGoapPoint oob = fleece_goap_utility_point(g, 0, 999);
+    CHECK(oob.x == 0.0 && oob.y == 0.0, "utility_point should return {0,0} for an out-of-range point index");
+
+    fleece_goap_destroy(g);
+    printf("Done: utility introspection tests\n");
 }
 
 static void test_source_truncation(void) {
@@ -664,6 +708,17 @@ static void test_serialization(void) {
           "goal expr should round-trip");
     CHECK(fleece_goap_goal_priority(h, 0) == 2.0, "goal priority should round-trip");
     CHECK(strcmp(fleece_goap_goal_curve_id(h, 0), "u2") == 0, "goal curve id should round-trip");
+    CHECK(strcmp(fleece_goap_action_name(h, 0), "Deploy to Zone") == 0, "action name should round-trip");
+    CHECK(strcmp(fleece_goap_goal_name(h, 0), "Gather 1 food") == 0, "goal name should round-trip");
+
+    // Utility curves.
+    CHECK(fleece_goap_utility_count(h) == 2, "utility count should round-trip");
+    CHECK(strcmp(fleece_goap_utility_id(h, 1), "u2") == 0, "utility id should round-trip");
+    CHECK(strcmp(fleece_goap_utility_name(h, 1), "Hunger") == 0, "utility name should round-trip");
+    CHECK(strcmp(fleece_goap_utility_dim(h, 1), "foodCount") == 0, "utility dim should round-trip");
+    CHECK(fleece_goap_utility_point_count(h, 1) == 4, "utility point count should round-trip");
+    FleeceGoapPoint hp3 = fleece_goap_utility_point(h, 1, 3);
+    CHECK(hp3.x == 3 && hp3.y == 0.05, "utility points should round-trip");
 
     // Missions.
     CHECK(fleece_goap_mission_id(h, 0) != NULL && strcmp(fleece_goap_mission_id(h, 0), "m1") == 0,
@@ -705,6 +760,7 @@ int main(void) {
     test_registration();
     test_source_truncation();
     test_utility_and_selection();
+    test_utility_introspection();
     test_plan_basic();
     test_plan_already_satisfied();
     test_plan_no_solution();

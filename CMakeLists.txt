@@ -86,3 +86,36 @@ endforeach()
 
 # example5 also needs the local HTTP helper
 target_sources(example5_uav_swarm PRIVATE examples/http_server.c)
+
+# Python bindings (nanobind): a standalone fleece_goap_native module wrapping
+# only the planner + CBOR codec - not the rest of fleece (QuickJS, comms,
+# embedded, runtime) - for offline plan-authoring tools (e.g. the
+# swarmpu-groundstation GOAP mission editor). Off by default so the normal
+# firmware build never needs a C++ toolchain or a Python dev environment.
+option(FLEECE_BUILD_PYTHON_BINDINGS "Build the fleece_goap_native nanobind Python module" OFF)
+if(FLEECE_BUILD_PYTHON_BINDINGS)
+    enable_language(CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+    find_package(Python 3.9 COMPONENTS Interpreter Development.Module REQUIRED)
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        OUTPUT_VARIABLE NB_DIR
+    )
+    list(APPEND CMAKE_PREFIX_PATH "${NB_DIR}")
+    find_package(nanobind CONFIG REQUIRED)
+
+    nanobind_add_module(fleece_goap_native
+        bindings/python/fleece_goap_bindings.cpp
+        src/planner/fleece_planner.c
+        src/state/fleece_cbor.c
+        bindings/python/fleece_alloc_shim.c
+    )
+    target_include_directories(fleece_goap_native PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/planner"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/state"
+    )
+endif()

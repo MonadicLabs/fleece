@@ -959,6 +959,9 @@ uint32_t fleece_goap_action_count(const FleeceGoap* goap) { return goap ? goap->
 const char* fleece_goap_action_id(const FleeceGoap* goap, uint32_t idx) {
     return (goap && idx < goap->action_count) ? goap->actions[idx].id : NULL;
 }
+const char* fleece_goap_action_name(const FleeceGoap* goap, uint32_t idx) {
+    return (goap && idx < goap->action_count) ? goap->actions[idx].name : NULL;
+}
 uint32_t fleece_goap_action_pre_count(const FleeceGoap* goap, uint32_t idx) {
     return (goap && idx < goap->action_count) ? goap->actions[idx].pre_count : 0;
 }
@@ -987,6 +990,9 @@ uint32_t fleece_goap_goal_count(const FleeceGoap* goap) { return goap ? goap->go
 const char* fleece_goap_goal_id(const FleeceGoap* goap, uint32_t idx) {
     return (goap && idx < goap->goal_count) ? goap->goals[idx].id : NULL;
 }
+const char* fleece_goap_goal_name(const FleeceGoap* goap, uint32_t idx) {
+    return (goap && idx < goap->goal_count) ? goap->goals[idx].name : NULL;
+}
 const char* fleece_goap_goal_expr(const FleeceGoap* goap, uint32_t idx) {
     return (goap && idx < goap->goal_count) ? goap->goals[idx].expr : NULL;
 }
@@ -1007,6 +1013,40 @@ uint32_t fleece_goap_find_goal(const FleeceGoap* goap, const char* id) {
     if (!goap || !id) return UINT32_MAX;
     for (uint32_t i = 0; i < goap->goal_count; i++) {
         if (strcmp(goap->goals[i].id, id) == 0) return i;
+    }
+    return UINT32_MAX;
+}
+
+uint32_t fleece_goap_utility_count(const FleeceGoap* goap) { return goap ? goap->utility_count : 0; }
+const char* fleece_goap_utility_id(const FleeceGoap* goap, uint32_t idx) {
+    return (goap && idx < goap->utility_count) ? goap->utilities[idx].id : NULL;
+}
+const char* fleece_goap_utility_name(const FleeceGoap* goap, uint32_t idx) {
+    return (goap && idx < goap->utility_count) ? goap->utilities[idx].name : NULL;
+}
+const char* fleece_goap_utility_dim(const FleeceGoap* goap, uint32_t idx) {
+    return (goap && idx < goap->utility_count) ? goap->utilities[idx].dim : NULL;
+}
+double fleece_goap_utility_x_min(const FleeceGoap* goap, uint32_t idx) {
+    return (goap && idx < goap->utility_count) ? goap->utilities[idx].x_min : 0.0;
+}
+double fleece_goap_utility_x_max(const FleeceGoap* goap, uint32_t idx) {
+    return (goap && idx < goap->utility_count) ? goap->utilities[idx].x_max : 0.0;
+}
+uint32_t fleece_goap_utility_point_count(const FleeceGoap* goap, uint32_t idx) {
+    return (goap && idx < goap->utility_count) ? goap->utilities[idx].point_count : 0;
+}
+FleeceGoapPoint fleece_goap_utility_point(const FleeceGoap* goap, uint32_t idx, uint32_t i) {
+    if (goap && idx < goap->utility_count && i < goap->utilities[idx].point_count) {
+        return goap->utilities[idx].points[i];
+    }
+    FleeceGoapPoint zero = {0.0, 0.0};
+    return zero;
+}
+uint32_t fleece_goap_find_utility(const FleeceGoap* goap, const char* id) {
+    if (!goap || !id) return UINT32_MAX;
+    for (uint32_t i = 0; i < goap->utility_count; i++) {
+        if (strcmp(goap->utilities[i].id, id) == 0) return i;
     }
     return UINT32_MAX;
 }
