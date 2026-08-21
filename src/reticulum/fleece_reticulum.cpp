@@ -53,6 +53,12 @@ constexpr size_t kMaxPeers = 8;
  */
 constexpr uint32_t kAnnounceIntervalTicks = 50;
 
+/* Upper bound for one received packet. Generous versus the MTUs these radios
+ * actually run, and the host's receive callback is what truly bounds the copy
+ * anyway -- it is handed sizeof(buf) and returns what it wrote.
+ */
+constexpr size_t kRadioBufferBytes = 1024;
+
 FleeceReticulumConfig g_config = {};
 bool g_configured = false;
 
@@ -135,6 +141,69 @@ private:
 						 RNS::Type::NONE, RNS::Type::NONE};
 	uint32_t last_seen_tick_[kMaxPeers] = {0};
 	size_t count_ = 0;
+};
+
+/* A Reticulum interface backed by the host's two packet callbacks. This is
+ * the whole reason microReticulum stays invisible to integrators: they
+ * implement "send a packet" and "poll for a packet" over their own link, and
+ * this adapts that to whatever the mesh stack expects. Swapping the mesh
+ * implementation would rewrite this class and nothing on the host side.
+ */
+class HostRadioInterface : public RNS::InterfaceImpl {
+public:
+	HostRadioInterface() : RNS::InterfaceImpl("FleeceRadio") {}
+
+	void configure(uint32_t mtu, uint32_t bitrate)
+	{
+		_IN = true;
+		_OUT = true;
+		if (mtu > 0) {
+			_HW_MTU = static_cast<std::uint16_t>(mtu);
+		}
+		if (bitrate > 0) {
+			_bitrate = bitrate;
+		}
+	}
+
+	bool start() override
+	{
+		_online = true;
+		return true;
+	}
+
+	void stop() override { _online = false; }
+
+	void loop() override
+	{
+		if (!_online || g_config.radio_receive == nullptr) {
+			return;
+		}
+		/* Drain every packet currently available, not just one. A single
+		 * fleece tick can enqueue more than one outgoing frame (the self
+		 * stream and the shared/world stream are separate sends in the same
+		 * runtime iteration), so a receiver taking one packet per tick falls
+		 * permanently behind its own sender -- a backlog that only grows and
+		 * eventually overruns the host's buffering. Observed for real before
+		 * it was understood.
+		 */
+		uint8_t buf[kRadioBufferBytes];
+		uint32_t len;
+		while ((len = g_config.radio_receive(buf, sizeof(buf), g_config.user_data)) > 0) {
+			handle_incoming(RNS::Bytes(buf, len));
+		}
+	}
+
+private:
+	bool send_outgoing(const RNS::Bytes &data) override
+	{
+		bool ok = true;
+		if (_online && g_config.radio_send != nullptr) {
+			ok = g_config.radio_send(data.data(), static_cast<uint32_t>(data.size()),
+						  g_config.user_data);
+		}
+		InterfaceImpl::handle_outgoing(data);
+		return ok;
+	}
 };
 
 RNS::Reticulum *g_reticulum = nullptr;
@@ -342,7 +411,7 @@ extern "C" uint64_t fleece_reticulum_node_id(void)
 
 extern "C" bool fleece_reticulum_start(FleeceStateManager *state_manager)
 {
-	if (!g_configured || g_config.rns_interface == nullptr) {
+	if (!g_configured || g_config.radio_send == nullptr || g_config.radio_receive == nullptr) {
 		return false;
 	}
 	g_state_manager = state_manager;
@@ -364,8 +433,9 @@ extern "C" bool fleece_reticulum_start(FleeceStateManager *state_manager)
 		// start(), which is when Transport reads it.
 		RNS::Reticulum::transport_enabled(true);
 
-		static RNS::Interface interface(
-			static_cast<RNS::InterfaceImpl *>(g_config.rns_interface));
+		static HostRadioInterface radio;
+		radio.configure(g_config.radio_mtu, g_config.radio_bitrate);
+		static RNS::Interface interface(&radio);
 		RNS::Transport::register_interface(interface);
 		interface.start();
 

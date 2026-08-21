@@ -145,7 +145,13 @@ target_include_directories(fleece PUBLIC ${FLEECE_PUBLIC_INCLUDES})
 # built with its own flags; forcing LTO across that boundary buys little and
 # has a history of interacting badly with exceptions on embedded toolchains.
 target_compile_options(fleece PRIVATE $<$<COMPILE_LANGUAGE:C>:-Os> $<$<COMPILE_LANGUAGE:C>:-flto>)
-target_link_libraries(fleece PUBLIC qjs microReticulum)
+# microReticulum is PRIVATE: fleece's public headers expose none of its types
+# (include/reticulum/fleece_reticulum.h is plain C -- callbacks and byte
+# buffers), so consumers neither need nor should get its include paths. PUBLIC
+# would let a consumer reach through fleece and use Reticulum directly, which
+# is exactly the coupling this module exists to prevent -- and one did.
+target_link_libraries(fleece PUBLIC qjs)
+target_link_libraries(fleece PRIVATE microReticulum)
 
 # Target properties
 set_target_properties(fleece PROPERTIES

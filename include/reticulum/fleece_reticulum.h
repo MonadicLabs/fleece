@@ -15,8 +15,8 @@
  * What does NOT live here, and is supplied by the host through
  * FleeceReticulumConfig, is anything that needs a specific chip or OS:
  *
- *   - the radio itself (an RNS::InterfaceImpl the host constructs over its
- *     own UART/SPI/whatever),
+ *   - the radio itself, as a pair of send/receive callbacks over whatever
+ *     link the host has,
  *   - non-volatile storage for the identity key,
  *   - an entropy source and a device id,
  *   - a log sink.
@@ -86,12 +86,42 @@ typedef void (*FleeceReticulumLogFn)(const char *line, void *user_data);
 /* Receives one inbound control-channel packet (see the control aspect below). */
 typedef void (*FleeceReticulumControlRecvFn)(const uint8_t *data, uint32_t size, void *user_data);
 
+/* Sends one packet on the host's radio. Returns true if it went out.
+ *
+ * Packets, not bytes: message boundaries are the host's problem, because they
+ * are a property of its link. A packet radio has them natively; a transparent
+ * serial radio needs framing the host supplies. Either way fleece hands over
+ * one complete packet and gets one back, and never learns which it is.
+ */
+typedef bool (*FleeceRadioSendFn)(const uint8_t *data, uint32_t size, void *user_data);
+
+/* Polls for one received packet, copying it into `out`. Returns its length, or
+ * 0 if none is waiting. Must not block.
+ *
+ * Called repeatedly until it returns 0, so a host that has several packets
+ * buffered should return them one per call rather than dropping any: a single
+ * fleece tick can enqueue more than one outgoing frame, and a receiver that
+ * hands back only one per tick falls permanently behind its own sender.
+ */
+typedef uint32_t (*FleeceRadioReceiveFn)(uint8_t *out, uint32_t max_size, void *user_data);
+
 typedef struct FleeceReticulumConfig {
-	/* An RNS::InterfaceImpl* the host has constructed over its own radio
-	 * hardware, passed opaquely so this header stays C. fleece registers it
-	 * with Reticulum's Transport and drives it; it must outlive the runtime.
+	/* The host's radio. fleece wraps these in a Reticulum interface of its
+	 * own and drives it; microReticulum never appears in the host's code.
 	 */
-	void *rns_interface;
+	FleeceRadioSendFn radio_send;
+	FleeceRadioReceiveFn radio_receive;
+
+	/* Largest packet the radio accepts, in bytes. Reported to Reticulum as
+	 * the interface MTU, so it bounds what gets handed to radio_send.
+	 */
+	uint32_t radio_mtu;
+
+	/* Nominal link rate in bits/second. Used only for Reticulum's own
+	 * link-quality bookkeeping; fleece configures no hardware from it. 0
+	 * leaves it unset.
+	 */
+	uint32_t radio_bitrate;
 
 	/* Reticulum app name for both destinations, e.g. "swarmpu". The two
 	 * aspects underneath it are fixed: "<app_name>.fleece" carries gossip,
