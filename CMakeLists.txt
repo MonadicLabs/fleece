@@ -24,6 +24,13 @@ set(CMAKE_C_EXTENSIONS OFF)
 # QuickJS-ng (embedded JS engine). Configure before add_subdirectory so its own
 # options don't build the qjs/qjsc CLIs or install targets as part of this project.
 set(QJS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+# quickjs-ng unconditionally appends CMAKE_DL_LIBS (-ldl) to its link libraries.
+# Fine on a host, but there is no libdl on a bare-metal target and the link fails
+# with "cannot find -ldl". Nothing in fleece or quickjs calls dlopen(); this just
+# clears the stray requirement, gated to the case that is actually broken.
+if(CMAKE_CROSSCOMPILING)
+    set(CMAKE_DL_LIBS "" CACHE STRING "" FORCE)
+endif()
 add_subdirectory(third_party/quickjs EXCLUDE_FROM_ALL)
 
 # Source files
@@ -37,8 +44,14 @@ file(GLOB_RECURSE FLEECE_SRC
     "src/reticulum/*.cpp"
 )
 
-# Include directories
-include_directories(
+# Include directories, attached to the target rather than the directory.
+# include_directories() is directory-scoped: it works for everything built in
+# THIS CMakeLists (the library, its tests, its examples) but propagates nothing
+# to a parent project that add_subdirectory()s fleece and links the target. That
+# went unnoticed while the one embedded consumer hand-rolled its own copy of
+# this list; the moment it depended on the target properly, every fleece header
+# went missing. PUBLIC so consumers inherit them.
+set(FLEECE_PUBLIC_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/runtime"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/state"
@@ -50,13 +63,19 @@ include_directories(
 )
 
 # Library
-# microReticulum, for src/reticulum. If the enclosing build already defines the
-# target, use it as-is and do NOT fetch a second copy: an embedded integrator
-# typically needs to configure it for their platform first (allocator budget,
-# toolchain quirks, linking against an RTOS's own include interface), and that
-# configuration must not be silently duplicated or overridden from in here.
-# fleece only falls back to fetching when it is the top-level project -- a host
-# build, a test run, someone poking at it standalone.
+# microReticulum, for src/reticulum. fleece owns this dependency outright --
+# declaring it, pinning it, and configuring it -- because fleece is what uses
+# it. An integrator consumes fleece and gets a correctly configured mesh stack;
+# they do not have to know microReticulum exists.
+#
+# The knobs an integrator legitimately needs are cache variables below
+# (FLEECE_RNS_HEAP_POOL_BUFFER_SIZE, FLEECE_RNS_LOG_LEVEL), settable before
+# add_subdirectory(). Anything platform-specific that cannot be expressed that
+# way -- linking an RTOS's include interface, say -- is done by the integrator
+# against the targets afterwards.
+#
+# The guard remains for the case where an enclosing build genuinely defines its
+# own microReticulum first; that one wins, and nothing here second-guesses it.
 if(NOT TARGET microReticulum)
     include(FetchContent)
     # MonadicLabs' fork: upstream plus portability fixes (a vendor `RNG` macro
@@ -82,6 +101,17 @@ if(NOT TARGET microReticulum)
     set(RNS_PERSIST_KNOWN_DESTINATIONS OFF CACHE BOOL "" FORCE)
     set(RNS_PERSIST_HASHLIST OFF CACHE BOOL "" FORCE)
     set(RNS_USE_PROVISIONING OFF CACHE BOOL "" FORCE)
+
+    # A fixed-size TLSF pool rather than the system heap: on the targets fleece
+    # exists for, an unbounded allocator in the packet path is how you get a
+    # fragmentation failure hours into a flight. 80 KiB is a known-good budget
+    # from real use; override before add_subdirectory() if your target differs.
+    set(FLEECE_RNS_HEAP_POOL_BUFFER_SIZE 81920 CACHE STRING
+        "Bytes for microReticulum's TLSF pool allocator")
+    set(RNS_DEFAULT_ALLOCATOR RNS_HEAP_POOL_ALLOCATOR CACHE STRING "" FORCE)
+    set(RNS_CONTAINER_ALLOCATOR RNS_HEAP_POOL_ALLOCATOR CACHE STRING "" FORCE)
+    set(RNS_HEAP_POOL_BUFFER_SIZE ${FLEECE_RNS_HEAP_POOL_BUFFER_SIZE} CACHE STRING "" FORCE)
+
     FetchContent_MakeAvailable(rns_microreticulum)
 
     # microStore's headers select an implementation from whichever of these is
@@ -90,10 +120,27 @@ if(NOT TARGET microReticulum)
     # src/reticulum registers is not even declared -- found by building fleece
     # standalone, where nothing else had already set it (the embedded build
     # does, which is why it only showed up here).
-    target_compile_definitions(microReticulum PUBLIC USTORE_USE_NOOPFS)
+    set(FLEECE_RNS_LOG_LEVEL RNS_LOG_LEVEL_NONE CACHE STRING
+        "microReticulum log level; NONE by default since fleece registers no log callback")
+    target_compile_definitions(microReticulum PUBLIC
+        USTORE_USE_NOOPFS
+        RNS_LOG_LEVEL=${FLEECE_RNS_LOG_LEVEL}
+    )
+
+    # Position-independent code addresses every global indirectly through a GOT.
+    # On a target with no dynamic loader -- a single static ELF, which is every
+    # bare-metal and RTOS target fleece cares about -- nothing ever populates
+    # that table, so each lookup silently reads address 0 rather than faulting.
+    # That was a real, hard-to-find hang before it was understood. Cross-compiling
+    # is the available proxy for "no dynamic loader"; host builds keep PIC, where
+    # it is both harmless and needed if anything links fleece into a shared object.
+    if(CMAKE_CROSSCOMPILING)
+        set_target_properties(microReticulum CryptoLib PROPERTIES POSITION_INDEPENDENT_CODE OFF)
+    endif()
 endif()
 
 add_library(fleece ${FLEECE_SRC})
+target_include_directories(fleece PUBLIC ${FLEECE_PUBLIC_INCLUDES})
 # -Os -flto on the C sources only. The C++ side links microReticulum, which is
 # built with its own flags; forcing LTO across that boundary buys little and
 # has a history of interacting badly with exceptions on embedded toolchains.
@@ -105,8 +152,11 @@ set_target_properties(fleece PROPERTIES
     VERSION "${FLEECE_VERSION_MAJOR}.${FLEECE_VERSION_MINOR}.${FLEECE_VERSION_PATCH}"
     SOVERSION "${FLEECE_VERSION_MAJOR}"
     OUTPUT_NAME "fleece"
-    POSITION_INDEPENDENT_CODE ON
 )
+# PIC on for host builds (a shared-library consumer needs it), off when
+# cross-compiling -- see the microReticulum PIC comment above for why it is
+# actively harmful on a static-ELF target.
+set_target_properties(fleece PROPERTIES POSITION_INDEPENDENT_CODE $<NOT:$<BOOL:${CMAKE_CROSSCOMPILING}>>)
 
 # Tests: one executable + one ctest entry per tests/*.c file
 enable_testing()
