@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.10)
 
-project(fleece LANGUAGES C)
+# C AND C++: src/reticulum is C++ because microReticulum is. fleece's public
+# API stays plain C -- see include/reticulum/fleece_reticulum.h -- so C callers
+# are unaffected, but linking fleece now requires a C++ toolchain and runtime.
+project(fleece LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Project version
 set(FLEECE_VERSION_MAJOR 0)
@@ -28,6 +34,7 @@ file(GLOB_RECURSE FLEECE_SRC
     "src/embedded/*.c"
     "src/platform/*.c"
     "src/planner/*.c"
+    "src/reticulum/*.cpp"
 )
 
 # Include directories
@@ -38,13 +45,42 @@ include_directories(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/comms"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/embedded"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/planner"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/reticulum"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/state"
 )
 
 # Library
+# microReticulum, for src/reticulum. If the enclosing build already defines the
+# target, use it as-is and do NOT fetch a second copy: an embedded integrator
+# typically needs to configure it for their platform first (allocator budget,
+# toolchain quirks, linking against an RTOS's own include interface), and that
+# configuration must not be silently duplicated or overridden from in here.
+# fleece only falls back to fetching when it is the top-level project -- a host
+# build, a test run, someone poking at it standalone.
+if(NOT TARGET microReticulum)
+    include(FetchContent)
+    # MonadicLabs' fork: upstream plus portability fixes (a vendor `RNG` macro
+    # collision, and a missing <cstdint> in Utilities/Memory.h) without which
+    # this does not build on bare-metal/RTOS toolchains. Both are written to be
+    # upstream-able, so this can move back to attermann/microReticulum if they
+    # land there.
+    FetchContent_Declare(
+        rns_microreticulum
+        GIT_REPOSITORY https://github.com/MonadicLabs/microReticulum.git
+        GIT_TAG 3f06409a773a2637c5a696e394a909f4830013be
+    )
+    set(RNS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(RNS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(RNS_BUILD_INTEROP OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(rns_microreticulum)
+endif()
+
 add_library(fleece ${FLEECE_SRC})
-target_compile_options(fleece PRIVATE -Os -flto)
-target_link_libraries(fleece PUBLIC qjs)
+# -Os -flto on the C sources only. The C++ side links microReticulum, which is
+# built with its own flags; forcing LTO across that boundary buys little and
+# has a history of interacting badly with exceptions on embedded toolchains.
+target_compile_options(fleece PRIVATE $<$<COMPILE_LANGUAGE:C>:-Os> $<$<COMPILE_LANGUAGE:C>:-flto>)
+target_link_libraries(fleece PUBLIC qjs microReticulum)
 
 # Target properties
 set_target_properties(fleece PROPERTIES
