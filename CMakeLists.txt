@@ -72,7 +72,25 @@ if(NOT TARGET microReticulum)
     set(RNS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(RNS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(RNS_BUILD_INTEROP OFF CACHE BOOL "" FORCE)
+    # No filesystem-backed persistence: src/reticulum deliberately routes the
+    # only thing worth persisting (the identity key) through the host's own
+    # storage hooks instead, so Reticulum never needs to find a file. These
+    # gate persistence, not whether Reticulum looks for files at all, which is
+    # why a NoopFileSystem still has to be registered at runtime.
+    set(RNS_USE_FS OFF CACHE BOOL "" FORCE)
+    set(RNS_PERSIST_PATHS OFF CACHE BOOL "" FORCE)
+    set(RNS_PERSIST_KNOWN_DESTINATIONS OFF CACHE BOOL "" FORCE)
+    set(RNS_PERSIST_HASHLIST OFF CACHE BOOL "" FORCE)
+    set(RNS_USE_PROVISIONING OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(rns_microreticulum)
+
+    # microStore's headers select an implementation from whichever of these is
+    # defined first, and microReticulum unconditionally defines
+    # USTORE_USE_UNIVERSALFS. Without this override the NoopFileSystem adapter
+    # src/reticulum registers is not even declared -- found by building fleece
+    # standalone, where nothing else had already set it (the embedded build
+    # does, which is why it only showed up here).
+    target_compile_definitions(microReticulum PUBLIC USTORE_USE_NOOPFS)
 endif()
 
 add_library(fleece ${FLEECE_SRC})
