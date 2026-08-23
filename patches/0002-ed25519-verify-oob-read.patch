@@ -1,0 +1,24 @@
+diff --git a/src/microReticulum/Cryptography/Ed25519.h b/src/microReticulum/Cryptography/Ed25519.h
+index d1ff1ca..e44dfcb 100644
+--- a/src/microReticulum/Cryptography/Ed25519.h
++++ b/src/microReticulum/Cryptography/Ed25519.h
+@@ -50,6 +50,19 @@ namespace RNS { namespace Cryptography {
+ 		}
+ 
+ 		inline bool verify(const Bytes& signature, const Bytes& message) {
++			// Ed25519::verify() takes raw uint8_t[64]/uint8_t[32] pointers with
++			// no length parameter of its own -- it trusts the caller that
++			// `signature`/`_publicKey` really are that long, then reads
++			// exactly that many bytes (decodePoint() -> BigNumberUtil::unpackLE()).
++			// A short/malformed Bytes here (confirmed live: SIGSEGV in
++			// BigNumberUtil::unpackLE, reached via decodePoint(), reached via
++			// this verify() call, under real multi-peer announce traffic --
++			// a fresh peer's signing key not yet fully populated is one
++			// concrete way to get here) reads past its actual allocation.
++			// Reject cleanly instead of trusting undersized wire/identity data.
++			if (signature.size() != 64 || _publicKey.size() != 32) {
++				return false;
++			}
+ 			return Ed25519::verify(signature.data(), _publicKey.data(), message.data(), message.size());
+ 		}
+ 

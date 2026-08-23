@@ -35,6 +35,7 @@
 #define FLEECE_RETICULUM_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "state/fleece_state_manager.h"
@@ -197,6 +198,17 @@ void fleece_reticulum_control_send(const uint8_t *data, uint32_t size);
  */
 void fleece_reticulum_control_set_receive_callback(FleeceReticulumControlRecvFn callback,
 						    void *user_data);
+
+/* Test-only accessor for the largest gossip payload sendToAllPeers() will put
+ * directly into one RNS::Packet before falling back to a Resource/Link
+ * transfer (see fleece_reticulum.cpp). Mirrors Reticulum's own
+ * Type::Destination::ENCRYPTED_MDU derivation, evaluated against this node's
+ * actually-configured radio_mtu rather than Reticulum's own hardcoded MTU
+ * constant (500), which is larger than this project's real wire cap (460,
+ * see swarmpu's kMeshMtuBytes) and so unsafe to reuse directly. Requires
+ * fleece_reticulum_configure() to have been called first; 0 before that.
+ */
+size_t fleece_reticulum_single_packet_payload_ceiling(void);
 
 #ifdef __cplusplus
 }

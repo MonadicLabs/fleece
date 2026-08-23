@@ -78,7 +78,7 @@ void logf_line(const char *fmt, ...)
 	if (g_config.log == nullptr) {
 		return;
 	}
-	char buf[192];
+	char buf[256]; // was 192; the periodic status line grew four resource_* fields
 	va_list args;
 	va_start(args, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, args);
@@ -103,6 +103,16 @@ const char *app_name()
  * new one can start announcing at any time. Hence last-seen-tick plus
  * evict-oldest-when-full.
  */
+/* Aspect index into the per-peer link slots below: "fleece" gossip and
+ * "control" are different destinations (same identity, different aspect
+ * string), so a peer needing a Resource/Link fallback on both needs two
+ * independent links, not one.
+ */
+size_t aspect_index(const char *aspect)
+{
+	return std::strcmp(aspect, "control") == 0 ? 1 : 0;
+}
+
 class PeerTable {
 public:
 	void add(const RNS::Identity &identity, uint32_t now_tick)
@@ -129,18 +139,73 @@ public:
 				oldest = i;
 			}
 		}
+		teardown_links(oldest);
 		identities_[oldest] = identity;
 		last_seen_tick_[oldest] = now_tick;
 	}
 	size_t count() const { return count_; }
 	const RNS::Identity &identity(size_t i) const { return identities_[i]; }
 
+	/* Oversized-payload fallback (see sendToAllPeers()): a cached Link per
+	 * (peer, aspect), established on first need and reused for later
+	 * sends rather than re-handshaking every time. Returns nullptr if no
+	 * link has been established yet for this slot -- distinct from "the
+	 * Link object is default/NONE-constructed", which is NOT a safe test
+	 * here: Link's constructor always allocates a real backing object
+	 * even for a {Type::NONE} destination (confirmed against Link.cpp),
+	 * so operator bool() on a freshly-defaulted array slot would read
+	 * true. has_link_ is the actual source of truth.
+	 */
+	RNS::Link *link_for(size_t peer_index, size_t aspect_idx)
+	{
+		return has_link_[peer_index][aspect_idx] ? &links_[peer_index][aspect_idx] : nullptr;
+	}
+	void set_link(size_t peer_index, size_t aspect_idx, const RNS::Link &link)
+	{
+		links_[peer_index][aspect_idx] = link;
+		has_link_[peer_index][aspect_idx] = true;
+	}
+	/* Matches a closed/torn-down Link back to the (peer, aspect) slot that
+	 * cached it, by hash -- onLinkClosed() only gets the Link itself, not
+	 * which peer it belonged to.
+	 */
+	void note_link_closed(const RNS::Bytes &link_hash)
+	{
+		for (size_t i = 0; i < count_; i++) {
+			for (size_t a = 0; a < 2; a++) {
+				if (has_link_[i][a] && links_[i][a].hash().compare(link_hash) == 0) {
+					has_link_[i][a] = false;
+					return;
+				}
+			}
+		}
+	}
+
 private:
+	void teardown_links(size_t slot)
+	{
+		for (size_t a = 0; a < 2; a++) {
+			if (!has_link_[slot][a]) {
+				continue;
+			}
+			RNS::Type::Link::status st = links_[slot][a].status();
+			if (st == RNS::Type::Link::HANDSHAKE || st == RNS::Type::Link::ACTIVE) {
+				// Resolves any in-flight Resource for the evicted peer as a
+				// real FAILED/CORRUPT via its own concluded callback
+				// (counted) rather than silently orphaning it.
+				links_[slot][a].teardown();
+			}
+			has_link_[slot][a] = false;
+		}
+	}
+
 	RNS::Identity identities_[kMaxPeers] = {RNS::Type::NONE, RNS::Type::NONE, RNS::Type::NONE,
 						 RNS::Type::NONE, RNS::Type::NONE, RNS::Type::NONE,
 						 RNS::Type::NONE, RNS::Type::NONE};
 	uint32_t last_seen_tick_[kMaxPeers] = {0};
 	size_t count_ = 0;
+	RNS::Link links_[kMaxPeers][2];
+	bool has_link_[kMaxPeers][2] = {};
 };
 
 /* A Reticulum interface backed by the host's two packet callbacks. This is
@@ -220,6 +285,19 @@ uint32_t g_send_attempts = 0;
 uint32_t g_send_ok = 0;
 uint32_t g_send_fail = 0;
 
+/* Oversized-payload fallback counters -- deliberately separate from
+ * g_send_ok/g_send_fail above, which mean "this synchronous Packet attempt
+ * resolved this tick". A Resource transfer is multi-tick and async, so it
+ * needs its own vocabulary: started (kicked off this tick), link_pending
+ * (still handshaking, this tick's payload was dropped -- see
+ * sendViaResource()'s own comment), complete/failed (a concluded callback
+ * fired, on either the send or receive side).
+ */
+uint32_t g_resource_started = 0;
+uint32_t g_resource_link_pending = 0;
+uint32_t g_resource_complete = 0;
+uint32_t g_resource_failed = 0;
+
 bool g_identity_ready = false;
 uint64_t g_node_id = 0;
 RNS::Identity *g_identity_ptr = nullptr;
@@ -253,25 +331,253 @@ void onControlPacketReceived(const RNS::Bytes &data, const RNS::Packet & /*packe
 	}
 }
 
+/* Largest payload sendToAllPeers() will put directly into one RNS::Packet.
+ * Above this, a single Packet::send() would just fail against the real
+ * radio's own hard per-transmission cap (swarmpu's kMeshMtuBytes,
+ * configured here as g_config.radio_mtu -- see reticulum_bridge.cpp) with
+ * no retry and no queueing: confirmed live, fleece's own periodic status
+ * line showed sendfail climbing from ~15% to ~64% of sendcalls over a few
+ * thousand ticks under sustained gossip once a delta payload grew past
+ * that wall. sendToAllPeers() falls back to a Resource/Link transfer (see
+ * sendViaResource()) for anything over this ceiling instead of failing
+ * outright.
+ *
+ * Mirrors RNS::Type::Destination::ENCRYPTED_MDU's own derivation (Type.h)
+ * exactly, but evaluated against our REAL configured MTU rather than
+ * Reticulum's own hardcoded Type::Reticulum::MTU (500) -- larger than our
+ * real 460-byte wire cap, so unsafe to reuse as-is; every other term here
+ * is a named RNS::Type:: constant, not a second magic number.
+ */
+size_t single_packet_payload_ceiling()
+{
+	const size_t mtu = g_config.radio_mtu > 0 ? g_config.radio_mtu
+						   : static_cast<size_t>(RNS::Type::Reticulum::MTU);
+	const size_t header = RNS::Type::Reticulum::HEADER_MAXSIZE + RNS::Type::Reticulum::IFAC_MIN_SIZE;
+	const size_t crypto = RNS::Type::Identity::FERNET_OVERHEAD + RNS::Type::Identity::KEYSIZE / 16;
+	if (mtu <= header + crypto) {
+		return 0;
+	}
+	const size_t mdu = mtu - header;
+	return ((mdu - crypto) / RNS::Type::Identity::AES128_BLOCKSIZE) * RNS::Type::Identity::AES128_BLOCKSIZE - 1;
+}
+
+/* Fires when a Link this node opened (send-side) OR accepted (receive-side,
+ * see fleece_reticulum_start()'s set_link_established_callback) closes, for
+ * any reason -- timeout, teardown, the peer going away. Only send-side
+ * links are cached in PeerTable (receive-side ones belong to whichever peer
+ * opened them, symmetric but not something this node needs to track for
+ * its own future sends), so this just clears the cache entry if there is
+ * one; a no-op for a receive-side link.
+ */
+void onLinkClosed(RNS::Link &link)
+{
+	g_peers.note_link_closed(link.hash());
+}
+
+/* Send-side: a cached Link finished establishing. Nothing to do here --
+ * sendViaResource() re-checks status() live on its next call rather than
+ * trusting a cached "ready" flag, since a Link can also go stale/close
+ * between establishment and the next gossip tick. Kept as a real callback
+ * (not nullptr) purely for the log breadcrumb.
+ */
+void onOutgoingLinkEstablished(RNS::Link & /*link*/)
+{
+	log_line("fleece/reticulum: resource link established\n");
+}
+
+/* Shared by both directions on the "fleece" aspect: fires when a Resource
+ * this node SENT concludes (r.initiator() == true -- just count it, the
+ * data already left), and when a Resource this node RECEIVED concludes
+ * (r.initiator() == false -- deliver it, same as onPacketReceived() does
+ * for the Packet path, so gossip merges identically regardless of which
+ * transport a given frame arrived over). Fires for FAILED/CORRUPT/REJECTED
+ * too, not just COMPLETE -- must branch on status(), "the callback fired"
+ * alone does not mean success.
+ */
+void onFleeceResourceConcluded(const RNS::Resource &r)
+{
+	if (r.status() != RNS::Type::Resource::COMPLETE) {
+		g_resource_failed++;
+		logf_line("fleece/reticulum: resource FAILED status=%d initiator=%d\n",
+			  static_cast<int>(r.status()), static_cast<int>(r.initiator()));
+		return;
+	}
+	g_resource_complete++;
+	if (r.initiator()) {
+		return; // we sent it -- nothing more to do
+	}
+	if (g_state_manager != nullptr) {
+		g_packets_received++;
+		if (fleece_state_manager_import(g_state_manager, r.data().data(),
+						 static_cast<uint32_t>(r.data().size())) != 0) {
+			g_import_failures++;
+		}
+	}
+}
+
+/* Mirrors onFleeceResourceConcluded() for the "control" aspect: delivers to
+ * the host's control callback instead of the state manager, same as
+ * onControlPacketReceived() does for the Packet path.
+ */
+void onControlResourceConcluded(const RNS::Resource &r)
+{
+	if (r.status() != RNS::Type::Resource::COMPLETE) {
+		g_resource_failed++;
+		logf_line("fleece/reticulum: control resource FAILED status=%d initiator=%d\n",
+			  static_cast<int>(r.status()), static_cast<int>(r.initiator()));
+		return;
+	}
+	g_resource_complete++;
+	if (r.initiator()) {
+		return;
+	}
+	if (g_control_callback != nullptr) {
+		g_control_callback(r.data().data(), static_cast<uint32_t>(r.data().size()),
+				    g_control_callback_user_data);
+	}
+}
+
+/* Receive-side: a peer opened a Link to this node's "fleece"/"control"
+ * destination (only ever done to send an oversized payload as a Resource --
+ * everything that fits stays on the Packet path). ACCEPT_ALL: any peer that
+ * can reach this destination is already a trusted mesh member by the same
+ * standard Packet-based gossip already trusts, so there is no separate
+ * admission decision to make here.
+ */
+void onFleeceIncomingLinkEstablished(RNS::Link &link)
+{
+	link.set_resource_strategy(RNS::Type::Link::ACCEPT_ALL);
+	link.set_resource_concluded_callback(&onFleeceResourceConcluded);
+	link.set_link_closed_callback(&onLinkClosed);
+}
+
+void onControlIncomingLinkEstablished(RNS::Link &link)
+{
+	link.set_resource_strategy(RNS::Type::Link::ACCEPT_ALL);
+	link.set_resource_concluded_callback(&onControlResourceConcluded);
+	link.set_link_closed_callback(&onLinkClosed);
+}
+
+/* Oversized-payload fallback for one peer: establishes (or reuses) a Link
+ * to it and sends `payload` as a Resource instead of a Packet. Link
+ * establishment is asynchronous, so a link that isn't ACTIVE yet just
+ * drops this tick's payload rather than queueing it -- the tick loop
+ * (fleece_runtime.c) already advances its gossip watermark unconditionally
+ * after every export regardless of send success, so a dropped oversized
+ * delta is simply superseded by the next tick's fresher export. Queueing
+ * would need a new statically-sized per-peer buffer of unclear worst-case
+ * size, against this module's existing bounded-allocation discipline.
+ */
+void sendViaResource(size_t peer_index, size_t aspect_idx, const RNS::Identity &id, const char *aspect,
+		      const RNS::Bytes &payload, RNS::Resource::Callbacks::concluded concluded_cb)
+{
+	RNS::Link *link = g_peers.link_for(peer_index, aspect_idx);
+	if (link != nullptr) {
+		RNS::Type::Link::status st = link->status();
+		if (st == RNS::Type::Link::CLOSED || st == RNS::Type::Link::STALE) {
+			link = nullptr; // dead -- fall through to re-establish
+		}
+	}
+	if (link == nullptr) {
+		RNS::Destination peer_destination(id, RNS::Type::Destination::OUT,
+						   RNS::Type::Destination::SINGLE, app_name(), aspect);
+		RNS::Link new_link(peer_destination, &onOutgoingLinkEstablished, &onLinkClosed);
+		g_peers.set_link(peer_index, aspect_idx, new_link);
+		g_resource_link_pending++;
+		return;
+	}
+	if (link->status() == RNS::Type::Link::PENDING || link->status() == RNS::Type::Link::HANDSHAKE) {
+		g_resource_link_pending++;
+		return;
+	}
+	RNS::Resource resource =
+		RNS::Resource(payload, *link).auto_compress(false).set_concluded_callback(concluded_cb).start();
+	(void)resource; // kept alive via Link::register_outgoing_resource(), not this local
+	g_resource_started++;
+}
+
 /* Sends to every known peer's own destination individually. "Broadcast" is
  * this node's responsibility, not Reticulum's, because SINGLE destinations are
  * per-identity rather than a shared name. `aspect` picks which of a peer's two
  * destinations to address -- same identity, different aspect, so a different
  * destination hash either way.
+ *
+ * Packet stays the fast path for anything that fits in one -- steady-state
+ * delta gossip is supposed to be small by design, and paying a Link's
+ * handshake/keepalive overhead on every peer every tick for the common case
+ * would be a real regression. Only a payload over single_packet_payload_ceiling()
+ * falls back to sendViaResource().
  */
 void sendToAllPeers(const char *aspect, const RNS::Bytes &payload)
 {
+	const size_t aspect_idx = aspect_index(aspect);
+	const bool is_control = (aspect_idx == 1);
+	/* Memory backstop (single-variant heap sizing): Reticulum's
+	 * fixed TLSF pool is finite and shared (FLEECE_RNS_HEAP_POOL_BUFFER_SIZE).
+	 * When it runs low, RNS::Packet / RNS::Destination construction throws
+	 * std::bad_alloc (seen live as a full 32-peer mesh wedge) -- and a dropped
+	 * packet must never halt the fan-out to the rest. Rather than catch-and-retry
+	 * (which still pays the allocation attempt), shed BEFORE allocating: if the
+	 * pool's contiguous free space falls under a red line, stop trying to send
+	 * this tick. That is the graceful-degrade the node is expected to do -- a
+	 * memory-poor node goes quiet like a lost one, and peer-liveness already
+	 * swallows that shape. Logging the shed explicitly is what lets an operator
+	 * (or a simulation) tell "memory-pressure shedding" from a real radio loss.
+	 *
+	 * The check is per sendToAllPeers() call, not per peer: under pressure the
+	 * whole fan-out is skipped together rather than first-N-succeed-N+1-throw,
+	 * which is both cheaper and fairer -- and it means no partially-sent tick
+	 * with a packet only half the mesh received.
+	 *
+	 * Thresholds are deliberate: WARN at 50% still-allocating (observability),
+	 * DROP only below 10% free (the allocator still has 10% of the pool to make
+	 * the Destination/Packet objects it already committed to). Tuning these
+	 * (or the pool itself) is per-target; see the bailout comment on
+	 * FLEECE_RNS_HEAP_POOL_BUFFER_SIZE.
+	 */
+	const size_t pool_free = RNS::Utilities::Memory::heap_pool_free();
+	const size_t pool_tot  = RNS::Utilities::Memory::heap_pool_size();
+	if (pool_tot > 0 && pool_free * 2 < pool_tot) {
+		if (pool_free * 10 < pool_tot) {
+			/* Under 10% of the pool is free: drop this fan-out entirely rather
+			 * than let the next RNS::Packet throw bad_alloc. Log once per tick
+			 * avalanche, not per peer, so the drop is visible but not a flood. */
+			if (aspect_idx == 0) {
+				g_send_fail++;  /* account the dropped send like a failed one */
+				logf_line("fleece/reticulum: DEPRIORITIZING gossip send (pool %.1f%% free) -- shedding this tick\n",
+					  (double)pool_free / (double)pool_tot * 100.0);
+			}
+			return;
+		}
+		if (aspect_idx == 0) {
+			logf_line("fleece/reticulum: gossip pool pressure %u%% free\n",
+				  (unsigned)(pool_free * 100 / pool_tot));
+		}
+	}
+
 	g_send_attempts++;
+	RNS::Resource::Callbacks::concluded concluded_cb =
+		is_control ? &onControlResourceConcluded : &onFleeceResourceConcluded;
+	const bool oversized = payload.size() > single_packet_payload_ceiling();
+
 	for (size_t i = 0; i < g_peers.count(); i++) {
+		if (oversized) {
+			sendViaResource(i, aspect_idx, g_peers.identity(i), aspect, payload, concluded_cb);
+			continue;
+		}
 		try {
 			RNS::Destination peer_destination(g_peers.identity(i), RNS::Type::Destination::OUT,
-							   RNS::Type::Destination::SINGLE, app_name(), aspect);
+						   RNS::Type::Destination::SINGLE, app_name(), aspect);
 			RNS::Packet packet(peer_destination, payload);
 			packet.send();
 			g_send_ok++;
-		} catch (...) {
+		} catch (const std::exception &e) {
 			// One bad peer must not stop the fan-out to the rest.
 			g_send_fail++;
+			logf_line("fleece/reticulum: send to peer %zu (%s) threw: %s\n", i, aspect, e.what());
+		} catch (...) {
+			g_send_fail++;
+			logf_line("fleece/reticulum: send to peer %zu (%s) threw non-std exception\n", i, aspect);
 		}
 	}
 }
@@ -464,6 +770,9 @@ extern "C" bool fleece_reticulum_start(FleeceStateManager *state_manager)
 		static RNS::Destination destination(identity, RNS::Type::Destination::IN,
 						     RNS::Type::Destination::SINGLE, app_name(), "fleece");
 		destination.set_packet_callback(&onPacketReceived);
+		// Oversized-payload fallback (see sendToAllPeers()): accepts a Link a
+		// peer opens to send a Resource-based transfer instead of a Packet.
+		destination.set_link_established_callback(&onFleeceIncomingLinkEstablished);
 		g_destination = &destination;
 
 		// A second, independent destination for host-directed traffic. Same
@@ -474,6 +783,7 @@ extern "C" bool fleece_reticulum_start(FleeceStateManager *state_manager)
 							     RNS::Type::Destination::SINGLE, app_name(),
 							     "control");
 		control_destination.set_packet_callback(&onControlPacketReceived);
+		control_destination.set_link_established_callback(&onControlIncomingLinkEstablished);
 		g_control_destination = &control_destination;
 
 		// One shared peer table fed by announces from either destination. An
@@ -523,10 +833,14 @@ extern "C" void fleece_reticulum_poll(void * /*user_data*/)
 			// breadcrumb trail of peer count over time, cheap enough to
 			// leave on for real hardware.
 			logf_line("fleece/reticulum: tick=%u peers=%u rx=%u rxfail=%u sendcalls=%u "
-				  "sendok=%u sendfail=%u\n",
+				  "sendok=%u sendfail=%u resource_started=%u resource_pending=%u "
+				  "resource_complete=%u resource_failed=%u pool_free=%u pool_tot=%u\n",
 				  g_poll_tick_count, static_cast<unsigned>(g_peers.count()),
 				  g_packets_received, g_import_failures, g_send_attempts, g_send_ok,
-				  g_send_fail);
+				  g_send_fail, g_resource_started, g_resource_link_pending,
+				  g_resource_complete, g_resource_failed,
+				  static_cast<unsigned>(RNS::Utilities::Memory::heap_pool_free()),
+				  static_cast<unsigned>(RNS::Utilities::Memory::heap_pool_size()));
 			if (g_destination != nullptr) {
 				g_destination->announce();
 			}
@@ -553,4 +867,12 @@ extern "C" void fleece_reticulum_control_set_receive_callback(FleeceReticulumCon
 {
 	g_control_callback = callback;
 	g_control_callback_user_data = user_data;
+}
+
+extern "C" size_t fleece_reticulum_single_packet_payload_ceiling(void)
+{
+	if (!g_configured) {
+		return 0;
+	}
+	return single_packet_payload_ceiling();
 }

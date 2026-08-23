@@ -83,10 +83,37 @@ if(NOT TARGET microReticulum)
     # this does not build on bare-metal/RTOS toolchains. Both are written to be
     # upstream-able, so this can move back to attermann/microReticulum if they
     # land there.
+    #
+    # patches/: local overrides pending that same upstreaming --
+    # 0001-transport-outbound-reentrancy-deadlock.patch: live two-node
+    # testing found Transport::jobs() -> Link::tick_resources() ->
+    # Resource::cancel() -> Transport::outbound() self-deadlocks --
+    # outbound() opens with `while (_jobs_running) OS::sleep(...)`, a guard
+    # written for the upstream Python design's separate resource-watchdog
+    # thread, but this port ticks resources synchronously from inside
+    # jobs() itself (no real watchdog thread implemented), so outbound()
+    # ends up waiting on a flag only the very jobs() call it interrupted
+    # would ever clear. Any resource cancellation (a normal timeout, not
+    # just an error case) hangs the node forever.
+    # 0002-ed25519-verify-oob-read.patch: live multi-drone testing (adding
+    # peers through swarm control, then issuing a takeoff order) found a
+    # real SIGSEGV in BigNumberUtil::unpackLE(), reached via
+    # Ed25519::decodePoint(), reached via Ed25519PublicKey::verify() --
+    # that verify() forwards `Bytes` buffers straight into a raw
+    # uint8_t[64]/uint8_t[32]-array-expecting C function with no length
+    # parameter of its own and no size check before the call, so a
+    # short/malformed signature or public key (plausible under real
+    # multi-peer announce churn) reads past its actual allocation.
+    # See each patch's own comment for the fix.
     FetchContent_Declare(
         rns_microreticulum
         GIT_REPOSITORY https://github.com/MonadicLabs/microReticulum.git
         GIT_TAG 3f06409a773a2637c5a696e394a909f4830013be
+        # patches/apply.sh: a real script file, not an inline shell one-liner
+        # here -- CMake treats unescaped `;` in a bare PATCH_COMMAND argument
+        # as its own list separator, which silently mangles any inline
+        # script containing `;`/`&&` chains (confirmed live).
+        PATCH_COMMAND sh ${CMAKE_CURRENT_LIST_DIR}/patches/apply.sh
     )
     set(RNS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(RNS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)

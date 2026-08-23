@@ -1,0 +1,42 @@
+diff --git a/src/microReticulum/Transport.cpp b/src/microReticulum/Transport.cpp
+index 89b5238..4bbc0de 100644
+--- a/src/microReticulum/Transport.cpp
++++ b/src/microReticulum/Transport.cpp
+@@ -545,12 +545,37 @@ DestinationEntry empty_destination_entry;
+ 				// const_cast mirrors the pattern used elsewhere when
+ 				// iterating std::set<Link> — the wrapper is const but
+ 				// shared_ptr-backed mutation is the codebase convention.
++				//
++				// _jobs_running is cleared for the DURATION of this loop only:
++				// a resource watchdog can decide to cancel() (timeout, failed
++				// retry, ...), and cancel() sends a packet through
++				// Transport::outbound(), which opens with
++				// `while (_jobs_running) OS::sleep(...)` -- a guard meant to
++				// keep an OUTSIDE caller (a different thread, in the upstream
++				// Python design where resource watchdogs run on their own
++				// thread) from racing jobs()'s own bookkeeping. Ticking
++				// resources synchronously from inside jobs() itself (this
++				// port's own cooperative-scheduling adaptation, no real
++				// watchdog thread) breaks that assumption: outbound() ends up
++				// waiting for a flag only the very call frame it interrupted
++				// would ever clear, hanging the whole node forever. Confirmed
++				// live: a real 615 B oversized gossip delta drove a Resource
++				// through ADVERTISED -> timeout -> cancel() -> outbound(),
++				// which then spun on OS::sleep(0.0005) in `while(_jobs_running)`
++				// indefinitely -- the process never produced another log line.
++				// Safe to drop the guard here specifically: nothing else can
++				// run concurrently in this cooperative model, and
++				// tick_resources() itself never touches the collections
++				// (_pending_links/_active_links/receipts) the guard actually
++				// protects elsewhere in jobs().
++				_jobs_running = false;
+ 				for (auto& link_const : active_links) {
+ 					Link& link = const_cast<Link&>(link_const);
+ 					if (link.status() != Type::Link::CLOSED) {
+ 						link.tick_resources();
+ 					}
+ 				}
++				_jobs_running = true;
+ 
+ 				_links_last_checked = OS::time();
+ 			}
