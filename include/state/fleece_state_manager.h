@@ -4,6 +4,7 @@
 #ifndef FLEECE_STATE_MANAGER_H
 #define FLEECE_STATE_MANAGER_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
