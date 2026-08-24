@@ -199,6 +199,30 @@ void fleece_reticulum_control_send(const uint8_t *data, uint32_t size);
 void fleece_reticulum_control_set_receive_callback(FleeceReticulumControlRecvFn callback,
 						    void *user_data);
 
+/* Fires after every inbound gossip frame is merged, reporting whether THIS
+ * node's view of the shared/"world" stream diverges from the sender's
+ * (fleece_state_manager_import_ex's digest check). TRUE usually means "a delta
+ * was dropped somewhere - run a targeted repair against this peer"; FALSE
+ * confirms we are current.
+ *
+ * This is how the runtime's on-demand resync learns about gaps when the mesh
+ * transport is in play: inbound gossip merges inside this module (it never
+ * passes through FleeceComms' receive path), so without this callback the
+ * runtime would never see a behind report and dropped deltas would only heal
+ * by luck.
+ */
+typedef void (*FleeceReticulumGapFn)(bool behind_shared, void *user_data);
+
+void fleece_reticulum_set_gap_callback(FleeceReticulumGapFn callback, void *user_data);
+
+/* Sends one packet ONLY to the peer whose fleece node id is given (node ids
+ * are derived from identity hashes, see fleece_reticulum_node_id()). Single-
+ * packet path only - handshake-sized payloads, not general bulk transfer.
+ * Returns false if the peer is unknown or the send failed, leaving the caller
+ * free to fall back to fan-out or retry.
+ */
+bool fleece_reticulum_send_to_node(uint64_t node_id, const uint8_t *data, uint32_t size);
+
 /* Test-only accessor for the largest gossip payload sendToAllPeers() will put
  * directly into one RNS::Packet before falling back to a Resource/Link
  * transfer (see fleece_reticulum.cpp). Mirrors Reticulum's own

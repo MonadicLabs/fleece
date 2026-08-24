@@ -78,7 +78,12 @@ bool fleece_state_manager_exists(FleeceStateManager* manager, uint32_t key);
 // Remove a field (raw key, scoped to the local node's own fields)
 int fleece_state_manager_remove(FleeceStateManager* manager, uint32_t key);
 
-// Compact memory (remove tombstones)
+// Compact memory. Drops tombstones for legacy unnamed (raw-key) entries and
+// reclaims their slots. NAMED tombstones are RETAINED: a delete-marker is
+// convergence metadata - dropping it lets a stale replica's older live copy
+// resurrect the deleted field on the next resync. Named tombstones carry no
+// payload (one slot, no data buffer), so retaining them is cheap; they exist
+// because deletes must outlive any peer that has not yet heard about them.
 int fleece_state_manager_compact(FleeceStateManager* manager);
 
 // Get field version info (raw key, scoped to the local node's own fields)
@@ -178,16 +183,32 @@ int fleece_state_manager_set_shared_cas(FleeceStateManager* manager, const char*
 // Gossip wire frames are real CBOR (RFC 8949), not a bespoke format: a 3-byte
 // ['F']['G'][version] prefix (a quick sanity/version check that isn't itself
 // part of the CBOR payload) followed by a CBOR-encoded
-// [owner_node_id, hw, [record, record, ...]] array. `hw` is the sender's
-// per-stream high-water mark: the highest record timestamp it holds for that
-// stream, embedded so a receiver can detect it has fallen behind (missed a
-// delta) and request a full resync on demand - see fleece_state_manager_import_ex.
+// [owner_node_id, hw, digest, [record, record, ...]] array.
+//
+// `hw` is the sender's per-stream high-water mark: the highest record timestamp
+// it holds for that stream - kept for diagnostics and resync probing.
+//
+// `digest` is an order-independent 64-bit hash (FNV-1a sum of per-entry hashes)
+// over the sender's LIVE entries for that stream. The receiver computes the same
+// digest over what it stores and compares: any divergence - not just a missing
+// newest record, which is all the v3 scalar-hw check could catch - flags the
+// receiver as behind and triggers an on-demand full resync. Tombstones are
+// excluded from the digest on both sides, so they cannot cause phantom
+// mismatch; deletes travel as records and persist until every peer has applied
+// them (see fleece_state_manager_compact).
+//
 // A self-stream record is [is_tombstone, name, timestamp, data]; a
 // shared/"world"-stream record additionally carries its author up front:
 // [origin_node_id, is_tombstone, name, timestamp, data] (see
 // fleece_state_manager_merge_shared). Only the CBOR major types actually needed
 // here are supported (uint, bstring, tstring, array, bool) - this is not a
 // general-purpose CBOR codec.
+//
+// Note: as of the world-centric model, the runtime only gossips the SHARED
+// stream - each node's "self" object is node-local storage. A node publishes a
+// self field to the swarm by writing it to world explicitly (see
+// fleece_state_manager_set_shared). The self-stream export/import API remains
+// for tests and offline tooling.
 
 // Export the local node's own named fields as a gossip wire frame (full state)
 int fleece_state_manager_export(FleeceStateManager* manager, uint8_t** frame_data, uint32_t* frame_size);
@@ -234,6 +255,66 @@ int fleece_state_manager_import_ex(FleeceStateManager* manager, const uint8_t* f
 uint64_t fleece_state_manager_get_self_hw(FleeceStateManager* manager);
 uint64_t fleece_state_manager_get_shared_hw(FleeceStateManager* manager);
 uint64_t fleece_state_manager_get_peer_self_hw(FleeceStateManager* manager, uint64_t peer_id);
+
+// Order-independent 64-bit digest over the LIVE (non-tombstoned) named entries
+// owned by owner_node_id - the same value a gossip frame carries in its `digest`
+// field. Two nodes hold identical views of a stream iff this digest matches
+// (modulo hash collisions); used by import gap detection and by tests to assert
+// convergence. Returns 0 on success, -1 on bad arguments.
+// Ticks elapsed since the local node last WROTE any field (set/remove/CAS,
+// named or shared). Returns UINT64_MAX if this node never wrote anything.
+// Used to distinguish "my view differs because I just changed things" (benign
+// churn - do not repair) from "my view differs because a delta was lost"
+// (worth repairing): anti-entropy repairs are meaningful only once the local
+// node has gone quiet.
+uint64_t fleece_state_manager_ticks_since_last_write(FleeceStateManager* manager);
+
+int fleece_state_manager_stream_digest(FleeceStateManager* manager, uint64_t owner_node_id, uint64_t* digest_out);
+
+// --- Targeted anti-entropy (control frames) ---------------------------------
+//
+// A digest mismatch says "our views differ" - but under ordinary churn that is
+// usually BENIGN CONCURRENCY (each side holds a fresh write the other has not
+// heard yet), not a lost packet. Answering every mismatch with a full-snapshot
+// pull wastes O(world) airtime on gaps that are often empty. These helpers
+// support the cheap two-step repair instead:
+//
+//   1. receiver asks the sender for its stream INDEX,
+//   2. receiver diffs the index against its own store (entry present? whose
+//      timestamp is newer?), and requests ONLY the keys it is missing or
+//      stale on; the reply is a normal gossip frame carrying just those
+//      records, merged by the regular import path.
+//
+// Control frames carry a ['F']['X'][version] prefix followed by tagged CBOR.
+// This version constant is SHARED with the runtime's FX frame parser
+// (FLEECE_RESYNC_VERSION in fleece_runtime.c) - if they disagree, every index
+// reply is silently rejected at the receiver's version check. They last moved
+// together at v2 (origin_node_id added for unicast routing).
+#define FLEECE_CONTROL_PROTOCOL_VERSION 2
+//   [1, [[key_hash, timestamp], ...]]          - stream index reply
+//   [2, [key_hash, ...]]                       - value request (which keys)
+// The value reply is a NORMAL gossip frame (['F']['G'][version] ...) filtered
+// to the requested keys, so it merges through the standard import path with
+// no special handling on the receiving side.
+
+// Export the shared/"world" stream index: [['F']['X'][version], [1, entries]]
+// where entries is [[name_hash, timestamp], ...] over LIVE entries only.
+// Tombstones are deliberately absent: their absence plus a stale timestamp in
+// the requester's store is indistinguishable from "nothing to fetch", which is
+// exactly the semantics a deleted key should have.
+int fleece_state_manager_export_shared_index(FleeceStateManager* manager, uint8_t** frame_data, uint32_t* frame_size);
+
+// Export a NORMAL gossip frame containing only the live shared entries whose
+// key hash appears in hashes[] (unknown hashes simply match nothing). Used to
+// answer a value request; mergeable via fleece_state_manager_import like any
+// other gossip frame.
+int fleece_state_manager_export_shared_by_hash(FleeceStateManager* manager, const uint32_t* hashes, uint32_t count, uint8_t** frame_data, uint32_t* frame_size);
+
+// Local check used when diffing an index against the store: returns 1 if the
+// shared stream already holds an entry (live OR tombstone) for key_hash with
+// timestamp >= ts (nothing to fetch), 0 if the key is missing or stale
+// (fetch it), -1 on bad arguments.
+int fleece_state_manager_shared_at_least(FleeceStateManager* manager, uint32_t key_hash, uint64_t ts);
 
 #ifdef __cplusplus
 }

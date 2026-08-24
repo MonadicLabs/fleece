@@ -52,6 +52,31 @@ int fleece_runtime_set_peer_ttl_ticks(FleeceRuntime* runtime, uint64_t ttl_ticks
 // Start the runtime's main loop
 int fleece_runtime_start(FleeceRuntime* runtime);
 
+// --- Transport-agnostic inbound hooks ---------------------------------------
+//
+// The built-in comms path delivers frames through fleece_comms_set_receive_callback.
+// Transports that merge or route inbound traffic themselves (e.g. the Reticulum
+// module, whose gossip aspect merges inside the module and whose control aspect
+// arrives via a separate callback) use these entry points instead, so gap
+// detection and the targeted-repair handshake work identically regardless of
+// which transport delivered the bytes.
+
+// Feed one inbound GOSSIP wire frame (a ['F']['G'] CBOR frame) that was NOT
+// delivered through FleeceComms - e.g. merged by an out-of-band transport.
+// Runs the normal import plus resync bookkeeping under the pseudo-source
+// "mesh". Do NOT also feed the same frame through comms' receive path.
+void fleece_runtime_on_gossip_frame(FleeceRuntime* runtime, const uint8_t* data, uint32_t size);
+
+// Feed one inbound CONTROL frame (an ['F']['X'] index/value-request frame).
+void fleece_runtime_on_control_frame(FleeceRuntime* runtime, const uint8_t* data, uint32_t size);
+
+// Report the transport's view-digest status after merging a peer's gossip:
+// behind_shared == true means this node is missing something the sender holds
+// (schedule a targeted repair), false means current. Under the built-in comms
+// path this bookkeeping happens automatically; transports that merge in-band
+// call this instead.
+void fleece_runtime_note_behind_shared(FleeceRuntime* runtime, bool behind_shared);
+
 // Stop the runtime's main loop
 void fleece_runtime_stop(FleeceRuntime* runtime);
 

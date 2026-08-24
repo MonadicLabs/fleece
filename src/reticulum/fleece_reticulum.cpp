@@ -33,6 +33,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -277,6 +278,8 @@ RNS::Destination *g_control_destination = nullptr;
 FleeceStateManager *g_state_manager = nullptr;
 FleeceReticulumControlRecvFn g_control_callback = nullptr;
 void *g_control_callback_user_data = nullptr;
+FleeceReticulumGapFn g_gap_callback = nullptr;
+void *g_gap_callback_user_data = nullptr;
 PeerTable g_peers;
 uint32_t g_poll_tick_count = 0;
 uint32_t g_packets_received = 0;
@@ -312,15 +315,48 @@ public:
 	}
 };
 
-void onPacketReceived(const RNS::Bytes &data, const RNS::Packet & /*packet*/)
+/* Merges one inbound gossip frame and reports divergence. import_ex (not
+ * plain import) is deliberate: the digest check is the ONLY place gap
+ * detection happens now that delta gossip is push-only - without reporting
+ * `behind_shared` upward, a node that missed a delta would never repair it.
+ */
+void import_gossip_frame(const uint8_t *data, uint32_t size)
 {
 	if (g_state_manager != nullptr) {
 		g_packets_received++;
-		if (fleece_state_manager_import(g_state_manager, data.data(),
-						 static_cast<uint32_t>(data.size())) != 0) {
+		bool behind_shared = false;
+		if (fleece_state_manager_import_ex(g_state_manager, data, size,
+						   NULL, &behind_shared) != 0) {
 			g_import_failures++;
 		}
+		if (g_gap_callback != nullptr) {
+			g_gap_callback(behind_shared, g_gap_callback_user_data);
+		}
 	}
+}
+
+/* True for fleece's own control-channel frames ('F','X' prefix: index/value
+ * request handshakes). They share the gossip aspect's transport because it is
+ * the path that provably works over every radio - the separate "control"
+ * destination depends on its own announces/paths being established, which on
+ * some transports lags long after gossip already flows.
+ */
+static bool is_fx_control_frame(const uint8_t *data, uint32_t size)
+{
+	return size >= 3 && data[0] == 'F' && data[1] == 'X';
+}
+
+void onPacketReceived(const RNS::Bytes &data, const RNS::Packet & /*packet*/)
+{
+	const uint8_t *bytes = data.data();
+	uint32_t size = static_cast<uint32_t>(data.size());
+	if (is_fx_control_frame(bytes, size)) {
+		if (g_control_callback != nullptr) {
+			g_control_callback(bytes, size, g_control_callback_user_data);
+		}
+		return;
+	}
+	import_gossip_frame(bytes, size);
 }
 
 void onControlPacketReceived(const RNS::Bytes &data, const RNS::Packet & /*packet*/)
@@ -407,10 +443,14 @@ void onFleeceResourceConcluded(const RNS::Resource &r)
 		return; // we sent it -- nothing more to do
 	}
 	if (g_state_manager != nullptr) {
-		g_packets_received++;
-		if (fleece_state_manager_import(g_state_manager, r.data().data(),
-						 static_cast<uint32_t>(r.data().size())) != 0) {
-			g_import_failures++;
+		const uint8_t *bytes = r.data().data();
+		uint32_t size = static_cast<uint32_t>(r.data().size());
+		if (!is_fx_control_frame(bytes, size)) {
+			import_gossip_frame(bytes, size);
+			return;
+		}
+		if (g_control_callback != nullptr) {
+			g_control_callback(bytes, size, g_control_callback_user_data);
 		}
 	}
 }
@@ -867,6 +907,35 @@ extern "C" void fleece_reticulum_control_set_receive_callback(FleeceReticulumCon
 {
 	g_control_callback = callback;
 	g_control_callback_user_data = user_data;
+}
+
+extern "C" void fleece_reticulum_set_gap_callback(FleeceReticulumGapFn callback, void *user_data)
+{
+	g_gap_callback = callback;
+	g_gap_callback_user_data = user_data;
+}
+
+extern "C" bool fleece_reticulum_send_to_node(uint64_t node_id, const uint8_t *data, uint32_t size)
+{
+	try {
+		for (size_t i = 0; i < g_peers.count(); i++) {
+			const RNS::Bytes &h = g_peers.identity(i).hash();
+			if (h.data() == nullptr || h.size() < sizeof(node_id)) continue;
+			uint64_t candidate;
+			std::memcpy(&candidate, h.data(), sizeof(candidate));
+			if (candidate != node_id) continue;
+
+			RNS::Destination peer_destination(g_peers.identity(i), RNS::Type::Destination::OUT,
+							  RNS::Type::Destination::SINGLE, app_name(), "fleece");
+			RNS::Packet packet(peer_destination, RNS::Bytes(data, size));
+			packet.send();  // throws on failure; a quiet return means handed to the interface
+			if (getenv("FX_DEBUG") != nullptr) fprintf(stderr, "[fx] send_to_node %llx handed to interface\n", (unsigned long long)node_id);
+			g_send_ok++;
+			return true;
+		}
+	} catch (...) {
+	}
+	return false;
 }
 
 extern "C" size_t fleece_reticulum_single_packet_payload_ceiling(void)

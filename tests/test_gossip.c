@@ -124,11 +124,12 @@ static void test_self_owned_rejection(void) {
 }
 
 // Frames are real CBOR (see fleece_state_manager.c) behind a 3-byte
-// ['F']['G'][version] prefix: [owner_node_id, hw, [records...]], where a
-// self-stream record is [is_tombstone, name, timestamp, data] and `hw` is the
-// sender's per-stream high-water mark (max record timestamp) - the value a
-// receiver compares against to detect it is behind. These are small hand-built
-// CBOR fragments (all values kept < 24 so each head is a single byte:
+// ['F']['G'][version] prefix: [owner_node_id, hw, digest, [records...]], where a
+// self-stream record is [is_tombstone, name, timestamp, data], `hw` is the
+// sender's per-stream high-water mark (max record timestamp), and `digest` is
+// an order-independent hash of the sender's live view - the value a receiver
+// compares against to detect it is behind. These are small hand-built CBOR
+// fragments (all values kept < 24 so each head is a single byte:
 // (major << 5) | value) - see RFC 8949 for the encoding.
 #define CBOR_ARRAY(n) (uint8_t)(0x80 | (n))
 #define CBOR_UINT(n)  (uint8_t)(0x00 | (n))
@@ -153,35 +154,40 @@ static void test_malformed_frames(void) {
     uint8_t bad_version[8] = {'F', 'G', 99, 0, 0, 0, 0, 0};
     CHECK(fleece_state_manager_import(m, bad_version, sizeof(bad_version)) != 0, "wrong version should be rejected");
 
-    // Valid magic/version/outer-array/owner/hw/record-count (claims 5 records)
-    // but truncated to zero bytes for the records themselves - the CBOR parser
-    // must bounds-check every item read, not just the fixed-size header.
-    uint8_t truncated_records[] = {'F', 'G', 3, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_UINT(0), CBOR_ARRAY(5)};
+    // Valid magic/version/outer-array/owner/hw/digest/record-count (claims 5
+    // records) but truncated to zero bytes for the records themselves - the
+    // CBOR parser must bounds-check every item read, not just the header.
+    uint8_t truncated_records[] = {'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(5)};
     CHECK(fleece_state_manager_import(m, truncated_records, sizeof(truncated_records)) != 0, "truncated field records should be rejected without crashing");
 
-    // Outer array declares 2 elements instead of the required 3 (type/shape confusion).
-    uint8_t wrong_outer_arity[] = {'F', 'G', 3, CBOR_ARRAY(2), CBOR_UINT(5), CBOR_ARRAY(0)};
+    // Outer array declares 3 elements instead of the required 4 (type/shape confusion).
+    uint8_t wrong_outer_arity[] = {'F', 'G', 4, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_UINT(0), CBOR_ARRAY(0)};
     CHECK(fleece_state_manager_import(m, wrong_outer_arity, sizeof(wrong_outer_arity)) != 0, "wrong outer array arity should be rejected");
 
     // owner_node_id encoded as a text string instead of a uint (major-type confusion).
-    uint8_t wrong_owner_type[] = {'F', 'G', 3, CBOR_ARRAY(3), CBOR_TEXT(0), CBOR_UINT(0), CBOR_ARRAY(0)};
+    uint8_t wrong_owner_type[] = {'F', 'G', 4, CBOR_ARRAY(4), CBOR_TEXT(0), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(0)};
     CHECK(fleece_state_manager_import(m, wrong_owner_type, sizeof(wrong_owner_type)) != 0, "non-uint owner_node_id should be rejected");
 
     // hw (the high-water mark) encoded as a text string instead of a uint.
-    uint8_t wrong_hw_type[] = {'F', 'G', 3, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_TEXT(0), CBOR_ARRAY(0)};
+    uint8_t wrong_hw_type[] = {'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_TEXT(0), CBOR_UINT(0), CBOR_ARRAY(0)};
     CHECK(fleece_state_manager_import(m, wrong_hw_type, sizeof(wrong_hw_type)) != 0, "non-uint high-water mark should be rejected");
 
-    // A single well-formed record (owner=5, hw=0, is_tombstone=false, name="x", ts=1,
-    // data=[1 byte]) but the byte-string length claims 9 bytes when only 1 remains.
+    // digest encoded as a text string instead of a uint.
+    uint8_t wrong_digest_type[] = {'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_UINT(0), CBOR_TEXT(0), CBOR_ARRAY(0)};
+    CHECK(fleece_state_manager_import(m, wrong_digest_type, sizeof(wrong_digest_type)) != 0, "non-uint view digest should be rejected");
+
+    // A single well-formed record (owner=5, hw=3, digest=0, is_tombstone=false,
+    // name="x", ts=3, data=[1 byte]) but the byte-string length claims 9 bytes
+    // when only 1 remains.
     uint8_t oversized_data_len[] = {
-        'F', 'G', 3, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_UINT(0), CBOR_ARRAY(1),
+        'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(1),
         CBOR_ARRAY(4), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x', CBOR_UINT(1), CBOR_BYTES(9), 0xAB
     };
     CHECK(fleece_state_manager_import(m, oversized_data_len, sizeof(oversized_data_len)) != 0, "a data length exceeding the remaining buffer should be rejected");
 
     // Same shape, but the record's own inner array claims 3 elements instead of 4.
     uint8_t wrong_record_arity[] = {
-        'F', 'G', 3, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_UINT(0), CBOR_ARRAY(1),
+        'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(1),
         CBOR_ARRAY(3), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x'
     };
     CHECK(fleece_state_manager_import(m, wrong_record_arity, sizeof(wrong_record_arity)) != 0, "wrong per-record array arity should be rejected");
@@ -189,7 +195,7 @@ static void test_malformed_frames(void) {
     // A well-formed, fully in-bounds record should actually be accepted (positive control
     // proving the above rejections are about the corruption, not the hand-built encoding itself).
     uint8_t valid_record[] = {
-        'F', 'G', 3, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_UINT(3), CBOR_ARRAY(1),
+        'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_UINT(3), CBOR_UINT(0), CBOR_ARRAY(1),
         CBOR_ARRAY(4), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x', CBOR_UINT(3), CBOR_BYTES(1), 0xAB
     };
     CHECK(fleece_state_manager_import(m, valid_record, sizeof(valid_record)) == 0, "a well-formed hand-built CBOR frame should be accepted");

@@ -30,10 +30,12 @@ fleece is a **lightweight, decentralized swarm coordination runtime** designed f
 
 ### 📦 Gossip State
 - **Real CBOR (RFC 8949) framing** for bandwidth-limited links - a 3-byte magic/version prefix followed by a CBOR-encoded record array, see `src/state/fleece_state_manager.c`
-- **Delta gossip**: each tick sends only fields changed since the last send, with a periodic full-state resync so a peer can recover from a dropped packet
-- **Two independent streams**: `self` (owned by each node) and shared/`world` (owned by no single node, relayed by whoever holds a copy)
-- **Full replication of `world`**: every node re-broadcasts everything it currently holds, not just what it personally discovered, so a `world` entry propagates node-to-node until every reachable unit has it (multi-hop, once comms has a real transport); the periodic full resync also catches any node that missed a relay or joined late
-- **Deterministic convergence on `world` conflicts**: every shared record carries its true author (`origin_node_id`), so if two nodes write the same field at the exact same logical timestamp, all nodes converge on the identical winner (higher origin id) instead of each side keeping its own write forever
+- **Delta gossip**: each tick sends only fields changed since the last send; an on-demand full resync (triggered by view-digest divergence) recovers dropped packets
+- **`world` is THE replicated stream**: the shared object owned by no single node, relayed by whoever holds a copy. `self` is node-local storage - it is not gossiped; a node publishes selected fields to the swarm by writing them into `world` explicitly
+- **Digest-based anti-entropy**: every frame carries an order-independent 64-bit digest of the sender's live `world` view; any divergence on receive (not just a missed newest record) triggers a targeted full resync pull
+- **Full replication of `world`**: every node re-broadcasts everything it currently holds, not just what it personally discovered, so a `world` entry propagates node-to-node until every reachable unit has it (multi-hop, once comms has a real transport); the on-demand resync also catches any node that missed a relay or joined late
+- **Deterministic convergence on `world` conflicts**: every shared record carries its true author (`origin_node_id`) - deletes included, so if two nodes race on the same field at the exact same logical timestamp (one writing, one deleting), all nodes converge on the identical winner (higher origin id) instead of splitting permanently
+- **Durable delete-markers**: removing a `world` field leaves a payload-less tombstone that survives compaction and full resyncs, so stale replicas can never resurrect a deleted entry
 - **`worldCompareAndSet`**: a local compare-and-set primitive for building safe claim protocols on top of `world` (e.g. "claim this target only if unclaimed") - see the World section below
 - **Peer liveness / heartbeat**: every gossip frame (even an empty delta) counts as a heartbeat; a peer not heard from within a configurable TTL disappears from `swarm` (its data isn't deleted, just hidden - it reappears immediately once heard from again)
 - Efficient field-level versioning and conflict resolution
@@ -49,13 +51,13 @@ The core execution model follows a synchronized **4-phase coordination cycle**, 
 
 2. **Phase 2: Script Execution (QuickJS VM)**
    - Calls the script's `step()` function
-   - Reads/writes `self`, reads `swarm`, reads/writes `world`, calls `platform.<name>(...)`
-   - Runs *before* gossip so any `self.xxx`/`world.xxx` change this tick is broadcast this tick, not next
+   - Reads/writes `self` (node-local), reads `swarm`, reads/writes `world`, calls `platform.<name>(...)`
+   - Runs *before* gossip so any `world.xxx` change this tick is broadcast this tick, not next
 
 3. **Phase 3: Gossip (State Synchronization)**
-   - Advances the peer-liveness tick counter, then exports and broadcasts what changed since the last send (delta), full state periodically (resync) - as two separate frames, one for `self`, one for the shared `world` stream
-   - Peer frames arrive via the comms receive callback and merge into `swarm`/`world` with LWW semantics; every frame received also counts as a heartbeat from its sender
-   - Maintains eventual consistency across the swarm, replicates `world` to every reachable unit, and prunes peers from `swarm` that haven't been heard from within the configured TTL
+   - Advances the peer-liveness tick counter, then exports and broadcasts what changed in the shared `world` object since the last send (delta)
+   - Peer frames arrive via the comms receive callback and merge into `world` with LWW semantics; a frame whose advertised view digest diverges from ours triggers an on-demand full resync pull from that peer
+   - Maintains eventual consistency across the swarm, replicating `world` to every reachable unit
 
 4. **Phase 4: Output (Actuators/Mesh Broadcast)**
    - Send mesh broadcasts, disseminate updates to peer nodes
