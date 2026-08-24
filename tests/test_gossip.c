@@ -124,13 +124,14 @@ static void test_self_owned_rejection(void) {
 }
 
 // Frames are real CBOR (see fleece_state_manager.c) behind a 3-byte
-// ['F']['G'][version] prefix: [owner_node_id, hw, digest, [records...]], where a
-// self-stream record is [is_tombstone, name, timestamp, data], `hw` is the
-// sender's per-stream high-water mark (max record timestamp), and `digest` is
-// an order-independent hash of the sender's live view - the value a receiver
-// compares against to detect it is behind. These are small hand-built CBOR
-// fragments (all values kept < 24 so each head is a single byte:
-// (major << 5) | value) - see RFC 8949 for the encoding.
+// ['F']['G'][version] prefix: [sender_node_id, owner_node_id, hw, digest,
+// [records...]], where a self-stream record is [is_tombstone, name, timestamp,
+// data], the sender id names the transmitting node (v5 - it makes divergence
+// attributable per peer), `hw` is the sender's per-stream high-water mark
+// (max record timestamp), and `digest` is an order-independent hash of the
+// sender's live view - the value a receiver compares against to detect it is
+// behind. These are small hand-built CBOR fragments (all values kept < 24 so
+// each head is a single byte: (major << 5) | value) - see RFC 8949.
 #define CBOR_ARRAY(n) (uint8_t)(0x80 | (n))
 #define CBOR_UINT(n)  (uint8_t)(0x00 | (n))
 #define CBOR_BOOL_FALSE 0xF4
@@ -154,40 +155,53 @@ static void test_malformed_frames(void) {
     uint8_t bad_version[8] = {'F', 'G', 99, 0, 0, 0, 0, 0};
     CHECK(fleece_state_manager_import(m, bad_version, sizeof(bad_version)) != 0, "wrong version should be rejected");
 
-    // Valid magic/version/outer-array/owner/hw/digest/record-count (claims 5
-    // records) but truncated to zero bytes for the records themselves - the
-    // CBOR parser must bounds-check every item read, not just the header.
-    uint8_t truncated_records[] = {'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(5)};
+    // Valid magic/version/outer-array/sender/owner/hw/digest/record-count
+    // (claims 5 records) but truncated to zero bytes for the records
+    // themselves - the CBOR parser must bounds-check every item read, not just
+    // the header.
+    uint8_t truncated_records[] = {'F', 'G', 5, CBOR_ARRAY(5), CBOR_UINT(6), CBOR_UINT(5), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(5)};
     CHECK(fleece_state_manager_import(m, truncated_records, sizeof(truncated_records)) != 0, "truncated field records should be rejected without crashing");
 
-    // Outer array declares 3 elements instead of the required 4 (type/shape confusion).
-    uint8_t wrong_outer_arity[] = {'F', 'G', 4, CBOR_ARRAY(3), CBOR_UINT(5), CBOR_UINT(0), CBOR_ARRAY(0)};
+    // Outer array declares 4 elements instead of the required 5 (type/shape confusion).
+    uint8_t wrong_outer_arity[] = {'F', 'G', 5, CBOR_ARRAY(4), CBOR_UINT(6), CBOR_UINT(5), CBOR_UINT(0), CBOR_ARRAY(0)};
     CHECK(fleece_state_manager_import(m, wrong_outer_arity, sizeof(wrong_outer_arity)) != 0, "wrong outer array arity should be rejected");
 
+    // sender_node_id encoded as a text string instead of a uint (major-type confusion).
+    uint8_t wrong_sender_type[] = {'F', 'G', 5, CBOR_ARRAY(5), CBOR_TEXT(0), CBOR_UINT(5), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(0)};
+    CHECK(fleece_state_manager_import(m, wrong_sender_type, sizeof(wrong_sender_type)) != 0, "non-uint sender_node_id should be rejected");
+
+    // A frame whose sender claims to BE the receiver must be rejected
+    // (loopback); exercised end-to-end via export/import in
+    // test_self_owned_rejection below.
+
+    // The reserved shared-owner id (0) is not a valid sender either.
+    uint8_t reserved_sender[] = {'F', 'G', 5, CBOR_ARRAY(5), CBOR_UINT(0), CBOR_UINT(5), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(0)};
+    CHECK(fleece_state_manager_import(m, reserved_sender, sizeof(reserved_sender)) != 0, "sender_node_id 0 (reserved) should be rejected");
+
     // owner_node_id encoded as a text string instead of a uint (major-type confusion).
-    uint8_t wrong_owner_type[] = {'F', 'G', 4, CBOR_ARRAY(4), CBOR_TEXT(0), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(0)};
+    uint8_t wrong_owner_type[] = {'F', 'G', 5, CBOR_ARRAY(5), CBOR_UINT(6), CBOR_TEXT(0), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(0)};
     CHECK(fleece_state_manager_import(m, wrong_owner_type, sizeof(wrong_owner_type)) != 0, "non-uint owner_node_id should be rejected");
 
     // hw (the high-water mark) encoded as a text string instead of a uint.
-    uint8_t wrong_hw_type[] = {'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_TEXT(0), CBOR_UINT(0), CBOR_ARRAY(0)};
+    uint8_t wrong_hw_type[] = {'F', 'G', 5, CBOR_ARRAY(5), CBOR_UINT(6), CBOR_UINT(5), CBOR_TEXT(0), CBOR_UINT(0), CBOR_ARRAY(0)};
     CHECK(fleece_state_manager_import(m, wrong_hw_type, sizeof(wrong_hw_type)) != 0, "non-uint high-water mark should be rejected");
 
     // digest encoded as a text string instead of a uint.
-    uint8_t wrong_digest_type[] = {'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_UINT(0), CBOR_TEXT(0), CBOR_ARRAY(0)};
+    uint8_t wrong_digest_type[] = {'F', 'G', 5, CBOR_ARRAY(5), CBOR_UINT(6), CBOR_UINT(5), CBOR_UINT(0), CBOR_TEXT(0), CBOR_ARRAY(0)};
     CHECK(fleece_state_manager_import(m, wrong_digest_type, sizeof(wrong_digest_type)) != 0, "non-uint view digest should be rejected");
 
-    // A single well-formed record (owner=5, hw=3, digest=0, is_tombstone=false,
-    // name="x", ts=3, data=[1 byte]) but the byte-string length claims 9 bytes
-    // when only 1 remains.
+    // A single well-formed record (sender=6, owner=5, hw=3, digest=0,
+    // is_tombstone=false, name="x", ts=3, data=[1 byte]) but the byte-string
+    // length claims 9 bytes when only 1 remains.
     uint8_t oversized_data_len[] = {
-        'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(1),
+        'F', 'G', 5, CBOR_ARRAY(5), CBOR_UINT(6), CBOR_UINT(5), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(1),
         CBOR_ARRAY(4), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x', CBOR_UINT(1), CBOR_BYTES(9), 0xAB
     };
     CHECK(fleece_state_manager_import(m, oversized_data_len, sizeof(oversized_data_len)) != 0, "a data length exceeding the remaining buffer should be rejected");
 
     // Same shape, but the record's own inner array claims 3 elements instead of 4.
     uint8_t wrong_record_arity[] = {
-        'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(1),
+        'F', 'G', 5, CBOR_ARRAY(5), CBOR_UINT(6), CBOR_UINT(5), CBOR_UINT(0), CBOR_UINT(0), CBOR_ARRAY(1),
         CBOR_ARRAY(3), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x'
     };
     CHECK(fleece_state_manager_import(m, wrong_record_arity, sizeof(wrong_record_arity)) != 0, "wrong per-record array arity should be rejected");
@@ -195,10 +209,14 @@ static void test_malformed_frames(void) {
     // A well-formed, fully in-bounds record should actually be accepted (positive control
     // proving the above rejections are about the corruption, not the hand-built encoding itself).
     uint8_t valid_record[] = {
-        'F', 'G', 4, CBOR_ARRAY(4), CBOR_UINT(5), CBOR_UINT(3), CBOR_UINT(0), CBOR_ARRAY(1),
+        'F', 'G', 5, CBOR_ARRAY(5), CBOR_UINT(6), CBOR_UINT(5), CBOR_UINT(3), CBOR_UINT(0), CBOR_ARRAY(1),
         CBOR_ARRAY(4), CBOR_BOOL_FALSE, CBOR_TEXT(1), 'x', CBOR_UINT(3), CBOR_BYTES(1), 0xAB
     };
-    CHECK(fleece_state_manager_import(m, valid_record, sizeof(valid_record)) == 0, "a well-formed hand-built CBOR frame should be accepted");
+    bool behind_self = false, behind_shared = false;
+    uint64_t sender = 0;
+    CHECK(fleece_state_manager_import_from(m, valid_record, sizeof(valid_record), &behind_self, &behind_shared, &sender) == 0,
+          "a well-formed hand-built CBOR frame should be accepted");
+    CHECK(sender == 6, "import_from should report the v5 header's sender id back to the caller");
     CHECK(fleece_state_manager_exists_named(m, 5, "x"), "the accepted record's field should actually be readable back");
     CHECK(fleece_state_manager_get_peer_self_hw(m, 5) == 3, "peer hw should reflect the accepted record's timestamp");
 
@@ -554,6 +572,46 @@ static void test_behind_detection_shared(void) {
     printf("Done: behind-detection (shared) test\n");
 }
 
+// v5: a shared/"world" frame's header names the RELAYING sender, so the
+// receiver can attribute divergence to - and track liveness of - real peers
+// even though every record's storage owner is FLEECE_SHARED_OWNER_ID.
+static void test_shared_sender_attribution(void) {
+    printf("Running shared-stream sender attribution test...\n");
+
+    FleeceStateManager* a = fleece_state_manager_create_with_node_id(0x1A2B3C4D5E6F7788ULL);
+    FleeceStateManager* b = fleece_state_manager_create_with_node_id(0x8877665544332211ULL);
+    uint64_t a_id = fleece_state_manager_get_node_id(a);
+    uint64_t b_id = fleece_state_manager_get_node_id(b);
+
+    CHECK(fleece_state_manager_ticks_since_seen(b, a_id) == UINT64_MAX, "b has not heard from a yet");
+
+    fleece_state_manager_set_shared(a, "pos", (const uint8_t*)"\"p1\"", 4);
+
+    uint8_t* frame = NULL;
+    uint32_t frame_size = 0;
+    CHECK(fleece_state_manager_export_shared(a, &frame, &frame_size) == 0, "shared export should succeed");
+
+    bool behind_self = true, behind_shared = true;
+    uint64_t sender = 0;
+    CHECK(fleece_state_manager_import_from(b, frame, frame_size, &behind_self, &behind_shared, &sender) == 0,
+          "b should import a's shared frame");
+    CHECK(sender == a_id, "import_from must report the transmitting node as the sender");
+    free(frame);
+
+    // The digest matches here: b merged everything a advertised.
+    CHECK(!behind_shared, "a synchronized receiver must not be flagged behind");
+    CHECK(!behind_self, "a shared frame must never flag behind_self");
+
+    // And liveness is now attributed to the REAL relay (v4 could only ever
+    // see FLEECE_SHARED_OWNER_ID on world frames, which touch_peer skips).
+    CHECK(fleece_state_manager_ticks_since_seen(b, a_id) == 0,
+          "importing a shared frame must register the sender as a live peer");
+
+    fleece_state_manager_destroy(a);
+    fleece_state_manager_destroy(b);
+    printf("Done: shared-stream sender attribution test\n");
+}
+
 static void test_set_shared_cas(void) {
     printf("Running set_shared_cas test...\n");
 
@@ -593,6 +651,72 @@ static void test_set_shared_cas(void) {
     printf("Done: set_shared_cas test\n");
 }
 
+// The repair handshake's two control exports must round-trip through the
+// ordinary import path in their CURRENT wire shape: an INDEX reply feeds the
+// diff, and a VALUE reply (export_shared_by_hash) merges like any gossip
+// frame - regression: the value frame lagged the v5 header change (stayed
+// arity-4 without a sender id) and every repair payload was silently
+// rejected on import.
+static void test_repair_frame_roundtrip(void) {
+    printf("Running repair frame roundtrip test...\n");
+
+    FleeceStateManager* a = fleece_state_manager_create_with_node_id(0xA000000000000001ULL);
+    FleeceStateManager* b = fleece_state_manager_create_with_node_id(0xB000000000000002ULL);
+    uint64_t b_id = fleece_state_manager_get_node_id(b);
+
+    fleece_state_manager_set_shared(a, "k1", (const uint8_t*)"\"v1\"", 4);
+    fleece_state_manager_set_shared(a, "k2", (const uint8_t*)"\"v2\"", 4);
+    uint64_t ts_k1 = 0, origin_k1 = 0;
+    fleece_state_manager_get_meta_named(a, FLEECE_SHARED_OWNER_ID, "k1", &ts_k1, &origin_k1);
+
+    // Index: parses as [hash, ts] pairs and reports k1's stored ts.
+    uint8_t* idx = NULL;
+    uint32_t idx_size = 0;
+    CHECK(fleece_state_manager_export_shared_index(a, &idx, &idx_size) == 0, "index export should succeed");
+    free(idx);
+
+    // Value frame for k1 by hash: must import cleanly into b (v5 sender check
+    // included), carrying the record and reporting a as the sender.
+    uint32_t hash_k1 = 2166136261u;
+    for (const unsigned char* p = (const unsigned char*)"k1"; *p; p++) {
+        hash_k1 ^= *p;
+        hash_k1 *= 16777619u;
+    }
+    uint8_t* val = NULL;
+    uint32_t val_size = 0;
+    CHECK(fleece_state_manager_export_shared_by_hash(a, &hash_k1, 1, &val, &val_size) == 0, "value export should succeed");
+
+    bool behind_self = true, behind_shared = true;
+    uint64_t sender = 0;
+    CHECK(fleece_state_manager_import_from(b, val, val_size, &behind_self, &behind_shared, &sender) == 0,
+          "a served VALUE frame must import (v5 wire shape)");
+    uint64_t a_id = fleece_state_manager_get_node_id(a);
+    CHECK(sender == a_id, "the VALUE frame's sender must be the serving node");
+    // The frame advertises a's FULL view digest, and b does not yet hold k2,
+    // so behind_shared must fire - which is exactly what drives the requester
+    // to keep repairing until the next diff comes back empty.
+    CHECK(behind_shared, "a VALUE frame advertising the server's full-view digest must flag the remaining gap");
+
+    uint8_t* data = NULL;
+    uint32_t size = 0;
+    CHECK(fleece_state_manager_get_named(b, FLEECE_SHARED_OWNER_ID, "k1", &data, &size) == 0, "the repaired key should exist on b");
+    CHECK(data != NULL && size == 4 && memcmp(data, "\"v1\"", 4) == 0, "the repaired value should match");
+    free(data);
+
+    uint64_t ts_b = 0, origin_b = 0;
+    fleece_state_manager_get_meta_named(b, FLEECE_SHARED_OWNER_ID, "k1", &ts_b, &origin_b);
+    CHECK(ts_b == ts_k1, "repaired record must carry the origin's LWW timestamp");
+    CHECK(origin_b == origin_k1, "repaired record must carry the authoring origin");
+
+    // And b must now consider itself current with that key at that ts.
+    CHECK(fleece_state_manager_shared_at_least(b, hash_k1, ts_k1) == 1, "post-repair, shared_at_least should report the key is held at the fetched ts");
+
+    free(val);
+    fleece_state_manager_destroy(a);
+    fleece_state_manager_destroy(b);
+    printf("Done: repair frame roundtrip test\n");
+}
+
 int main(void) {
     printf("Fleece Gossip Wire Format Tests\n");
     printf("================================\n\n");
@@ -625,7 +749,11 @@ int main(void) {
     printf("\n");
     test_behind_detection_shared();
     printf("\n");
+    test_shared_sender_attribution();
+    printf("\n");
     test_set_shared_cas();
+    printf("\n");
+    test_repair_frame_roundtrip();
     printf("\n");
 
     if (g_failures > 0) {

@@ -206,10 +206,10 @@ static void on_control_packet(const uint8_t* data, uint32_t size, void* user_dat
     fleece_runtime_on_control_frame(g_runtime, data, size);
 }
 
-static void on_gap(bool behind_shared, void* user_data) {
+static void on_gap(bool behind_shared, uint64_t sender_node_id, void* user_data) {
     g_gap_calls++;
     if (behind_shared) g_gap_true++;
-    fleece_runtime_note_behind_shared((FleeceRuntime*)user_data, behind_shared);
+    fleece_runtime_note_behind_from((FleeceRuntime*)user_data, behind_shared, sender_node_id);
 }
 
 // --- Workload driver ---------------------------------------------------------
@@ -330,6 +330,10 @@ static int run_child(uint32_t idx, uint32_t n_nodes, double loss, uint32_t ticks
         char lp[512];
         snprintf(lp, sizeof lp, "%s/node%u.log", g_dir, g_idx);
         g_logfile = fopen(lp, "w");
+        // Line-buffered: children exit via _exit() after fork(), which skips
+        // stdio flush - unbuffered logs are the difference between a debuggable
+        // run and a silent one.
+        if (g_logfile) setvbuf(g_logfile, NULL, _IOLBF, 0);
     }
     cfg.user_data = &radio;
 
@@ -376,6 +380,14 @@ static int run_child(uint32_t idx, uint32_t n_nodes, double loss, uint32_t ticks
                 (unsigned long long)g_ctrl_tx,
                 (unsigned long long)g_uni_ok,
                 (unsigned long long)g_uni_fail);
+        // Per-key LWW state: lets the parent pinpoint WHICH entries disagree
+        // when digests diverge.
+        for (uint32_t i = 0; i < fields; i++) {
+            uint64_t ts = 0, origin = 0;
+            fleece_state_manager_get_meta_named(sm, FLEECE_SHARED_OWNER_ID, names[i], &ts, &origin);
+            fprintf(f, "field=%s ts=%llu origin=%llx\n", names[i],
+                    (unsigned long long)ts, (unsigned long long)origin);
+        }
         fclose(f);
     }
 
@@ -460,6 +472,49 @@ int main(int argc, char** argv) {
     uint64_t ref = digests[0];
     for (uint32_t i = 0; i < n_nodes && converged; i++) {
         if (digests[i] != ref || fields[i] != n_nodes * k) converged = false;
+    }
+
+    // When digests diverge, show exactly which keys disagree (vs node 0).
+    if (!converged && got == n_nodes) {
+        printf("\nper-key divergence vs node 0:\n");
+        for (uint32_t i = 1; i < n_nodes; i++) {
+            char path0[512], pathI[512], line[192];
+            snprintf(path0, sizeof path0, "%s/result.0", dir);
+            snprintf(pathI, sizeof pathI, "%s/result.%u", dir, i);
+            FILE* f0 = fopen(path0, "r");
+            FILE* fi = fopen(pathI, "r");
+            if (!f0 || !fi) { if (f0) fclose(f0); if (fi) fclose(fi); continue; }
+            // Skip the scalar header lines, collect field= maps.
+            // Small N: linear scan per key is fine for a benchmark report.
+            while (fgets(line, sizeof line, f0)) {
+                if (strncmp(line, "field=", 6) != 0) continue;
+                char name[FLEECE_FIELD_NAME_MAX];
+                unsigned long long ts0 = 0, or0 = 0;
+                sscanf(line + 6, "%63s ts=%llu origin=%llx", name, &ts0, &or0);
+                // find same key in node i
+                FILE* fj = fopen(pathI, "r");
+                unsigned long long tsI = 0, orI = 0;
+                char l2[192];
+                bool found = false;
+                if (fj) {
+                    while (fgets(l2, sizeof l2, fj)) {
+                        if (strncmp(l2, "field=", 6) != 0) continue;
+                        char nm[FLEECE_FIELD_NAME_MAX];
+                        unsigned long long t2 = 0, o2 = 0;
+                        sscanf(l2 + 6, "%63s ts=%llu origin=%llx", nm, &t2, &o2);
+                        if (strcmp(nm, name) == 0) { tsI = t2; orI = o2; found = true; break; }
+                    }
+                    fclose(fj);
+                }
+                if (!found || tsI != ts0 || orI != or0) {
+                    printf("  node %u: %s %s ts=%llu origin=%llx (node0: ts=%llu origin=%llx)\n",
+                           i, name, found ? "STALE/DIFFERS:" : "MISSING, has",
+                           tsI, orI, ts0, or0);
+                    break;  // one example per node pair is enough
+                }
+            }
+            fclose(f0); fclose(fi);
+        }
     }
 
     uint64_t total_tx = 0, total_rx = 0, total_drop = 0;

@@ -311,26 +311,42 @@ public:
 	void received_announce(const RNS::Bytes & /*destination_hash*/, const RNS::Identity &announced_identity,
 				const RNS::Bytes & /*app_data*/) override
 	{
+		if (getenv("FX_DEBUG") != nullptr) {
+			RNS::Bytes h = announced_identity.hash();
+			uint64_t id = 0;
+			if (h.data() != nullptr && h.size() >= sizeof(id)) std::memcpy(&id, h.data(), sizeof(id));
+			fprintf(stderr, "[fx] me=%llx announce from %llx at poll_tick %u\n",
+				(unsigned long long)g_node_id, (unsigned long long)id, g_poll_tick_count);
+		}
 		g_peers.add(announced_identity, g_poll_tick_count);
 	}
 };
 
-/* Merges one inbound gossip frame and reports divergence. import_ex (not
+/* Merges one inbound gossip frame and reports divergence. import_from (not
  * plain import) is deliberate: the digest check is the ONLY place gap
  * detection happens now that delta gossip is push-only - without reporting
  * `behind_shared` upward, a node that missed a delta would never repair it.
+ * The v5 sender header comes back too, so gap reports are attributable per
+ * peer and repair traffic can be unicast to the offending sender.
  */
 void import_gossip_frame(const uint8_t *data, uint32_t size)
 {
 	if (g_state_manager != nullptr) {
 		g_packets_received++;
 		bool behind_shared = false;
-		if (fleece_state_manager_import_ex(g_state_manager, data, size,
-						   NULL, &behind_shared) != 0) {
+		uint64_t sender = 0;
+		int rc = fleece_state_manager_import_from(g_state_manager, data, size,
+						   NULL, &behind_shared, &sender);
+		if (rc != 0) {
 			g_import_failures++;
 		}
+		if (getenv("FX_DEBUG") != nullptr) {
+			fprintf(stderr, "[fx] me=%llx module-import rc=%d %u B from %llx behind=%d\n",
+				(unsigned long long)g_node_id, rc,
+				size, (unsigned long long)sender, (int)behind_shared);
+		}
 		if (g_gap_callback != nullptr) {
-			g_gap_callback(behind_shared, g_gap_callback_user_data);
+			g_gap_callback(behind_shared, sender, g_gap_callback_user_data);
 		}
 	}
 }

@@ -63,19 +63,22 @@ int fleece_runtime_start(FleeceRuntime* runtime);
 
 // Feed one inbound GOSSIP wire frame (a ['F']['G'] CBOR frame) that was NOT
 // delivered through FleeceComms - e.g. merged by an out-of-band transport.
-// Runs the normal import plus resync bookkeeping under the pseudo-source
-// "mesh". Do NOT also feed the same frame through comms' receive path.
+// Runs the normal import plus resync bookkeeping; the frame's v5 sender header
+// identifies which peer's repair state to update. Do NOT also feed the same
+// frame through comms' receive path.
 void fleece_runtime_on_gossip_frame(FleeceRuntime* runtime, const uint8_t* data, uint32_t size);
 
 // Feed one inbound CONTROL frame (an ['F']['X'] index/value-request frame).
 void fleece_runtime_on_control_frame(FleeceRuntime* runtime, const uint8_t* data, uint32_t size);
 
-// Report the transport's view-digest status after merging a peer's gossip:
-// behind_shared == true means this node is missing something the sender holds
-// (schedule a targeted repair), false means current. Under the built-in comms
-// path this bookkeeping happens automatically; transports that merge in-band
-// call this instead.
-void fleece_runtime_note_behind_shared(FleeceRuntime* runtime, bool behind_shared);
+// Report the transport's view-digest status for one peer after merging its
+// gossip: behind_shared == true means this node is missing something THAT
+// sender holds (schedule a targeted repair against it), false means current.
+// sender_node_id is the peer the report concerns - pass 0 only when the
+// transport cannot identify it (the report then lands in an anonymous "mesh"
+// target and repairs fan out). Under the built-in comms path this bookkeeping
+// happens automatically; transports that merge in-band call this instead.
+void fleece_runtime_note_behind_from(FleeceRuntime* runtime, bool behind_shared, uint64_t sender_node_id);
 
 // Stop the runtime's main loop
 void fleece_runtime_stop(FleeceRuntime* runtime);

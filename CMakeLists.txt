@@ -131,9 +131,13 @@ if(NOT TARGET microReticulum)
 
     # A fixed-size TLSF pool rather than the system heap: on the targets fleece
     # exists for, an unbounded allocator in the packet path is how you get a
-    # fragmentation failure hours into a flight. 80 KiB is a known-good budget
-    # from real use; override before add_subdirectory() if your target differs.
-    set(FLEECE_RNS_HEAP_POOL_BUFFER_SIZE 81920 CACHE STRING
+    # fragmentation failure hours into a flight. 128 KiB is measured, not
+    # guessed: at 80 KiB the pool ran <10% free under real mesh gossip and
+    # RNS shed most sends ("DEPRIORITIZING gossip send"), stalling convergence;
+    # 128 KiB - a defensible slice of the ESP32-P4's 768 KiB internal SRAM -
+    # eliminated shedding entirely. Override before add_subdirectory() if your
+    # target differs.
+    set(FLEECE_RNS_HEAP_POOL_BUFFER_SIZE 131072 CACHE STRING
         "Bytes for microReticulum's TLSF pool allocator")
     set(RNS_DEFAULT_ALLOCATOR RNS_HEAP_POOL_ALLOCATOR CACHE STRING "" FORCE)
     set(RNS_CONTAINER_ALLOCATOR RNS_HEAP_POOL_ALLOCATOR CACHE STRING "" FORCE)

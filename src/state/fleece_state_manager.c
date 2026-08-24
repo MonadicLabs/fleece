@@ -46,12 +46,21 @@ static const uint32_t FIELD_CAPACITY = 128;  // Max fields for microcontrollers 
 
 #define FLEECE_GOSSIP_MAGIC0 'F'
 #define FLEECE_GOSSIP_MAGIC1 'G'
-#define FLEECE_GOSSIP_VERSION 4
+#define FLEECE_GOSSIP_VERSION 5
 
-// Protocol v4: every gossip frame carries an order-independent 64-bit digest
-// of the sender's live entries for that stream alongside the owner id and
-// records (the v3 scalar high-water mark is still present for diagnostics).
-// After merging, the receiver computes the same digest over what IT stores and
+// Protocol v5: v4 plus a SENDER id in the frame header. v4's header carried
+// only the stream owner (for world gossip always FLEECE_SHARED_OWNER_ID), so a
+// receiver could tell WHAT it was behind on but not WHO had advertised the
+// divergent view - all peers aggregated into one anonymous "mesh" repair
+// target, and at N>=6 under loss the mesh never converged within its tick
+// budget. The sender id makes divergence attributable per peer: targeted,
+// UNICAST index requests become possible, and each peer's own repair state
+// tracks just that peer.
+//
+// As in v4, every frame also carries an order-independent 64-bit digest of the
+// sender's live entries for that stream alongside the owner id and records
+// (the v3 scalar high-water mark is still present for diagnostics). After
+// merging, the receiver computes the same digest over what IT stores and
 // flags itself as behind on mismatch. Unlike the v3 hw check - which could
 // only detect "I'm missing the stream's newest record" - a digest mismatch
 // catches ANY divergence, including a dropped update to a field that is not
@@ -129,6 +138,9 @@ static uint64_t compute_stream_digest(FleeceStateManager* manager, uint64_t owne
     }
     return sum;
 }
+
+// Defined further below; the bounded delta exporter needs it for its header.
+static uint64_t max_timestamp_for_owner(FleeceStateManager* manager, uint64_t owner_node_id);
 
 // --- Minimal CBOR (RFC 8949) support -----------------------------------
 // Only what this file's wire format needs: unsigned integers, byte strings,
@@ -441,6 +453,21 @@ bool fleece_state_manager_exists_named(FleeceStateManager* manager, uint64_t own
     return find_field_owned(manager, hash_name(name), owner_node_id) != NULL;
 }
 
+int fleece_state_manager_get_meta_named(FleeceStateManager* manager, uint64_t owner_node_id,
+                                        const char* name, uint64_t* ts_out, uint64_t* origin_out) {
+    if (!manager || !name || !ts_out || !origin_out) return -1;
+
+    struct FieldEntry* field = find_field_owned(manager, hash_name(name), owner_node_id);
+    if (!field) {
+        *ts_out = 0;
+        *origin_out = 0;
+        return -1;
+    }
+    *ts_out = field->timestamp;
+    *origin_out = field->origin_node_id;
+    return 0;
+}
+
 // --- Shared fields (owner = FLEECE_SHARED_OWNER_ID; see header for the LWW caveat) ---
 
 int fleece_state_manager_set_shared(FleeceStateManager* manager, const char* name, const uint8_t* data, uint32_t size) {
@@ -613,7 +640,10 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t owner_filte
     uint64_t digest = compute_stream_digest(manager, owner_filter);
 
     uint32_t count = 0;
-    size_t body_size = fleece_cbor_array_header_size(4) + fleece_cbor_uint_size(owner_filter)
+    // v5: outer array is [sender, owner, hw, digest, [records]] - one more
+    // header-sized element than v4.
+    size_t body_size = fleece_cbor_array_header_size(5) + fleece_cbor_uint_size(manager->node_id)
+                     + fleece_cbor_uint_size(owner_filter)
                      + fleece_cbor_uint_size(hw)
                      + fleece_cbor_uint_size(digest);
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
@@ -643,7 +673,8 @@ static int export_fields_since(FleeceStateManager* manager, uint64_t owner_filte
     buf[pos++] = FLEECE_GOSSIP_MAGIC1;
     buf[pos++] = FLEECE_GOSSIP_VERSION;
 
-    fleece_cbor_write_array_header(buf, &pos, 4);
+    fleece_cbor_write_array_header(buf, &pos, 5);
+    fleece_cbor_write_uint(buf, &pos, manager->node_id);  // v5: who is advertising this view
     fleece_cbor_write_uint(buf, &pos, owner_filter);
     fleece_cbor_write_uint(buf, &pos, hw);
     fleece_cbor_write_uint(buf, &pos, digest);
@@ -689,17 +720,104 @@ int fleece_state_manager_export_shared_delta(FleeceStateManager* manager, uint64
     return export_fields_since(manager, FLEECE_SHARED_OWNER_ID, since_timestamp, frame_data, frame_size);
 }
 
-// Shared import core (see the two public wrappers below). Parses a v4 gossip
-// frame [owner_node_id, hw, digest, [records]], merges its records with LWW,
-// then - if behind_self/behind_shared are non-NULL - reports whether the
-// receiver is now *behind* on that stream: its own computed view digest differs
-// from the sender's advertised digest, meaning this receiver is missing (or
-// stale on) at least one live field - a delta was dropped somewhere, and a full
-// resync from this peer is warranted. Only the flag matching the frame's own
-// stream is set; the other is left untouched. The caller can then request a
-// full export from the sender (see fleece_runtime.c Phase 3).
+// Bounded variant: like export_shared_delta, but stops adding records once
+// the serialized frame reaches cap_bytes, and reports through included_max_ts
+// the highest record timestamp ACTUALLY carried - the value the caller must
+// advance its watermark to. (Advancing past a truncation point would drop
+// the excluded records from every future delta.) Keeping frames under the
+// transport's single-packet ceiling avoids the Resource/Link fallback, whose
+// pending transfers pin fixed-pool memory and starve the whole node.
+// Bounded variant: like export_shared_delta, but stops adding records once
+// the serialized frame reaches cap_bytes, and reports through included_max_ts
+// the highest record timestamp ACTUALLY carried - the value the caller must
+// advance its watermark to. (Advancing past a truncation point would drop
+// the excluded records from every future delta.) Keeping frames under the
+// transport's single-packet ceiling avoids the Resource/Link fallback, whose
+// pending transfers pin fixed-pool memory and starve the whole node.
+int fleece_state_manager_export_shared_delta_bounded(FleeceStateManager* manager, uint64_t since_timestamp,
+                                                     size_t cap_bytes, uint8_t** frame_data, uint32_t* frame_size,
+                                                     uint64_t* included_max_ts) {
+    if (!manager || !frame_data || !frame_size) return -1;
+
+    bool take[FIELD_CAPACITY];
+    uint32_t count = 0;
+    // Header: magic(3, outside `body`) + [sender, owner, hw, digest, count].
+    // The count header is budgeted at its 3-byte worst case; the hw/digest at
+    // theirs. Oversizing by a few bytes is fine - undersizing would corrupt.
+    size_t body = fleece_cbor_array_header_size(5) + fleece_cbor_uint_size(manager->node_id)
+                 + fleece_cbor_uint_size(FLEECE_SHARED_OWNER_ID)
+                 + 9 + 9 + 3;
+    uint64_t max_ts = 0;
+    for (uint32_t i = 0; i < manager->field_capacity; i++) take[i] = false;
+    for (uint32_t i = 0; i < manager->field_capacity; i++) {
+        struct FieldEntry* f = &manager->fields[i];
+        if (!f->exists || f->node_id != FLEECE_SHARED_OWNER_ID || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
+        if (f->timestamp > max_ts) max_ts = f->timestamp;
+        uint32_t name_len = (uint32_t)strlen(f->name);
+        uint32_t data_len = f->is_tombstone ? 0 : f->size;
+        size_t rec = fleece_cbor_array_header_size(5)
+                   + fleece_cbor_uint_size(f->origin_node_id)
+                   + 1
+                   + fleece_cbor_text_size(name_len)
+                   + fleece_cbor_uint_size(f->timestamp)
+                   + fleece_cbor_bytes_size(data_len);
+        if (count > 0 && body + rec > cap_bytes) continue;
+        body += rec;
+        take[i] = true;
+        count++;
+    }
+    if (included_max_ts) *included_max_ts = max_ts;
+
+    uint8_t* buf = (uint8_t*)fleece_malloc(3 + body);
+    if (!buf) return -1;
+    size_t pos = 0;
+    buf[pos++] = FLEECE_GOSSIP_MAGIC0;
+    buf[pos++] = FLEECE_GOSSIP_MAGIC1;
+    buf[pos++] = FLEECE_GOSSIP_VERSION;
+    fleece_cbor_write_array_header(buf, &pos, 5);
+    fleece_cbor_write_uint(buf, &pos, manager->node_id);
+    fleece_cbor_write_uint(buf, &pos, FLEECE_SHARED_OWNER_ID);
+    fleece_cbor_write_uint(buf, &pos, max_timestamp_for_owner(manager, FLEECE_SHARED_OWNER_ID));
+    fleece_cbor_write_uint(buf, &pos, compute_stream_digest(manager, FLEECE_SHARED_OWNER_ID));
+    fleece_cbor_write_array_header(buf, &pos, count);
+    for (uint32_t i = 0; i < manager->field_capacity; i++) {
+        struct FieldEntry* f = &manager->fields[i];
+        if (!f->exists || !take[i]) continue;
+        fleece_cbor_write_array_header(buf, &pos, 5);
+        fleece_cbor_write_uint(buf, &pos, f->origin_node_id);
+        fleece_cbor_write_bool(buf, &pos, f->is_tombstone);
+        fleece_cbor_write_text(buf, &pos, f->name, (uint32_t)strlen(f->name));
+        fleece_cbor_write_uint(buf, &pos, f->timestamp);
+        fleece_cbor_write_bytes(buf, &pos, f->data, f->is_tombstone ? 0 : f->size);
+    }
+    *frame_data = buf;
+    *frame_size = (uint32_t)pos;
+    return 0;
+}
+
+uint32_t fleece_state_manager_count_new_shared(FleeceStateManager* manager, uint64_t since_timestamp) {
+    if (!manager) return 0;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < manager->field_capacity; i++) {
+        struct FieldEntry* f = &manager->fields[i];
+        if (!f->exists || f->node_id != FLEECE_SHARED_OWNER_ID || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
+        count++;
+    }
+    return count;
+}
+
+// Shared import core (see the two public wrappers below). Parses a v5 gossip
+// frame [sender_node_id, owner_node_id, hw, digest, [records]], merges its
+// records with LWW, then - if behind_self/behind_shared are non-NULL - reports
+// whether the receiver is now *behind* on that stream: its own computed view
+// digest differs from the sender's advertised digest, meaning this receiver is
+// missing (or stale on) at least one live field - a delta was dropped somewhere,
+// and a resync from this peer is warranted. Only the flag matching the frame's
+// own stream is set; the other is left untouched. The sender's node id is
+// reported back through sender_node_id so the caller can run the repair
+// handshake against THAT peer alone (see fleece_runtime.c Phase 3).
 static int import_impl(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size,
-                       bool* behind_self, bool* behind_shared) {
+                       bool* behind_self, bool* behind_shared, uint64_t* sender_node_id) {
     if (!manager || !frame_data) {
         return -1;
     }
@@ -714,17 +832,25 @@ static int import_impl(FleeceStateManager* manager, const uint8_t* frame_data, u
     uint8_t major;
     uint64_t value;
 
-    // Outer array: [owner_node_id, hw, digest, records]
-    if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 4 || value != 4) return -1;
+    // Outer array: [sender_node_id, owner_node_id, hw, digest, records]
+    if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 4 || value != 5) return -1;
+
+    if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
+    uint64_t sender = value;
+
+    // Reject loopback and reserved ids: the sender field must name a real
+    // third-party node for per-peer attribution to mean anything.
+    if (sender == manager->node_id || sender == FLEECE_SHARED_OWNER_ID) return -1;
+    if (sender_node_id) *sender_node_id = sender;
 
     if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
     uint64_t owner_node_id = value;
 
-    if (owner_node_id == manager->node_id) {
-        return -1;  // reject a "peer" frame claiming to be us
-    }
-
     bool is_shared_stream = (owner_node_id == FLEECE_SHARED_OWNER_ID);
+
+    // v4 behavior kept: a SELF-stream claiming us as owner is bogus (the v5
+    // sender check above already catches the honest form of this mistake).
+    if (!is_shared_stream && owner_node_id == manager->node_id) return -1;
 
     if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
     (void)value;  // hw: kept on the wire for diagnostics; the digest below supersedes it
@@ -732,7 +858,7 @@ static int import_impl(FleeceStateManager* manager, const uint8_t* frame_data, u
     if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 0) return -1;
     uint64_t advertised_digest = value;
 
-    touch_peer(manager, owner_node_id);  // even an empty delta counts as "heard from"
+    touch_peer(manager, sender);  // even an empty delta counts as "heard from"; v5 makes the real relay visible
 
     if (!fleece_cbor_read_head(frame_data, frame_size, &pos, &major, &value) || major != 4) return -1;
     uint64_t count = value;
@@ -789,12 +915,17 @@ static int import_impl(FleeceStateManager* manager, const uint8_t* frame_data, u
 }
 
 int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size) {
-    return import_impl(manager, frame_data, frame_size, NULL, NULL);
+    return import_impl(manager, frame_data, frame_size, NULL, NULL, NULL);
 }
 
 int fleece_state_manager_import_ex(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size,
                                    bool* behind_self, bool* behind_shared) {
-    return import_impl(manager, frame_data, frame_size, behind_self, behind_shared);
+    return import_impl(manager, frame_data, frame_size, behind_self, behind_shared, NULL);
+}
+
+int fleece_state_manager_import_from(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size,
+                                     bool* behind_self, bool* behind_shared, uint64_t* sender_node_id) {
+    return import_impl(manager, frame_data, frame_size, behind_self, behind_shared, sender_node_id);
 }
 
 // --- Per-stream high-water marks ------------------------------------------
@@ -889,47 +1020,54 @@ int fleece_state_manager_export_shared_index(FleeceStateManager* manager, uint8_
 // Unknown hashes match nothing; tombstoned keys are skipped (a delete has no
 // value to ship - the requester learns deletes only from records or by never
 // having had the entry).
+//
+// BYTE CAP: the reply stays under the transport's single-packet ceiling
+// whenever possible. Oversized frames fall back to Resource/Link transfers,
+// which on real radios establish slowly, stall under loss, and pin fixed-pool
+// memory while pending (measured: multi-key value replies drove exactly the
+// pool-exhaustion shedding that starves everything else). Anything left over
+// is fetched by the requester's NEXT diff round - its view digest still
+// differs, so the handshake simply repeats. At least one record is always
+// included so every round makes progress.
+#define FLEECE_VALUE_FRAME_BYTE_CAP 320
 int fleece_state_manager_export_shared_by_hash(FleeceStateManager* manager, const uint32_t* hashes, uint32_t count, uint8_t** frame_data, uint32_t* frame_size) {
     if (!manager || !frame_data || !frame_size || (!hashes && count > 0)) return -1;
 
     uint64_t hw = 0;
+    // First pass: size the header and find which requested entries fit under
+    // the single-packet byte cap (at least one - progress is mandatory).
+    size_t body = fleece_cbor_array_header_size(5) + fleece_cbor_uint_size(manager->node_id)
+                 + fleece_cbor_uint_size(FLEECE_SHARED_OWNER_ID)
+                 + 9   // worst-case hw encoding
+                 + fleece_cbor_uint_size(compute_stream_digest(manager, FLEECE_SHARED_OWNER_ID))
+                 + fleece_cbor_array_header_size(count);
+    bool take[FIELD_CAPACITY];
     uint32_t matched = 0;
-
+    for (uint32_t i = 0; i < manager->field_capacity; i++) take[i] = false;
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         struct FieldEntry* f = &manager->fields[i];
         if (!f->exists || f->is_tombstone || f->node_id != FLEECE_SHARED_OWNER_ID || f->name[0] == '\0') continue;
         if (f->timestamp > hw) hw = f->timestamp;
-        for (uint32_t h = 0; h < count; h++) {
-            if (hashes[h] == f->key) {
-                matched++;
-                break;
-            }
-        }
-    }
-
-    size_t body = fleece_cbor_array_header_size(4) + fleece_cbor_uint_size(FLEECE_SHARED_OWNER_ID)
-                 + fleece_cbor_uint_size(hw)
-                 + fleece_cbor_uint_size(compute_stream_digest(manager, FLEECE_SHARED_OWNER_ID))
-                 + fleece_cbor_array_header_size(matched);
-    for (uint32_t i = 0; i < manager->field_capacity; i++) {
-        struct FieldEntry* f = &manager->fields[i];
-        if (!f->exists || f->is_tombstone || f->node_id != FLEECE_SHARED_OWNER_ID || f->name[0] == '\0') continue;
         bool hit = false;
         for (uint32_t h = 0; h < count; h++) {
-            if (hashes[h] == f->key) {
-                hit = true;
-                break;
-            }
+            if (hashes[h] == f->key) { hit = true; break; }
         }
         if (!hit) continue;
         uint32_t name_len = (uint32_t)strlen(f->name);
-        body += fleece_cbor_array_header_size(5)
-              + fleece_cbor_uint_size(f->origin_node_id)
-              + 1  // bool
-              + fleece_cbor_text_size(name_len)
-              + fleece_cbor_uint_size(f->timestamp)
-              + fleece_cbor_bytes_size(f->size);
+        size_t rec = fleece_cbor_array_header_size(5)
+                   + fleece_cbor_uint_size(f->origin_node_id)
+                   + 1  // bool
+                   + fleece_cbor_text_size(name_len)
+                   + fleece_cbor_uint_size(f->timestamp)
+                   + fleece_cbor_bytes_size(f->size);
+        if (matched > 0 && body + rec > FLEECE_VALUE_FRAME_BYTE_CAP) continue;
+        body += rec;
+        take[i] = true;
+        matched++;
     }
+    // Shrink the record-count header to what we actually wrote.
+    body -= fleece_cbor_array_header_size(count);
+    body += fleece_cbor_array_header_size(matched);
 
     uint8_t* buf = (uint8_t*)fleece_malloc(3 + body);
     if (!buf) return -1;
@@ -938,7 +1076,11 @@ int fleece_state_manager_export_shared_by_hash(FleeceStateManager* manager, cons
     buf[pos++] = FLEECE_GOSSIP_MAGIC0;
     buf[pos++] = FLEECE_GOSSIP_MAGIC1;
     buf[pos++] = FLEECE_GOSSIP_VERSION;
-    fleece_cbor_write_array_header(buf, &pos, 4);
+    // v5 header, same shape as a regular gossip frame: repair VALUE frames
+    // merge through the ordinary import path, which now requires the sender
+    // id (and rejects its absence as a malformed arity-4 frame).
+    fleece_cbor_write_array_header(buf, &pos, 5);
+    fleece_cbor_write_uint(buf, &pos, manager->node_id);
     fleece_cbor_write_uint(buf, &pos, FLEECE_SHARED_OWNER_ID);
     fleece_cbor_write_uint(buf, &pos, hw);
     fleece_cbor_write_uint(buf, &pos, compute_stream_digest(manager, FLEECE_SHARED_OWNER_ID));
@@ -946,15 +1088,7 @@ int fleece_state_manager_export_shared_by_hash(FleeceStateManager* manager, cons
 
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         struct FieldEntry* f = &manager->fields[i];
-        if (!f->exists || f->is_tombstone || f->node_id != FLEECE_SHARED_OWNER_ID || f->name[0] == '\0') continue;
-        bool hit = false;
-        for (uint32_t h = 0; h < count; h++) {
-            if (hashes[h] == f->key) {
-                hit = true;
-                break;
-            }
-        }
-        if (!hit) continue;
+        if (!f->exists || !take[i]) continue;
         uint32_t name_len = (uint32_t)strlen(f->name);
         fleece_cbor_write_array_header(buf, &pos, 5);
         fleece_cbor_write_uint(buf, &pos, f->origin_node_id);

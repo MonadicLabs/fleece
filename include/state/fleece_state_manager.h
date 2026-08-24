@@ -100,6 +100,12 @@ int fleece_state_manager_remove_named(FleeceStateManager* manager, const char* n
 // Get a named field owned by the given node (local or a known peer)
 int fleece_state_manager_get_named(FleeceStateManager* manager, uint64_t owner_node_id, const char* name, uint8_t** data, uint32_t* size);
 
+// LWW metadata probe: reports the timestamp and origin_node_id of the stored
+// version of `name` (0/0 when absent). Diagnostics for divergence analysis -
+// two nodes hold the same view iff value AND (ts, origin) match per key.
+int fleece_state_manager_get_meta_named(FleeceStateManager* manager, uint64_t owner_node_id,
+                                        const char* name, uint64_t* ts_out, uint64_t* origin_out);
+
 // Check whether a named field owned by the given node exists
 bool fleece_state_manager_exists_named(FleeceStateManager* manager, uint64_t owner_node_id, const char* name);
 
@@ -183,7 +189,14 @@ int fleece_state_manager_set_shared_cas(FleeceStateManager* manager, const char*
 // Gossip wire frames are real CBOR (RFC 8949), not a bespoke format: a 3-byte
 // ['F']['G'][version] prefix (a quick sanity/version check that isn't itself
 // part of the CBOR payload) followed by a CBOR-encoded
-// [owner_node_id, hw, digest, [record, record, ...]] array.
+// [sender_node_id, owner_node_id, hw, digest, [record, record, ...]] array.
+//
+// `sender_node_id` (protocol v5) names the node that transmitted this frame -
+// which for relayed world data is not necessarily any record's author. It lets
+// a receiver attribute divergence to the specific peer that advertised the
+// divergent view, so repair handshakes can be run per peer and UNICAST to it
+// (see fleece_runtime.c). Frames from ourselves or from id 0 (reserved) are
+// rejected.
 //
 // `hw` is the sender's per-stream high-water mark: the highest record timestamp
 // it holds for that stream - kept for diagnostics and resync probing.
@@ -225,6 +238,23 @@ int fleece_state_manager_export_delta(FleeceStateManager* manager, uint64_t sinc
 int fleece_state_manager_export_shared(FleeceStateManager* manager, uint8_t** frame_data, uint32_t* frame_size);
 int fleece_state_manager_export_shared_delta(FleeceStateManager* manager, uint64_t since_timestamp, uint8_t** frame_data, uint32_t* frame_size);
 
+// Bounded delta export: stops adding records once the frame reaches cap_bytes
+// (always includes at least one) and reports the highest record timestamp
+// actually carried through included_max_ts - advance the gossip watermark to
+// THAT, never past it, or truncated records are lost from all future deltas.
+// Frames stay small enough for single-packet transports (no Resource/Link
+// fallback, which pins fixed-pool memory on constrained radios).
+int fleece_state_manager_export_shared_delta_bounded(FleeceStateManager* manager, uint64_t since_timestamp,
+                                                     size_t cap_bytes, uint8_t** frame_data, uint32_t* frame_size,
+                                                     uint64_t* included_max_ts);
+
+// Cheap pre-check for the shared delta export: returns the number of records
+// a fleece_state_manager_export_shared_delta(since_timestamp) would carry.
+// The runtime uses it to skip transmitting EMPTY deltas - at N peers each
+// empty frame still costs an N-fold fan-out on the wire, and heartbeat spam
+// is what saturates a shared LoRa-class channel before repairs get airtime.
+uint32_t fleece_state_manager_count_new_shared(FleeceStateManager* manager, uint64_t since_timestamp);
+
 // Import a gossip wire frame received from a peer, merging its fields with LWW.
 // Handles both self-stream and shared-stream frames - the frame's own
 // owner_node_id (a real peer id, or FLEECE_SHARED_OWNER_ID) determines where
@@ -234,19 +264,19 @@ int fleece_state_manager_import(FleeceStateManager* manager, const uint8_t* fram
 // Import with on-demand resync support. Same merge as fleece_state_manager_import,
 // and additionally reports (via behind_self / behind_shared - both optional,
 // NULL is fine) whether the receiver is now *behind* on the stream the frame
-// carried: the sender's advertised high-water mark exceeds the highest record
-// timestamp the receiver stores for that stream, meaning a delta was dropped
-// and a full resync from this peer is warranted. Only the flag matching the
-// frame's own stream is set; the other is left untouched. The caller can then
-// request a full export from the sender (see fleece_runtime.c Phase 3).
-//
-// Known limitation: the gap check compares a single scalar hw per stream. It
-// reliably detects "I'm missing the stream's newest record", but can miss a
-// gap on a non-newest field; LWW means only the newest version of each field
-// matters, and a stale non-max field is repaired on that field's next update
-// or at the next on-demand resync.
+// carried: the receiver's computed view digest differs from the sender's
+// advertised digest, meaning it is missing or stale on at least one live field
+// (a delta was dropped somewhere). Only the flag matching the frame's own
+// stream is set; the other is left untouched. The caller can then run the
+// targeted repair handshake against the sender (see fleece_runtime.c Phase 3).
 int fleece_state_manager_import_ex(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size,
                                    bool* behind_self, bool* behind_shared);
+
+// Same as import_ex, and additionally reports the frame's SENDER node id
+// (protocol v5 header field) through sender_node_id - the peer to aim repair
+// traffic at. NULL is fine; import_ex is exactly this call with a NULL sender.
+int fleece_state_manager_import_from(FleeceStateManager* manager, const uint8_t* frame_data, uint32_t frame_size,
+                                     bool* behind_self, bool* behind_shared, uint64_t* sender_node_id);
 
 // Per-stream high-water marks: the highest record timestamp the manager holds
 // for its own self stream, the shared stream, or a stored peer's self stream.

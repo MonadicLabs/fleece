@@ -44,14 +44,41 @@
 #define FLEECE_RESYNC_TAG_VALUE_REQ 2
 #define FLEECE_RESYNC_PROBE_TICKS 100  // re-request from a peer not heard from this long
 #define FLEECE_RESYNC_RETRY_TICKS 8    // re-send an unanswered index request after this many ticks
-// Repairs during local churn are allowed again: with unicast replies a round
-// costs one index + one targeted value frame, so the cure is now cheaper than
-// the divergence it fixes. The retry cadence (above) still bounds the rate.
-#define FLEECE_RESYNC_QUIESCE_TICKS 0
-#define FLEECE_RESYNC_CLEAR_STREAK 8  // consecutive current reports before a repair flag clears
+// Repairs during local churn wait for a short quiet period: while THIS node
+// is itself writing, digest divergence is expected (peers legitimately lag
+// behind us) and every peer repairs at once - at N>=6 that aggregate is what
+// saturates the channel (measured: quiesce-free repairs drove >90% channel
+// utilization with zero convergence). A lost-delta gap persists past the
+// quiet point by definition, so nothing is missed; in-flight rounds continue.
+#define FLEECE_RESYNC_QUIESCE_TICKS 5
+// Bounded leak-through: at most this many NEW handshake rounds may start per
+// tick across all peers. After a partition heals, every peer reports a gap on
+// the same tick; without the cap they would all fire index requests at once
+// and stampede the channel exactly when N peers' worth of backlogged gossip is
+// already fighting for it (observed as the N=6 non-convergence). Two per tick
+// drains the backlog quickly while keeping each tick's control burst tiny;
+// in-flight rounds and their retries are NOT throttled by this - only starts.
+#define FLEECE_RESYNC_STARTS_PER_TICK 2
 #define FLEECE_MAX_RESYNC_TARGETS 32   // matches FLEECE_MAX_TRACKED_PEERS in the state manager
 #define FLEECE_MAX_PENDING_TX 16       // deferred control-frame slots
 #define FLEECE_MAX_FETCH_KEYS 64       // max keys fetched per repair round
+// Steady-state gossip cadence: one batched delta frame every this many ticks.
+// Wire cost per node is roughly frame_bytes * N_peers * RNS_overhead / (ticks
+// between sends); at N=6 that lands under the 1/N channel share only at 10+
+// ticks (measured: 5 ticks oversubscribed a 115200-baud channel ~2x once
+// per-packet header/crypto overhead is counted).
+#define FLEECE_GOSSIP_EVERY_TICKS 10
+// Wire budget for one gossip delta frame. Under the single-packet payload
+// ceiling at the LoRa MTU (460), so frames never fall back to Resource/Link
+// transfer even with per-record overhead at its worst.
+#define FLEECE_GOSSIP_FRAME_BYTES 320
+// Digest beacon cadence: a header-only frame (view digest, zero records) so
+// peers keep detecting divergence even when nobody has fresh data - without
+// it, a delta lost during churn leaves the loser silent AND blind: it cannot
+// know its view differs until the next real frame arrives, which under
+// empty-delta suppression may be never (measured: post-churn silences left
+// stale values unrepaired past the convergence budget).
+#define FLEECE_BEACON_EVERY_TICKS 20
 
 // v2 wire format: ['F']['X'][2] + CBOR [tag, origin_node_id, items...].
 //
@@ -78,12 +105,15 @@ struct FleeceRuntime {
     void (*tick_cb)(FleeceRuntime*, void*);  // optional per-tick C hook (see fleece_runtime_set_tick_callback)
     void* tick_ud;
 
-    // On-demand resync bookkeeping, keyed by the comms source address of each
-    // peer we gossip with. A target is created when a gossip frame arrives from
-    // a source; need_shared is set when import_ex reports we are behind on the
-    // shared/"world" stream, and cleared when a frame confirms we are current.
-    // The probe (FLEECE_RESYNC_PROBE_TICKS) re-requests from targets we haven't
-    // confirmed sync with in a while - handles "never heard from".
+    // On-demand resync bookkeeping, one entry per peer we gossip with (protocol
+    // v5 frames carry the sender's node id, so divergence is attributable per
+    // peer and repair traffic can be UNICAST to the offender). A target is
+    // created when a gossip frame arrives; need_shared is set when that frame's
+    // digest check reports we are behind on the shared/"world" stream relative
+    // to THIS sender, and cleared when a later frame from the same sender
+    // confirms we are current. The probe (FLEECE_RESYNC_PROBE_TICKS)
+    // re-requests from targets we haven't confirmed sync with in a while -
+    // handles "never heard from".
     //
     // Only the world stream exists on the wire now: "self" is node-local
     // storage (a node publishes selected fields into world explicitly), so the
@@ -103,12 +133,12 @@ struct FleeceRuntime {
     uint32_t pending_tx_dropped;
 
     struct ResyncTarget {
-        char source[64];
+        uint64_t node_id;         // peer's node id (0 = anonymous "mesh" aggregate)
+        char source[48];          // comms destination: "node:%016llx", or "mesh"
         uint64_t last_heard_tick;  // last tick a gossip frame arrived from this source
         bool need_shared;          // digest divergence seen - repair pending
         bool awaiting_index;       // index request sent, reply not yet processed
         uint64_t last_index_req_tick;  // throttle for index-request retries
-        uint32_t current_streak;   // consecutive "current" reports (sticky-clear)
         bool exists;
     } resync_targets[FLEECE_MAX_RESYNC_TARGETS];
 };
@@ -122,36 +152,54 @@ static void signal_handler(int signum) {
     }
 }
 
-// Locates (creating if needed) the resync bookkeeping entry for `source`.
-static struct ResyncTarget* resync_target_for(FleeceRuntime* runtime, const char* source) {
-    if (!source || !source[0]) return NULL;
+// Locates (creating if needed) the resync bookkeeping entry for a peer by
+// NODE ID - the primary key since protocol v5 frames carry the sender's id.
+// `node_id` 0 means "unknown sender": everything collapses into one anonymous
+// "mesh" target (legacy fan-out behavior).
+static struct ResyncTarget* resync_target_for_id(FleeceRuntime* runtime, uint64_t node_id) {
+    char source[48];
+    if (node_id == 0) {
+        snprintf(source, sizeof source, "mesh");
+    } else {
+        snprintf(source, sizeof source, "node:%016llx", (unsigned long long)node_id);
+    }
 
     for (int i = 0; i < FLEECE_MAX_RESYNC_TARGETS; i++) {
-        if (runtime->resync_targets[i].exists && strcmp(runtime->resync_targets[i].source, source) == 0) {
+        if (runtime->resync_targets[i].exists && runtime->resync_targets[i].node_id == node_id &&
+            strcmp(runtime->resync_targets[i].source, source) == 0) {
             return &runtime->resync_targets[i];
         }
     }
     for (int i = 0; i < FLEECE_MAX_RESYNC_TARGETS; i++) {
         if (!runtime->resync_targets[i].exists) {
-            strncpy(runtime->resync_targets[i].source, source, sizeof(runtime->resync_targets[i].source) - 1);
-            runtime->resync_targets[i].source[sizeof(runtime->resync_targets[i].source) - 1] = '\0';
-            runtime->resync_targets[i].last_heard_tick = runtime->gossip_tick_count;
-            runtime->resync_targets[i].need_shared = false;
-            runtime->resync_targets[i].awaiting_index = false;
-            runtime->resync_targets[i].last_index_req_tick = 0;
-            runtime->resync_targets[i].current_streak = 0;
-            runtime->resync_targets[i].exists = true;
-            return &runtime->resync_targets[i];
+            struct ResyncTarget* t = &runtime->resync_targets[i];
+            t->node_id = node_id;
+            snprintf(t->source, sizeof t->source, "%s", source);
+            t->last_heard_tick = runtime->gossip_tick_count;
+            t->need_shared = false;
+            t->awaiting_index = false;
+            t->last_index_req_tick = 0;
+            t->exists = true;
+            return t;
         }
     }
     return NULL;  // table full - silently skip; gap detection is best-effort
 }
 
+static void enqueue_tx(FleeceRuntime* runtime, const char* dest, const uint8_t* data, uint32_t size);
+
 // Sends an 'FX' v2 control frame. tag 0 = index request (empty items); tag 2
 // = value request carrying key hashes. `origin` is this node's id, so the
 // responder can unicast the reply back to us alone.
-static void send_control(FleeceRuntime* runtime, const char* target, uint8_t tag,
-                         const uint32_t* hashes, uint32_t count) {
+//
+// defer: TRUE queues the frame for the next main-loop tick instead of
+// transmitting inline. Anything composed while we are INSIDE the transport's
+// inbound-dispatch callback MUST defer - a re-entrant Packet::send() there
+// hands the frame to an interface whose transport is mid-cycle and it vanishes
+// without failing (measured live: value requests fired from the index-reply
+// handler never reached any responder, stalling every repair round).
+static void send_control_ex(FleeceRuntime* runtime, const char* target, uint8_t tag,
+                            const uint32_t* hashes, uint32_t count, bool defer) {
     uint8_t buf[16 + FLEECE_MAX_FETCH_KEYS * 5 + 16];
     size_t pos = 0;
     buf[pos++] = FLEECE_RESYNC_MAGIC0;
@@ -164,7 +212,16 @@ static void send_control(FleeceRuntime* runtime, const char* target, uint8_t tag
     for (uint32_t i = 0; i < count; i++) {
         fleece_cbor_write_uint(buf, &pos, hashes[i]);
     }
-    fleece_comms_send(runtime->comms, target, buf, (uint32_t)pos);
+    if (defer) {
+        enqueue_tx(runtime, target, buf, (uint32_t)pos);
+    } else {
+        fleece_comms_send(runtime->comms, target, buf, (uint32_t)pos);
+    }
+}
+
+static void send_control(FleeceRuntime* runtime, const char* target, uint8_t tag,
+                         const uint32_t* hashes, uint32_t count) {
+    send_control_ex(runtime, target, tag, hashes, count, false);
 }
 
 // Formats the peer-addressed destination string understood by transports with
@@ -179,7 +236,7 @@ static bool unicast_dest_for(uint64_t origin, char* out, size_t out_size) {
 // Diff step of the repair: given a parsed index reply's [hash, ts] pairs,
 // collect the keys we are missing or stale on and request them from the
 // responder alone. `reply_origin` is the responder's node id (0 = unknown,
-// fall back to fan-out).
+// fall back to fan-out). Returns true when keys were requested.
 static bool request_missing_keys(FleeceRuntime* runtime, uint64_t reply_origin,
                                  const uint64_t* hashes, const uint64_t* tss, uint32_t count) {
     uint32_t wanted[FLEECE_MAX_FETCH_KEYS];
@@ -191,24 +248,35 @@ static bool request_missing_keys(FleeceRuntime* runtime, uint64_t reply_origin,
                                                         (uint32_t)hashes[i], tss[i]);
         if (have == 0) wanted[n_wanted++] = (uint32_t)hashes[i];
     }
-    // NOTE: an empty diff does NOT clear the repair flag. This responder's
-    // index only proves WE have everything THEY have - another peer may hold
-    // fresher data (measured live: clearing here left a stale value stuck
-    // forever because the stalest responder always answered fastest).
-    // Disarming happens exclusively via note_behind_shared's sustained
-    // current-report streak, which is what actually certifies convergence.
+    // An EMPTY diff means we hold everything THIS responder advertised:
+    // pairwise sync with that peer is certified, so its repair flag disarms.
+    // (Under the old single aggregated target this was unsound - one
+    // responder proving nothing said nothing about OTHER peers, and clearing
+    // then left stale values stuck forever behind the fastest responder.
+    // Per-peer targets restored the soundness: any other peer's fresher data
+    // keeps ITS OWN flag armed.) A non-empty diff keeps the flag armed until
+    // the fetched values arrive and a later index exchange comes back clean.
     if (n_wanted > 0) {
         char dest[40];
         if (!unicast_dest_for(reply_origin, dest, sizeof dest)) {
             snprintf(dest, sizeof dest, "mesh");
         }
-        if (getenv("FX_DEBUG")) fprintf(stderr, "[fx] me=%llu fetching %u keys from %s (%llx)\n",
-            (unsigned long long)fleece_state_manager_get_node_id(runtime->state_manager),
-            n_wanted, dest, (unsigned long long)reply_origin);
-        send_control(runtime, dest, FLEECE_RESYNC_TAG_VALUE_REQ, wanted, n_wanted);
+        if (getenv("FX_DEBUG")) {
+            fprintf(stderr, "[fx] me=%llu fetching %u keys from %s (%llx):",
+                (unsigned long long)fleece_state_manager_get_node_id(runtime->state_manager),
+                n_wanted, dest, (unsigned long long)reply_origin);
+            for (uint32_t i = 0; i < n_wanted; i++) fprintf(stderr, " %08x", wanted[i]);
+            fprintf(stderr, "\n");
+        }
+        // Deferred transmit: we are inside the transport's inbound dispatch
+        // (this handler runs from the index-reply callback chain) - an inline
+        // send here vanishes at the transport layer. See send_control_ex.
+        send_control_ex(runtime, dest, FLEECE_RESYNC_TAG_VALUE_REQ, wanted, n_wanted, true);
         return true;
     }
-    if (getenv("FX_DEBUG")) fprintf(stderr, "[fx] me=%llu diff empty vs %llx\n",
+    struct ResyncTarget* t = resync_target_for_id(runtime, reply_origin);
+    if (t) t->need_shared = false;
+    if (getenv("FX_DEBUG")) fprintf(stderr, "[fx] me=%llu diff empty vs %llx - sync certified\n",
         (unsigned long long)fleece_state_manager_get_node_id(runtime->state_manager),
         (unsigned long long)reply_origin);
     return false;
@@ -318,7 +386,8 @@ static void handle_fx_frame(FleeceRuntime* runtime, const uint8_t* data, uint32_
             if (!fleece_cbor_read_head(data, size, &pos, &major, &tss[n]) || major != 0) return;
             n++;
         }
-        struct ResyncTarget* t = resync_target_for(runtime, "mesh");
+        // The responder's index reply closes OUR round against THAT peer.
+        struct ResyncTarget* t = resync_target_for_id(runtime, origin);
         if (t) t->awaiting_index = false;
         request_missing_keys(runtime, origin, hashes, tss, n);
         return;
@@ -326,19 +395,36 @@ static void handle_fx_frame(FleeceRuntime* runtime, const uint8_t* data, uint32_
 }
 
 // Gossip import + resync bookkeeping core, shared by both inbound paths.
-static void import_and_track(FleeceRuntime* runtime, const char* source,
-                             const uint8_t* data, uint32_t size) {
-    bool behind_self = false;
+static void import_and_track(FleeceRuntime* runtime, const uint8_t* data, uint32_t size) {
     bool behind_shared = false;
-    if (fleece_state_manager_import_ex(runtime->state_manager, data, size, &behind_self, &behind_shared) != 0) {
+    uint64_t sender = 0;
+    if (fleece_state_manager_import_from(runtime->state_manager, data, size, NULL, &behind_shared, &sender) != 0) {
+        if (getenv("FX_DEBUG")) fprintf(stderr, "[fx] me=%llu import FAILED (%u B)\n",
+            (unsigned long long)fleece_state_manager_get_node_id(runtime->state_manager), size);
         return;  // malformed frame - ignore
     }
+    if (getenv("FX_DEBUG")) fprintf(stderr, "[fx] me=%llu imported %u B from %llx behind=%d\n",
+        (unsigned long long)fleece_state_manager_get_node_id(runtime->state_manager),
+        size, (unsigned long long)sender, (int)behind_shared);
 
-    struct ResyncTarget* target = resync_target_for(runtime, source);
+    struct ResyncTarget* target = resync_target_for_id(runtime, sender);
     if (!target) return;
     target->last_heard_tick = runtime->gossip_tick_count;
-    if (behind_shared) target->need_shared = true;
-    else target->need_shared = false;
+
+    // Per-peer flag semantics. With each peer's reports landing in its OWN
+    // target, the old stickiness is no longer needed: the flicker hazard it
+    // guarded against was one peer's "current" report disarming repair state
+    // armed by a DIFFERENT peer in the same tick (all peers used to aggregate
+    // under one anonymous "mesh" target). Now a digest match from peer X
+    // genuinely certifies "we hold everything X holds", so clearing X's flag
+    // immediately is sound - divergence elsewhere re-arms via that peer's own
+    // frames. The awaiting_index guard keeps an in-flight round alive until
+    // its reply (or retry timeout) resolves it.
+    if (behind_shared) {
+        target->need_shared = true;
+    } else if (!target->awaiting_index) {
+        target->need_shared = false;
+    }
 }
 
 // Receives gossip or 'FX' control frames from the built-in comms path.
@@ -351,7 +437,9 @@ static void runtime_gossip_receive(const char* source, const uint8_t* data, uint
         return;
     }
 
-    import_and_track(runtime, source, data, size);
+    // The v5 sender header identifies the peer; the comms source string is
+    // not needed for attribution.
+    import_and_track(runtime, data, size);
 }
 
 void fleece_runtime_on_control_frame(FleeceRuntime* runtime, const uint8_t* data, uint32_t size) {
@@ -364,33 +452,25 @@ void fleece_runtime_on_control_frame(FleeceRuntime* runtime, const uint8_t* data
 
 void fleece_runtime_on_gossip_frame(FleeceRuntime* runtime, const uint8_t* data, uint32_t size) {
     if (!runtime || !data || size == 0) return;
-    import_and_track(runtime, "mesh", data, size);
+    // The v5 sender header identifies the peer; no source string needed.
+    import_and_track(runtime, data, size);
 }
 
-void fleece_runtime_note_behind_shared(FleeceRuntime* runtime, bool behind_shared) {
+void fleece_runtime_note_behind_from(FleeceRuntime* runtime, bool behind_shared, uint64_t sender_node_id) {
     if (!runtime) return;
-    struct ResyncTarget* t = resync_target_for(runtime, "mesh");
+    struct ResyncTarget* t = resync_target_for_id(runtime, sender_node_id);
     if (!t) return;
     t->last_heard_tick = runtime->gossip_tick_count;
 
-    // A single transport (e.g. Reticulum fan-out) aggregates ALL peers into
-    // this one target. Two consequences shape this logic:
-    //   - One peer's "behind" report must arm the repair flag even though
-    //     OTHER peers legitimately report "current" in the same tick - a
-    //     single false report would otherwise flicker the flag back off
-    //     before any handshake fires (measured: 170+ gap reports produced
-    //     ~12 repair attempts). Hence STICKY clearing: only a sustained
-    //     streak of current reports - no in-flight round, no divergence
-    //     anywhere - clears it.
-    //   - While a round is in flight, current reports mean little anyway:
-    //     the handshake itself will close the gap.
+    // Same per-peer semantics as import_and_track: a gap report arms THIS
+    // sender's repair flag; a current report disarms it (unless a round to
+    // this very peer is in flight). Transports that cannot identify the
+    // reporting peer pass sender_node_id = 0 and get the anonymous "mesh"
+    // target - correct, just less targeted.
     if (behind_shared) {
         t->need_shared = true;
-        t->current_streak = 0;
     } else if (!t->awaiting_index) {
-        if (++t->current_streak >= FLEECE_RESYNC_CLEAR_STREAK) {
-            t->need_shared = false;
-        }
+        t->need_shared = false;
     }
 }
 
@@ -401,6 +481,8 @@ static void runtime_send_resync_requests(FleeceRuntime* runtime) {
     // First: drain replies composed during last tick's inbound dispatch -
     // safely outside the transport's callback context this time.
     flush_pending_tx(runtime);
+
+    uint32_t starts_this_tick = 0;
 
     for (int i = 0; i < FLEECE_MAX_RESYNC_TARGETS; i++) {
         struct ResyncTarget* t = &runtime->resync_targets[i];
@@ -421,13 +503,15 @@ static void runtime_send_resync_requests(FleeceRuntime* runtime) {
         if (t->need_shared) {
             bool quiet = fleece_state_manager_ticks_since_last_write(runtime->state_manager)
                          >= FLEECE_RESYNC_QUIESCE_TICKS;
-            if (quiet &&
+            bool can_start = starts_this_tick < FLEECE_RESYNC_STARTS_PER_TICK;
+            if (quiet && can_start &&
                 (!t->awaiting_index ||
                  runtime->gossip_tick_count - t->last_index_req_tick >= FLEECE_RESYNC_RETRY_TICKS)) {
                 uint32_t none = 0;
                 send_control(runtime, t->source, FLEECE_RESYNC_TAG_INDEX_REQ, &none, 0);
                 t->awaiting_index = true;
                 t->last_index_req_tick = runtime->gossip_tick_count;
+                starts_this_tick++;
             }
         }
 
@@ -575,33 +659,84 @@ int fleece_runtime_start(FleeceRuntime* runtime) {
         // on, and runtime_send_resync_requests() below pulls missing snapshots.
         uint8_t* shared_frame = NULL;
         uint32_t shared_frame_size = 0;
-        if (fleece_state_manager_export_shared_delta(runtime->state_manager, runtime->shared_gossip_watermark, &shared_frame, &shared_frame_size) == 0) {
-            fleece_comms_send(runtime->comms, "broadcast", shared_frame, shared_frame_size);
-            fleece_free(shared_frame);
+        // Gossip cadence + empty-delta suppression. Two hard limits collide on
+        // a shared LoRa-class channel as N grows:
+        //   - every frame costs a full N-peer fan-out of RNS packets, each
+        //     carrying ~80B of header/crypto before any payload;
+        //   - each node owns only 1/N of the channel.
+        // Per-tick delta gossip crosses per-node fair share already at N=6
+        // (measured: ticks stretched 20x, zero airtime left for repairs).
+        // So deltas are BATCHED every FLEECE_GOSSIP_EVERY_TICKS ticks and
+        // empty sends are skipped entirely: one amortized frame instead of k
+        // heartbeat frames. Peers detect missed data via the view digest in
+        // whichever frames do arrive, plus the unicast liveness probe.
+        bool gossip_due = (runtime->gossip_tick_count % FLEECE_GOSSIP_EVERY_TICKS) == 0;
+        // Beacon phase offset by node id: synchronized beacons collide into
+        // one N-fold burst every interval, exactly the kind of spike that
+        // trips pool-pressure shedding on constrained radios.
+        bool beacon_due = ((runtime->gossip_tick_count + (uint32_t)fleece_state_manager_get_node_id(runtime->state_manager))
+                           % FLEECE_BEACON_EVERY_TICKS) == 0;
+        bool have_new = fleece_state_manager_count_new_shared(runtime->state_manager, runtime->shared_gossip_watermark) > 0;
+        if (gossip_due && have_new) {
+            // Bounded export: never exceed the transport's single-packet
+            // ceiling, so steady-state gossip NEVER falls back to
+            // Resource/Link transfer - pending Resources pin fixed-pool
+            // memory and their shedding spiral silences a node's entire
+            // fan-out while its unicast control path keeps working (measured:
+            // one wedged node gossiped nothing for a whole run). Whatever
+            // doesn't fit stays eligible: the watermark advances only to the
+            // highest record ACTUALLY carried.
+            uint64_t included_max_ts = 0;
+            if (fleece_state_manager_export_shared_delta_bounded(runtime->state_manager,
+                                                                 runtime->shared_gossip_watermark,
+                                                                 FLEECE_GOSSIP_FRAME_BYTES,
+                                                                 &shared_frame, &shared_frame_size,
+                                                                 &included_max_ts) == 0) {
+                fleece_comms_send(runtime->comms, "broadcast", shared_frame, shared_frame_size);
+                if (getenv("FX_DEBUG")) fprintf(stderr, "[fx] me=%llu gossip %u B wm=%llu -> %llu\n",
+                    (unsigned long long)fleece_state_manager_get_node_id(runtime->state_manager),
+                    shared_frame_size,
+                    (unsigned long long)runtime->shared_gossip_watermark,
+                    (unsigned long long)included_max_ts);
+                fleece_free(shared_frame);
+                // The watermark must track this stream's own high-water mark (the
+                // highest field.timestamp actually eligible for export_delta's
+                // filter), not the manager's global local_timestamp clock. That
+                // clock also advances on every import (merge_shared's own
+                // max(local, remote) bump - see fleece_state_manager.c) and on
+                // every LOCAL write regardless of destination, so a node that has
+                // ticked a while before first hearing a given peer already has a
+                // local_timestamp well past that peer's own (independently
+                // clocked, so typically much lower) field timestamps. Advancing
+                // the watermark to that global clock skips straight past those
+                // merged-but-not-yet-exported fields: since export_delta only
+                // ever looks at field.timestamp > since_timestamp, and a field's
+                // own timestamp never changes once merged (until its origin
+                // writes a newer one), the entry becomes permanently invisible to
+                // every future export - found via a 3-node relay chain where B
+                // correctly relayed one neighbor's data onward but never the
+                // other's, depending purely on which one's frame happened to
+                // arrive before B's own clock ticked past its timestamp.
+                //
+                // With the bounded exporter the ceiling is exact: the highest
+                // timestamp actually carried. Records beyond it (truncated this
+                // round) stay eligible for the next slot.
+                runtime->shared_gossip_watermark = included_max_ts;
+            }
+        } else if (beacon_due) {
+            // Digest beacon: header-only frame (zero records) carrying this
+            // node's view digest, so peers keep detecting divergence even when
+            // nobody has fresh data to gossip. Without it, a delta lost during
+            // churn leaves both sides silent AND blind - the loser cannot know
+            // its view differs until it sees a digest that disagrees with it.
+            if (fleece_state_manager_export_shared_delta_bounded(runtime->state_manager,
+                                                                 UINT64_MAX, 0,
+                                                                 &shared_frame, &shared_frame_size,
+                                                                 NULL) == 0) {
+                fleece_comms_send(runtime->comms, "broadcast", shared_frame, shared_frame_size);
+                fleece_free(shared_frame);
+            }
         }
-        // The watermark must track this stream's own high-water mark (the
-        // highest field.timestamp actually eligible for export_delta's
-        // filter), not the manager's global local_timestamp clock. That
-        // clock also advances on every import (merge_shared's own
-        // max(local, remote) bump - see fleece_state_manager.c) and on
-        // every LOCAL write regardless of destination, so a node that has
-        // ticked a while before first hearing a given peer already has a
-        // local_timestamp well past that peer's own (independently
-        // clocked, so typically much lower) field timestamps. Advancing
-        // the watermark to that global clock skips straight past those
-        // merged-but-not-yet-exported fields: since export_delta only
-        // ever looks at field.timestamp > since_timestamp, and a field's
-        // own timestamp never changes once merged (until its origin
-        // writes a newer one), the entry becomes permanently invisible to
-        // every future export - found via a 3-node relay chain where B
-        // correctly relayed one neighbor's data onward but never the
-        // other's, depending purely on which one's frame happened to
-        // arrive before B's own clock ticked past its timestamp.
-        // get_shared_hw() reports the real per-stream ceiling instead, so
-        // the watermark can never advance past data this export actually
-        // had a chance to include.
-        runtime->shared_gossip_watermark = fleece_state_manager_get_shared_hw(runtime->state_manager);
-
         runtime_send_resync_requests(runtime);
 
         runtime->gossip_tick_count++;
