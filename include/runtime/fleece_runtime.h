@@ -43,6 +43,15 @@ void fleece_runtime_set_tick_callback(FleeceRuntime* runtime,
                                       void (*cb)(FleeceRuntime* runtime, void* user_data),
                                       void* user_data);
 
+// Overrides the steady-state gossip cadence: one batched delta frame every
+// gossip_every_ticks loop ticks, a digest beacon every beacon_every_ticks.
+// Defaults (10 / 20) are sized for a fair-shared LoRa-class channel - do NOT
+// lower them there. For transports with bandwidth to spare (native_sim sim
+// pipelines, wired backhauls), cadence 1 gives every-tick propagation.
+// Call before fleece_runtime_start().
+int fleece_runtime_set_gossip_cadence(FleeceRuntime* runtime, uint32_t gossip_every_ticks,
+                                      uint32_t beacon_every_ticks);
+
 // Sets the peer liveness TTL (in loop ticks) used to hide dead/silent peers
 // from the "swarm" script global. Optional - defaults to
 // FLEECE_DEFAULT_PEER_TTL_TICKS (see fleece_embedded.h) if never called.

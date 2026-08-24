@@ -67,7 +67,12 @@
 // between sends); at N=6 that lands under the 1/N channel share only at 10+
 // ticks (measured: 5 ticks oversubscribed a 115200-baud channel ~2x once
 // per-packet header/crypto overhead is counted).
+//
+// NOT a hard constant: fleece_runtime_set_gossip_cadence() overrides both this
+// and the beacon interval per runtime, for transports with bandwidth to spare
+// (native_sim pipelines, wired backhauls) that want sub-second propagation.
 #define FLEECE_GOSSIP_EVERY_TICKS 10
+static uint32_t s_gossip_every_ticks = FLEECE_GOSSIP_EVERY_TICKS;
 // Wire budget for one gossip delta frame. Under the single-packet payload
 // ceiling at the LoRa MTU (460), so frames never fall back to Resource/Link
 // transfer even with per-record overhead at its worst.
@@ -79,6 +84,7 @@
 // empty-delta suppression may be never (measured: post-churn silences left
 // stale values unrepaired past the convergence budget).
 #define FLEECE_BEACON_EVERY_TICKS 20
+static uint32_t s_beacon_every_ticks = FLEECE_BEACON_EVERY_TICKS;
 
 // v2 wire format: ['F']['X'][2] + CBOR [tag, origin_node_id, items...].
 //
@@ -670,12 +676,12 @@ int fleece_runtime_start(FleeceRuntime* runtime) {
         // empty sends are skipped entirely: one amortized frame instead of k
         // heartbeat frames. Peers detect missed data via the view digest in
         // whichever frames do arrive, plus the unicast liveness probe.
-        bool gossip_due = (runtime->gossip_tick_count % FLEECE_GOSSIP_EVERY_TICKS) == 0;
+        bool gossip_due = (runtime->gossip_tick_count % s_gossip_every_ticks) == 0;
         // Beacon phase offset by node id: synchronized beacons collide into
         // one N-fold burst every interval, exactly the kind of spike that
         // trips pool-pressure shedding on constrained radios.
         bool beacon_due = ((runtime->gossip_tick_count + (uint32_t)fleece_state_manager_get_node_id(runtime->state_manager))
-                           % FLEECE_BEACON_EVERY_TICKS) == 0;
+                           % s_beacon_every_ticks) == 0;
         bool have_new = fleece_state_manager_count_new_shared(runtime->state_manager, runtime->shared_gossip_watermark) > 0;
         if (gossip_due && have_new) {
             // Bounded export: never exceed the transport's single-packet
@@ -814,4 +820,13 @@ void fleece_runtime_set_tick_callback(FleeceRuntime* runtime, void (*cb)(FleeceR
     if (!runtime) return;
     runtime->tick_cb = cb;
     runtime->tick_ud = user_data;
+}
+
+int fleece_runtime_set_gossip_cadence(FleeceRuntime* runtime, uint32_t gossip_every_ticks,
+                                      uint32_t beacon_every_ticks) {
+    if (!runtime) return -1;
+    if (gossip_every_ticks == 0 || beacon_every_ticks == 0) return -1;
+    s_gossip_every_ticks = gossip_every_ticks;
+    s_beacon_every_ticks = beacon_every_ticks;
+    return 0;
 }
