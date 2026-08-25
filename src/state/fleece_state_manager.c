@@ -747,11 +747,43 @@ int fleece_state_manager_export_shared_delta_bounded(FleeceStateManager* manager
     size_t body = fleece_cbor_array_header_size(5) + fleece_cbor_uint_size(manager->node_id)
                  + fleece_cbor_uint_size(FLEECE_SHARED_OWNER_ID)
                  + 9 + 9 + 3;
-    uint64_t max_ts = 0;
-    for (uint32_t i = 0; i < manager->field_capacity; i++) take[i] = false;
+    /* Oldest-first, ALWAYS: the delta is a cap-bounded WINDOW over the
+     * stream of changed records. Packing in slot order let the watermark
+     * advance past records that didn't fit, permanently silencing them
+     * whenever the world held more changed data than one frame carries
+     * (found live: a POI written on every drone never reached the GC-SPU
+     * because telemetry keys monopolized the frame). Oldest-first with the
+     * watermark at the last SENT record rotates everything through within
+     * a few frames, no matter how large the backlog grows. */
+    uint32_t eligible[FIELD_CAPACITY];
+    uint64_t eligible_ts[FIELD_CAPACITY];
+    uint32_t eligible_n = 0;
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         struct FieldEntry* f = &manager->fields[i];
         if (!f->exists || f->node_id != FLEECE_SHARED_OWNER_ID || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
+        eligible[eligible_n] = i;
+        eligible_ts[eligible_n] = f->timestamp;
+        eligible_n++;
+    }
+    /* insertion sort by timestamp ascending (n <= capacity, nearly sorted) */
+    for (uint32_t a = 1; a < eligible_n; a++) {
+        uint32_t idx = eligible[a];
+        uint64_t ts = eligible_ts[a];
+        uint32_t b = a;
+        while (b > 0 && eligible_ts[b - 1] > ts) {
+            eligible[b] = eligible[b - 1];
+            eligible_ts[b] = eligible_ts[b - 1];
+            b--;
+        }
+        eligible[b] = idx;
+        eligible_ts[b] = ts;
+    }
+
+    uint64_t max_ts = 0;
+    for (uint32_t i = 0; i < manager->field_capacity; i++) take[i] = false;
+    for (uint32_t e = 0; e < eligible_n; e++) {
+        uint32_t i = eligible[e];
+        struct FieldEntry* f = &manager->fields[i];
         if (f->timestamp > max_ts) max_ts = f->timestamp;
         uint32_t name_len = (uint32_t)strlen(f->name);
         uint32_t data_len = f->is_tombstone ? 0 : f->size;
@@ -761,7 +793,7 @@ int fleece_state_manager_export_shared_delta_bounded(FleeceStateManager* manager
                    + fleece_cbor_text_size(name_len)
                    + fleece_cbor_uint_size(f->timestamp)
                    + fleece_cbor_bytes_size(data_len);
-        if (count > 0 && body + rec > cap_bytes) continue;
+        if (count > 0 && body + rec > cap_bytes) break;  /* oldest-first window ends here */
         body += rec;
         take[i] = true;
         count++;
