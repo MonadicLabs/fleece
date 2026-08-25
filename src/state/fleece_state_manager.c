@@ -551,6 +551,19 @@ uint32_t fleece_state_manager_list_nodes(FleeceStateManager* manager, uint64_t* 
     return count;
 }
 
+uint32_t fleece_state_manager_list_heard_peers(FleeceStateManager* manager, uint64_t* node_ids_out, uint32_t max_nodes) {
+    if (!manager || !node_ids_out || max_nodes == 0) return 0;
+
+    uint32_t count = 0;
+    for (int i = 0; i < FLEECE_MAX_TRACKED_PEERS && count < max_nodes; i++) {
+        if (!manager->peers_seen[i].exists) continue;
+        uint64_t id = manager->peers_seen[i].node_id;
+        if (id == manager->node_id || id == FLEECE_SHARED_OWNER_ID) continue;  // self / the shared namespace aren't peers
+        node_ids_out[count++] = id;
+    }
+    return count;
+}
+
 uint32_t fleece_state_manager_list_fields(FleeceStateManager* manager, uint64_t owner_node_id, char names_out[][FLEECE_FIELD_NAME_MAX], uint32_t max_names) {
     if (!manager || !names_out || max_names == 0) return 0;
 

@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include "state/fleece_state_manager.h"
 #include "embedded/fleece_embedded.h"
+#include "fleece_alloc.h"
 
 static int g_failures = 0;
 
@@ -101,6 +102,45 @@ static void test_swarm_view(void) {
     fleece_embedded_destroy(embedded);
     fleece_state_manager_destroy(manager);
     printf("Done: swarm view test\n");
+}
+
+static void test_swarm_shows_shared_only_peer(void) {
+    /* Regression: gossip carries only the shared/world stream (self streams
+     * are node-local), so a real mesh peer owns NO node-local fields on a
+     * remote node - every field of theirs arrives under
+     * FLEECE_SHARED_OWNER_ID. Swarm enumeration must therefore be driven by
+     * the liveness table (who we heard from), not field ownership, or
+     * gossiping peers stay invisible to scripts forever. */
+    printf("Running swarm-shares-shared-only-peer test...\n");
+
+    FleeceStateManager* b = fleece_state_manager_create_with_node_id(0x5151515151515151ULL);
+    CHECK(fleece_state_manager_set_shared(b, "hb", (const uint8_t*)"7", 1) == 0,
+          "peer publishing one shared heartbeat should succeed");
+    uint8_t* frame = NULL;
+    uint32_t frame_size = 0;
+    CHECK(fleece_state_manager_export_shared(b, &frame, &frame_size) == 0 && frame != NULL,
+          "exporting the shared stream should succeed");
+
+    FleeceStateManager* a = fleece_state_manager_create_with_node_id(0x5252525252525252ULL);
+    bool behind = false;
+    uint64_t sender = 0;
+    CHECK(fleece_state_manager_import_from(a, frame, frame_size, NULL, &behind, &sender) == 0,
+          "importing the peer's shared frame should succeed");
+    CHECK(sender == 0x5151515151515151ULL, "the frame sender should be the peer");
+
+    FleeceEmbedded* embedded = make_embedded(a);
+    CHECK(fleece_embedded_execute(embedded,
+        "var ids = Object.keys(swarm);"
+        "if (ids.length !== 1 || ids[0] !== '5151515151515151') "
+        "throw new Error('a shared-only gossip peer must still appear in swarm: ' + ids);"
+        "if (!('hb' in world)) throw new Error('the shared field should be in world');"
+    ) == 0, "swarm must list a peer heard from only via the shared stream");
+
+    fleece_embedded_destroy(embedded);
+    fleece_state_manager_destroy(a);
+    fleece_state_manager_destroy(b);
+    fleece_free(frame);
+    printf("Done: swarm-shares-shared-only-peer test\n");
 }
 
 static void test_console_log_no_crash(void) {
@@ -303,6 +343,7 @@ int main(void) {
     test_self_id();
     printf("\n");
     test_swarm_view();
+    test_swarm_shows_shared_only_peer();
     printf("\n");
     test_console_log_no_crash();
     printf("\n");

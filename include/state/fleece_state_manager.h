@@ -67,6 +67,15 @@ void fleece_state_manager_tick(FleeceStateManager* manager);
 // fleece_embedded_set_peer_ttl_ticks() in fleece_embedded.h.
 uint64_t fleece_state_manager_ticks_since_seen(FleeceStateManager* manager, uint64_t node_id);
 
+// Enumerate every node id this manager has ever heard from (import or
+// merge_named), TTL filtering left to the caller. Deliberately does NOT
+// enumerate field owners: since self streams became node-local, a gossiping
+// peer's fields all arrive under FLEECE_SHARED_OWNER_ID, so field ownership
+// identifies only the local node - the liveness table is the only record
+// that gossip peers exist at all. The embedded "swarm" view is built from
+// this; without it, remote peers would be invisible to scripts forever.
+uint32_t fleece_state_manager_list_heard_peers(FleeceStateManager* manager, uint64_t* node_ids_out, uint32_t max_nodes);
+
 // Set a field value with LWW semantics (raw key, implicitly owned by the local node)
 int fleece_state_manager_set(FleeceStateManager* manager, uint32_t key, const uint8_t* data, uint32_t size);
 

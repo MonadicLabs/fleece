@@ -388,8 +388,14 @@ static JSValue js_swarm_nodes(JSContext* ctx, JSValueConst this_val, int argc, J
     if (!emb || !emb->manager) return JS_NewArray(ctx);
 
     uint64_t local_id = fleece_state_manager_get_node_id(emb->manager);
+    /* Enumerate HEARD peers, not field owners: gossip only carries the
+     * shared/world stream (self streams are node-local), so a remote peer's
+     * fields are all owned by FLEECE_SHARED_OWNER_ID locally and field
+     * ownership can never identify a peer. The liveness table is the only
+     * record that remote peers exist at all; the TTL check below still
+     * hides silent ones. */
     uint64_t ids[FLEECE_JS_LIST_MAX];
-    uint32_t count = fleece_state_manager_list_nodes(emb->manager, ids, FLEECE_JS_LIST_MAX);
+    uint32_t count = fleece_state_manager_list_heard_peers(emb->manager, ids, FLEECE_JS_LIST_MAX);
 
     JSValue arr = JS_NewArray(ctx);
     uint32_t out_idx = 0;
