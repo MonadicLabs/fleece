@@ -173,6 +173,28 @@ void fleece_goap_brain_set_max_action_ticks(FleeceGoapBrain* brain, uint32_t max
 // this and always retries every ranked goal every tick.
 void fleece_goap_brain_set_goal_cooldown_ticks(FleeceGoapBrain* brain, uint32_t ticks);
 
+// --- Goal-pool mode (native CBBA-over-the-CRDT claiming) ------------------
+//
+// Turns the brain into a shared-goal-pool auctioneer: every tick, before
+// exec/replan, it (re-)claims the best-scoring eligible entry from world
+// keys starting with goal_prefix -- exclusive ownership, scored contest
+// margin, dead-peer takeover, periodic re-assertion so an unmoving claim
+// keeps propagating through normal delta-gossip -- via
+// fleece_embedded_claim_best_goal() (see that function's own extensive
+// doc comment in fleece_embedded.h for the full mechanics and the
+// convergence incident that motivated it). The result is published into
+// self[current_key_field] as a plain string (empty when nothing is held),
+// so authored exec/pre/goal/cost sources read it exactly like any other
+// self field -- bb.self[current_key_field]. Scoring one candidate still
+// calls back into a JS-authored `scoreGoal(key, record) -> number` global
+// the loaded script must define (mission-specific: distance, priority,
+// capability match); the claiming mechanics around it do not touch JS.
+//
+// Pass goal_prefix == NULL (or "") to turn goal-pool mode off (the
+// default). Call any time; takes effect on the brain's next tick.
+void fleece_goap_brain_set_goal_pool(FleeceGoapBrain* brain, const char* goal_prefix,
+                                      const char* current_key_field, double contest_margin);
+
 // Current brain state, for introspection/logging. NULL when none.
 const char* fleece_goap_brain_goal_id(const FleeceGoapBrain* brain);
 const char* fleece_goap_brain_action_id(const FleeceGoapBrain* brain);

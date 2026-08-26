@@ -578,6 +578,9 @@ struct FleeceGoapBrain {
     void* world_model_ud;
     FleeceGoapDivergenceFn divergence_cb;   // eff-predicted vs exec-produced (debug aid)
     void* divergence_ud;
+    char goal_pool_prefix[FLEECE_FIELD_NAME_MAX];    // empty = goal-pool mode off
+    char goal_pool_key_field[FLEECE_FIELD_NAME_MAX]; // self field the held key is published into
+    double goal_pool_contest_margin;
 };
 
 FleeceGoapBrain* fleece_goap_brain_create(FleeceEmbedded* embedded, FleeceGoap* goap) {
@@ -718,9 +721,17 @@ static void report_divergences(FleeceGoapBrain* b, uint32_t action_idx,
     if (n > 0) b->divergence_cb(b, action_idx, diffs, n, b->divergence_ud);
 }
 
+static void goal_pool_tick(FleeceGoapBrain* b);
+
 int fleece_goap_brain_tick(FleeceGoapBrain* b) {
     if (!b) return -1;
     b->tick_count++;
+
+    // 0. Goal-pool auction (only when configured, see
+    //    fleece_goap_brain_set_goal_pool) -- runs first so this SAME tick's
+    //    exec body already sees an up-to-date claim in
+    //    self[goal_pool_key_field].
+    goal_pool_tick(b);
 
     // 1. Run the in-flight action's exec() body. The body does the real work
     //    every tick (mutating its bb copy, which we commit so the world sees
@@ -813,6 +824,73 @@ void fleece_goap_brain_set_max_action_ticks(FleeceGoapBrain* b, uint32_t max_tic
 void fleece_goap_brain_set_goal_cooldown_ticks(FleeceGoapBrain* b, uint32_t ticks) {
     if (!b) return;
     b->goal_cooldown_ticks = ticks;
+}
+
+void fleece_goap_brain_set_goal_pool(FleeceGoapBrain* b, const char* goal_prefix,
+                                      const char* current_key_field, double contest_margin) {
+    if (!b) return;
+    if (!goal_prefix || !goal_prefix[0] || !current_key_field || !current_key_field[0]) {
+        b->goal_pool_prefix[0] = '\0';
+        return;
+    }
+    strncpy(b->goal_pool_prefix, goal_prefix, sizeof(b->goal_pool_prefix) - 1);
+    b->goal_pool_prefix[sizeof(b->goal_pool_prefix) - 1] = '\0';
+    strncpy(b->goal_pool_key_field, current_key_field, sizeof(b->goal_pool_key_field) - 1);
+    b->goal_pool_key_field[sizeof(b->goal_pool_key_field) - 1] = '\0';
+    b->goal_pool_contest_margin = contest_margin;
+}
+
+// Reads b->goal_pool_key_field (a JSON string field, quotes included, same
+// convention every fleece string field uses) and strips the quotes -- the
+// currently-held pool key, or an empty string if none. A byte-level strip
+// rather than a full JS_ParseJSON round trip: the field's shape is fully
+// controlled by this same module (only goal_pool_tick() ever writes it), so
+// there is nothing here that needs a general JSON parser.
+static void goal_pool_read_current(FleeceStateManager* sm, uint64_t self_id,
+                                    const char* field, char* out, uint32_t out_cap) {
+    out[0] = '\0';
+    uint8_t* data = NULL;
+    uint32_t size = 0;
+    if (fleece_state_manager_get_named(sm, self_id, field, &data, &size) != 0 || !data) return;
+    const uint8_t* start = data;
+    uint32_t len = size;
+    if (len >= 2 && start[0] == '"' && start[len - 1] == '"') {
+        start++;
+        len -= 2;
+    }
+    if (len >= out_cap) len = out_cap - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    fleece_free(data);
+}
+
+// Runs one goal-pool auction tick when configured (fleece_goap_brain_set_
+// goal_pool): claims/holds the best-scoring eligible pool entry via
+// fleece_embedded_claim_best_goal() and publishes the result into
+// goal_pool_key_field as a JSON string self field, so an authored exec/pre/
+// goal source can read it off bb.self exactly like any other field. Called
+// at the very top of fleece_goap_brain_tick(), before exec/replan, so the
+// SAME tick's exec body already sees an up-to-date claim.
+static void goal_pool_tick(FleeceGoapBrain* b) {
+    if (!b->goal_pool_prefix[0]) return;
+    FleeceStateManager* sm = (FleeceStateManager*)fleece_embedded_get_state_manager(b->embedded);
+    if (!sm) return;
+    uint64_t self_id = fleece_state_manager_get_node_id(sm);
+
+    char current[FLEECE_FIELD_NAME_MAX];
+    goal_pool_read_current(sm, self_id, b->goal_pool_key_field, current, sizeof(current));
+
+    char claimed[FLEECE_FIELD_NAME_MAX];
+    claimed[0] = '\0';
+    fleece_embedded_claim_best_goal(b->embedded, b->goal_pool_prefix,
+                                     current[0] ? current : NULL, b->goal_pool_contest_margin,
+                                     claimed, sizeof(claimed));
+
+    char json_val[FLEECE_FIELD_NAME_MAX + 4];
+    int written = snprintf(json_val, sizeof(json_val), "\"%s\"", claimed);
+    if (written > 0 && (size_t)written < sizeof(json_val)) {
+        fleece_state_manager_set_named(sm, b->goal_pool_key_field, (const uint8_t*)json_val, (uint32_t)written);
+    }
 }
 
 const char* fleece_goap_brain_goal_id(const FleeceGoapBrain* b) {

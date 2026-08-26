@@ -596,6 +596,284 @@ static JSValue js_world_compare_and_set(JSContext* ctx, JSValueConst this_val, i
     return JS_NewBool(ctx, rc == 0);
 }
 
+// --- claimBestGoal: native CBBA-over-the-CRDT claiming --------------------
+//
+// A generic, mission-agnostic primitive: auctioning a shared pool of world
+// records via scored compare-and-set, with dead-peer takeover and automatic
+// re-assertion of a held claim. Originally hand-rolled per-mission in
+// swarmpu's own JS (see docs/decisions/026-cbba-goal-pool-auction.md in that
+// superproject) — moved here because the mechanics (CAS, contest margin,
+// liveness, and especially periodic re-assertion so an unmoving claim keeps
+// getting re-exported by the normal delta-gossip path) are exactly the kind
+// of thing every fleece mission wanting this pattern would otherwise
+// reimplement from scratch in JS, with the same subtle convergence trap
+// swarmpu hit doing exactly that. Scoring stays mission-specific and
+// JS-authored (distance, priority, capability match are all mission
+// concerns fleece has no business knowing about) via one well-known global
+// function the loaded script defines.
+
+// Parses `data` (raw JSON bytes for one pool record) and calls the script's
+// scoreGoal(key, parsedRecord) -> number. Returns false (ineligible) on a
+// thrown exception or a non-finite result — the scorer's own way of
+// rejecting a candidate (bad capability match, missing required field,
+// required_agents excluding this node, etc.) without a separate eligibility
+// callback.
+static bool js_score_goal(JSContext* ctx, JSValueConst score_fn, const char* key,
+                           const uint8_t* data, uint32_t size, double* out_score) {
+    // JS_ParseJSON needs a NUL-terminated buffer despite taking an explicit
+    // length -- fleece_state_manager_get_named()'s own buffer is exactly
+    // `size` bytes, no trailing NUL (raw stored bytes, verbatim). Parsing it
+    // directly one-byte-overreads into whatever heap garbage follows,
+    // intermittently (depends on what's adjacent) producing bogus parse
+    // errors -- found live, this exact call flaked between working and a
+    // "SyntaxError: Unexpected token '\x90'"-style failure on THE SAME
+    // stored bytes from one call to the next. Mirrors goap_bb_to_js()'s own
+    // established fleece_malloc(size+1)+NUL-terminate pattern just above in
+    // this file.
+    char* scratch = (char*)fleece_malloc((size_t)size + 1);
+    if (!scratch) return false;
+    memcpy(scratch, data, size);
+    scratch[size] = '\0';
+    JSValue parsed = JS_ParseJSON(ctx, scratch, size, "<goal>");
+    fleece_free(scratch);
+    if (JS_IsException(parsed)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return false;
+    }
+    JSValue key_js = JS_NewString(ctx, key);
+    JSValue argv[2] = { key_js, parsed };
+    JSValue result = JS_Call(ctx, score_fn, JS_UNDEFINED, 2, (JSValueConst*)argv);
+    JS_FreeValue(ctx, key_js);
+    JS_FreeValue(ctx, parsed);
+    if (JS_IsException(result)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, result);
+        return false;
+    }
+    double score;
+    int rc = JS_ToFloat64(ctx, &score, result);
+    JS_FreeValue(ctx, result);
+    if (rc != 0) return false;
+    if (score != score) return false;          // NaN
+    if (score > 1e300 || score < -1e300) {
+        // Treat as a finite "unbeatable"/"never" sentinel rather than
+        // propagating +/-Infinity into stored JSON (not valid JSON) or into
+        // arithmetic against CONTEST_MARGIN-style comparisons downstream.
+        score = score > 0 ? 1e300 : -1e300;
+    }
+    *out_score = score;
+    return true;
+}
+
+// Reads claim_<key> (if present) and extracts its owner (hex self.id string
+// -> uint64) and score. Returns false if absent or malformed.
+static bool read_claim(FleeceEmbedded* emb, JSContext* ctx, const char* key,
+                        uint64_t* out_owner, double* out_score,
+                        uint8_t** out_raw, uint32_t* out_raw_size) {
+    char claim_key[FLEECE_FIELD_NAME_MAX + 8];
+    snprintf(claim_key, sizeof(claim_key), "claim_%s", key);
+
+    uint8_t* data = NULL;
+    uint32_t size = 0;
+    *out_raw = NULL;
+    *out_raw_size = 0;
+    if (fleece_state_manager_get_named(emb->manager, FLEECE_SHARED_OWNER_ID, claim_key, &data, &size) != 0 ||
+        !data) {
+        return false;
+    }
+    *out_raw = data;
+    *out_raw_size = size;
+
+    // NUL-terminate before parsing -- see js_score_goal's own comment above
+    // for why (JS_ParseJSON needs it despite taking an explicit length).
+    char* scratch = (char*)fleece_malloc((size_t)size + 1);
+    if (!scratch) return false;
+    memcpy(scratch, data, size);
+    scratch[size] = '\0';
+    JSValue parsed = JS_ParseJSON(ctx, scratch, size, "<claim>");
+    fleece_free(scratch);
+    if (JS_IsException(parsed)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return false;
+    }
+    JSValue owner_js = JS_GetPropertyStr(ctx, parsed, "o");
+    JSValue score_js = JS_GetPropertyStr(ctx, parsed, "b");
+    const char* owner_hex = JS_ToCString(ctx, owner_js);
+    bool ok = false;
+    if (owner_hex) {
+        *out_owner = (uint64_t)strtoull(owner_hex, NULL, 16);
+        double score = 0;
+        if (JS_ToFloat64(ctx, &score, score_js) == 0) {
+            *out_score = score;
+            ok = true;
+        }
+        JS_FreeCString(ctx, owner_hex);
+    }
+    JS_FreeValue(ctx, owner_js);
+    JS_FreeValue(ctx, score_js);
+    JS_FreeValue(ctx, parsed);
+    return ok;
+}
+
+// Writes claim_<key> = {"o":"<self hex id>","b":<score>} via CAS.
+// expected_raw/expected_raw_size == NULL/0 means "claim only if absent".
+static int cas_claim(FleeceEmbedded* emb, const char* key, uint64_t self_id, double score,
+                      const uint8_t* expected_raw, uint32_t expected_raw_size) {
+    char claim_key[FLEECE_FIELD_NAME_MAX + 8];
+    snprintf(claim_key, sizeof(claim_key), "claim_%s", key);
+    char new_value[96];
+    int written = snprintf(new_value, sizeof(new_value), "{\"o\":\"%016llx\",\"b\":%.17g}",
+                            (unsigned long long)self_id, score);
+    if (written < 0 || (size_t)written >= sizeof(new_value)) return -1;
+    return fleece_state_manager_set_shared_cas(emb->manager, claim_key,
+                                                expected_raw_size > 0 ? expected_raw : NULL, expected_raw_size,
+                                                (const uint8_t*)new_value, (uint32_t)written);
+}
+
+// See fleece_embedded.h's own extensive doc comment for the design and
+// contract. This is the GOAP brain's core reasoning loop for goal-pool mode
+// (fleece_goap_brain_set_goal_pool, fleece_goap_js.c) -- pure C, called
+// once per brain tick, never JS-exposed. SCORING one candidate is the sole
+// piece that calls back into JS (the mission-authored `scoreGoal` global) --
+// deliberately: distance/priority/capability-match heuristics are mission
+// concerns, the claiming mechanics around them are not. See
+// docs/decisions/026-cbba-goal-pool-auction.md (swarmpu superproject) for
+// the convergence incident that motivated moving the mechanics here.
+int fleece_embedded_claim_best_goal(FleeceEmbedded* emb, const char* prefix,
+                                     const char* current_key, double contest_margin,
+                                     char* out_key, uint32_t out_key_cap) {
+    if (out_key && out_key_cap > 0) out_key[0] = '\0';
+    if (!emb || !emb->manager || !prefix || !out_key || out_key_cap == 0) return -1;
+    if (current_key && current_key[0] == '\0') current_key = NULL;
+
+    JSContext* ctx = emb->ctx;
+    size_t prefix_len = strlen(prefix);
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue score_fn = JS_GetPropertyStr(ctx, global, "scoreGoal");
+    JS_FreeValue(ctx, global);
+    if (!JS_IsFunction(ctx, score_fn)) {
+        JS_FreeValue(ctx, score_fn);
+        return -1;  // no scoreGoal(key, record) heuristic defined -- goal-pool mode can't score anything
+    }
+
+    uint64_t self_id = fleece_state_manager_get_node_id(emb->manager);
+
+    // Is my own currently-held key still genuinely mine, and what does it
+    // score right now? An owner mismatch (someone else's claim won) or a
+    // vanished record drops it unconditionally, same as swarmpu's own prior
+    // JS-side "lost" handling.
+    bool have_current = false;
+    double current_score = 0;
+    if (current_key) {
+        uint64_t owner = 0;
+        double score = 0;
+        uint8_t* raw = NULL;
+        uint32_t raw_size = 0;
+        bool claim_ok = read_claim(emb, ctx, current_key, &owner, &score, &raw, &raw_size);
+        if (raw) fleece_free(raw);
+        if (claim_ok && owner == self_id) {
+            uint8_t* data = NULL;
+            uint32_t size = 0;
+            if (fleece_state_manager_get_named(emb->manager, FLEECE_SHARED_OWNER_ID, current_key, &data, &size) == 0 && data) {
+                have_current = js_score_goal(ctx, score_fn, current_key, data, size, &current_score);
+                fleece_free(data);
+            }
+        }
+    }
+
+    char names[FLEECE_JS_LIST_MAX][FLEECE_FIELD_NAME_MAX];
+    uint32_t count = fleece_state_manager_list_fields(emb->manager, FLEECE_SHARED_OWNER_ID, names, FLEECE_JS_LIST_MAX);
+
+    char best_key[FLEECE_FIELD_NAME_MAX];
+    best_key[0] = '\0';
+    double best_score = 0;
+    uint8_t* best_expected_raw = NULL;
+    uint32_t best_expected_raw_size = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        const char* key = names[i];
+        if (strncmp(key, prefix, prefix_len) != 0) continue;
+        if (strncmp(key, "claim_", 6) == 0) continue;  // never bid on a claim record itself
+        if (current_key && strcmp(key, current_key) == 0) continue;  // scored separately above
+
+        uint8_t* data = NULL;
+        uint32_t size = 0;
+        if (fleece_state_manager_get_named(emb->manager, FLEECE_SHARED_OWNER_ID, key, &data, &size) != 0 || !data) {
+            continue;
+        }
+        double score;
+        bool eligible_score = js_score_goal(ctx, score_fn, key, data, size, &score);
+        fleece_free(data);
+        if (!eligible_score) continue;
+
+        uint64_t holder = 0;
+        double holder_score = 0;
+        uint8_t* claim_raw = NULL;
+        uint32_t claim_raw_size = 0;
+        bool has_claim = read_claim(emb, ctx, key, &holder, &holder_score, &claim_raw, &claim_raw_size);
+
+        bool eligible;
+        if (!has_claim || holder == self_id) {
+            eligible = true;  // unclaimed, or (stale) already ours
+        } else if (fleece_state_manager_ticks_since_seen(emb->manager, holder) > emb->peer_ttl_ticks) {
+            eligible = true;  // holder has gone silent -- takeover
+        } else {
+            eligible = score > holder_score + contest_margin;
+        }
+
+        if (eligible && score > best_score) {
+            best_score = score;
+            strncpy(best_key, key, sizeof(best_key) - 1);
+            best_key[sizeof(best_key) - 1] = '\0';
+            if (best_expected_raw) fleece_free(best_expected_raw);
+            best_expected_raw = claim_raw;
+            best_expected_raw_size = claim_raw_size;
+            claim_raw = NULL;
+        }
+        if (claim_raw) fleece_free(claim_raw);
+    }
+
+    bool should_switch = best_key[0] != '\0' && (!have_current || best_score > current_score + contest_margin);
+
+    const char* result_key = NULL;
+    if (should_switch) {
+        int rc = cas_claim(emb, best_key, self_id, best_score, best_expected_raw, best_expected_raw_size);
+        if (rc == 0) {
+            if (have_current) {
+                char old_claim_key[FLEECE_FIELD_NAME_MAX + 8];
+                snprintf(old_claim_key, sizeof(old_claim_key), "claim_%s", current_key);
+                fleece_state_manager_remove_shared(emb->manager, old_claim_key);
+            }
+            result_key = best_key;
+        } else if (have_current) {
+            result_key = current_key;  // lost the race -- keep what I already hold
+        }
+    } else if (have_current) {
+        // Re-assert: a same-value CAS touch bumps this claim's LWW
+        // timestamp so the next delta-export round carries it again. See
+        // this primitive's own block comment for why that matters.
+        uint8_t* raw = NULL;
+        uint32_t raw_size = 0;
+        char claim_key[FLEECE_FIELD_NAME_MAX + 8];
+        snprintf(claim_key, sizeof(claim_key), "claim_%s", current_key);
+        if (fleece_state_manager_get_named(emb->manager, FLEECE_SHARED_OWNER_ID, claim_key, &raw, &raw_size) == 0 && raw) {
+            cas_claim(emb, current_key, self_id, current_score, raw, raw_size);
+            fleece_free(raw);
+        }
+        result_key = current_key;
+    }
+
+    if (result_key) {
+        strncpy(out_key, result_key, out_key_cap - 1);
+        out_key[out_key_cap - 1] = '\0';
+    }
+
+    if (best_expected_raw) fleece_free(best_expected_raw);
+    JS_FreeValue(ctx, score_fn);
+    return 0;
+}
+
 static JSValue js_platform_names(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     (void)this_val; (void)argc; (void)argv;
     FleeceEmbedded* emb = get_embedded(ctx);
@@ -734,6 +1012,10 @@ int fleece_embedded_set_peer_ttl_ticks(FleeceEmbedded* embedded, uint64_t ttl_ti
     return 0;
 }
 
+uint64_t fleece_embedded_get_peer_ttl_ticks(FleeceEmbedded* embedded) {
+    return embedded ? embedded->peer_ttl_ticks : FLEECE_DEFAULT_PEER_TTL_TICKS;
+}
+
 int fleece_embedded_register_c_functions(FleeceEmbedded* embedded) {
     if (!embedded || !embedded->ctx || !embedded->manager) {
         return -1;
@@ -763,6 +1045,10 @@ int fleece_embedded_register_c_functions(FleeceEmbedded* embedded) {
     // Permanent global (not deleted by the prelude below, unlike __world_* above) -
     // a 3-argument atomic operation doesn't fit the world Proxy's get/set/delete traps.
     JS_SetPropertyStr(ctx, global, "worldCompareAndSet", JS_NewCFunction(ctx, js_world_compare_and_set, "worldCompareAndSet", 3));
+    // fleece_embedded_claim_best_goal() is deliberately NOT exposed here: it's
+    // the GOAP brain's internal goal-pool reasoning loop (fleece_goap_js.c's
+    // fleece_goap_brain_set_goal_pool), not a script-callable primitive --
+    // see its own doc comment in fleece_embedded.h.
 
     JS_FreeValue(ctx, global);
 

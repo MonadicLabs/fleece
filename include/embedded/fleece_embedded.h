@@ -51,6 +51,13 @@ int fleece_embedded_set_platform(FleeceEmbedded* embedded, FleecePlatform* platf
 // (shared fields have no single owner to go stale).
 int fleece_embedded_set_peer_ttl_ticks(FleeceEmbedded* embedded, uint64_t ttl_ticks);
 
+// Reads back the currently configured peer liveness TTL (the default if
+// fleece_embedded_set_peer_ttl_ticks was never called). Used by
+// fleece_embedded_claim_best_goal() to judge dead-peer takeover with the
+// SAME liveness threshold the "swarm" script global already uses, rather
+// than a second, independently-tunable notion of "alive".
+uint64_t fleece_embedded_get_peer_ttl_ticks(FleeceEmbedded* embedded);
+
 // Register the native bindings (console.log, self, swarm, platform, world)
 // with the JS context. Requires fleece_embedded_set_state_manager() to have
 // been called first.
@@ -82,6 +89,42 @@ void* fleece_embedded_get_context(FleeceEmbedded* embedded);
 
 // Get the bound state manager (FleeceStateManager*), or NULL if none was set.
 void* fleece_embedded_get_state_manager(FleeceEmbedded* embedded);
+
+// --- claimBestGoal: native CBBA-over-the-CRDT claiming ---------------------
+//
+// A generic, mission-agnostic primitive: auctioning a shared pool of world
+// records via scored compare-and-set, with dead-peer takeover and automatic
+// re-assertion of a held claim so it keeps getting re-sent by the normal
+// delta-gossip path (a claim written exactly once, by design, is otherwise
+// never re-transmitted - found running this under load, two nodes that
+// each locally win a genuine simultaneous claim race can then disagree
+// indefinitely, since neither side's write ever gets a second chance at an
+// LWW comparison on the other).
+//
+// This is the CORE REASONING LOOP (CAS, contest margin, liveness, periodic
+// re-assert) - deliberately pure C, not JS: it is the part every mission
+// wanting this pattern would otherwise reimplement from scratch, and the
+// part where a hand-rolled JS version hit the convergence bug above.
+// SCORING one candidate is the one piece that stays a JS-authored
+// heuristic (distance, priority, capability match are mission concerns
+// fleece has no business knowing about): this function calls back into a
+// well-known global JS function, `scoreGoal(key, record) -> number`, that
+// the loaded script must define. NaN, a thrown exception, or no such
+// function marks a candidate ineligible.
+//
+// Scans world keys with the given prefix, skips `current_key` (scored
+// separately, for the "should I keep holding it" comparison), and claims
+// the best eligible candidate: unclaimed, held by a peer silent for more
+// than fleece_embedded_get_peer_ttl_ticks(), or held by a live peer but
+// beaten by more than contest_margin. Switching away from current_key
+// itself needs the same contest_margin win. Writes the resulting key (or
+// empty string if nothing is held/eligible) into out_key (capacity
+// out_key_cap, NUL-terminated, truncated safely if it doesn't fit).
+// Returns 0 on success, -1 on a real error (no manager, no scoreGoal
+// defined, bad arguments).
+int fleece_embedded_claim_best_goal(FleeceEmbedded* embedded, const char* prefix,
+                                     const char* current_key, double contest_margin,
+                                     char* out_key, uint32_t out_key_cap);
 
 // Install the allocator used by the whole fleece stack - the library's own
 // allocations (state-manager field values, GOAP planner A* tables,
