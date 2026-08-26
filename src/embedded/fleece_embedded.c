@@ -741,6 +741,7 @@ static int cas_claim(FleeceEmbedded* emb, const char* key, uint64_t self_id, dou
 // the convergence incident that motivated moving the mechanics here.
 int fleece_embedded_claim_best_goal(FleeceEmbedded* emb, const char* prefix,
                                      const char* current_key, double contest_margin,
+                                     bool allow_reassert,
                                      char* out_key, uint32_t out_key_cap) {
     if (out_key && out_key_cap > 0) out_key[0] = '\0';
     if (!emb || !emb->manager || !prefix || !out_key || out_key_cap == 0) return -1;
@@ -852,14 +853,18 @@ int fleece_embedded_claim_best_goal(FleeceEmbedded* emb, const char* prefix,
     } else if (have_current) {
         // Re-assert: a same-value CAS touch bumps this claim's LWW
         // timestamp so the next delta-export round carries it again. See
-        // this primitive's own block comment for why that matters.
-        uint8_t* raw = NULL;
-        uint32_t raw_size = 0;
-        char claim_key[FLEECE_FIELD_NAME_MAX + 8];
-        snprintf(claim_key, sizeof(claim_key), "claim_%s", current_key);
-        if (fleece_state_manager_get_named(emb->manager, FLEECE_SHARED_OWNER_ID, claim_key, &raw, &raw_size) == 0 && raw) {
-            cas_claim(emb, current_key, self_id, current_score, raw, raw_size);
-            fleece_free(raw);
+        // this primitive's own block comment for why that matters, and why
+        // the caller MUST gate allow_reassert well below its own call
+        // frequency instead of passing true every tick.
+        if (allow_reassert) {
+            uint8_t* raw = NULL;
+            uint32_t raw_size = 0;
+            char claim_key[FLEECE_FIELD_NAME_MAX + 8];
+            snprintf(claim_key, sizeof(claim_key), "claim_%s", current_key);
+            if (fleece_state_manager_get_named(emb->manager, FLEECE_SHARED_OWNER_ID, claim_key, &raw, &raw_size) == 0 && raw) {
+                cas_claim(emb, current_key, self_id, current_score, raw, raw_size);
+                fleece_free(raw);
+            }
         }
         result_key = current_key;
     }

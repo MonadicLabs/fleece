@@ -101,6 +101,26 @@ void* fleece_embedded_get_state_manager(FleeceEmbedded* embedded);
 // indefinitely, since neither side's write ever gets a second chance at an
 // LWW comparison on the other).
 //
+// `allow_reassert` gates ONLY the same-value CAS touch that keeps an
+// already-held claim propagating - the scan/eligibility/switch logic above
+// always runs. The caller MUST throttle this to true well below its own
+// call frequency (goal_pool_tick() calls this every brain tick; reasserting
+// on every one of those is itself a convergence bug, not a fix: a local
+// reassert bumps this node's own LWW timestamp on every call, so if that
+// happens faster than a round of gossip can carry a genuinely conflicting
+// peer's claim back and forth, this node's own copy is ALWAYS the more
+// "recent" one by the time the peer's write arrives - merge_shared() keeps
+// the (correctly, by LWW rules) newer incumbent every time, and the
+// conflict never gets a fair single comparison. Found live: two to three
+// drones that each locally won a simultaneous claim on the same goal
+// disagreed *forever*, one initial claim event each and then total silence,
+// because every drone's own goal-pool tick re-touched its claim far faster
+// than the batched gossip cadence could ever land a competing write while
+// the local timestamp held still. Throttling reassertion to a cadence at or
+// below the gossip send cadence gives an actually-conflicting peer claim a
+// real window to be merged and change what `current_key` resolves to next
+// tick - see goal_pool_tick()'s own throttle in fleece_goap_js.c.
+//
 // This is the CORE REASONING LOOP (CAS, contest margin, liveness, periodic
 // re-assert) - deliberately pure C, not JS: it is the part every mission
 // wanting this pattern would otherwise reimplement from scratch, and the
@@ -124,6 +144,7 @@ void* fleece_embedded_get_state_manager(FleeceEmbedded* embedded);
 // defined, bad arguments).
 int fleece_embedded_claim_best_goal(FleeceEmbedded* embedded, const char* prefix,
                                      const char* current_key, double contest_margin,
+                                     bool allow_reassert,
                                      char* out_key, uint32_t out_key_cap);
 
 // Install the allocator used by the whole fleece stack - the library's own

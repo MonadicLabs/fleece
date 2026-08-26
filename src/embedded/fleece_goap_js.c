@@ -518,9 +518,31 @@ int fleece_goap_js_bb_commit(FleeceEmbedded* embedded, const FleeceGoapBlackboar
     if (!embedded || !bb) return -1;
     FleeceStateManager* sm = (FleeceStateManager*)fleece_embedded_get_state_manager(embedded);
     if (!sm) return -1;
+    uint64_t self_id = fleece_state_manager_get_node_id(sm);
 
     for (uint32_t i = 0; i < bb->count; i++) {
         const FleeceGoapField* f = &bb->fields[i];
+        // Skip the write entirely when the field's value is byte-identical to
+        // what is already stored: every action exec runs every tick and its
+        // returned blackboard mirrors the FULL loaded snapshot (self AND
+        // world/shared fields), not just what the JS body actually touched.
+        // Committing all of it unconditionally re-stamps EVERY shared field
+        // with a fresh LWW timestamp on EVERY tick, forever - a genuinely
+        // conflicting peer's write (correct, older) can then never win a
+        // comparison against this node's own perpetually-refreshed copy, no
+        // matter how the caller throttles its OWN reassertion logic. Found
+        // live via the goal-pool auction: contested claim/goal records never
+        // converged because bb_commit was re-touching all of them every
+        // single tick regardless of goal_pool_tick()'s own reassert cadence.
+        uint64_t owner = f->is_shared ? FLEECE_SHARED_OWNER_ID : self_id;
+        uint8_t* existing = NULL;
+        uint32_t existing_size = 0;
+        bool unchanged = fleece_state_manager_get_named(sm, owner, f->name, &existing, &existing_size) == 0 &&
+                          existing_size == f->size &&
+                          (f->size == 0 || memcmp(existing, f->data, f->size) == 0);
+        if (existing) fleece_free(existing);
+        if (unchanged) continue;
+
         int rc = f->is_shared
             ? fleece_state_manager_set_shared(sm, f->name, f->data, f->size)
             : fleece_state_manager_set_named(sm, f->name, f->data, f->size);
@@ -864,6 +886,20 @@ static void goal_pool_read_current(FleeceStateManager* sm, uint64_t self_id,
     fleece_free(data);
 }
 
+// Reassertion cadence for an already-held goal-pool claim, in brain ticks.
+// goal_pool_tick() runs every brain tick, but fleece_embedded_claim_best_
+// goal()'s own doc comment explains why blindly reasserting that often is a
+// convergence bug, not a fix: reasserting faster than a gossip round can
+// carry a genuinely conflicting peer's claim back and forth means this
+// node's own copy is always the "newer" one by the time the peer's write
+// arrives, so merge_shared() never gets a fair single comparison and two
+// nodes that each locally won a simultaneous claim race disagree forever.
+// This must stay comfortably above the runtime's gossip send cadence
+// (FLEECE_GOSSIP_EVERY_TICKS in fleece_runtime.c, default 10 ticks) so a
+// competing claim gets at least one real gossip round-trip to land and be
+// merged before this node touches its own copy again.
+#define FLEECE_GOAL_POOL_REASSERT_EVERY_TICKS 30
+
 // Runs one goal-pool auction tick when configured (fleece_goap_brain_set_
 // goal_pool): claims/holds the best-scoring eligible pool entry via
 // fleece_embedded_claim_best_goal() and publishes the result into
@@ -880,10 +916,13 @@ static void goal_pool_tick(FleeceGoapBrain* b) {
     char current[FLEECE_FIELD_NAME_MAX];
     goal_pool_read_current(sm, self_id, b->goal_pool_key_field, current, sizeof(current));
 
+    bool allow_reassert = (b->tick_count % FLEECE_GOAL_POOL_REASSERT_EVERY_TICKS) == 0;
+
     char claimed[FLEECE_FIELD_NAME_MAX];
     claimed[0] = '\0';
     fleece_embedded_claim_best_goal(b->embedded, b->goal_pool_prefix,
                                      current[0] ? current : NULL, b->goal_pool_contest_margin,
+                                     allow_reassert,
                                      claimed, sizeof(claimed));
 
     char json_val[FLEECE_FIELD_NAME_MAX + 4];

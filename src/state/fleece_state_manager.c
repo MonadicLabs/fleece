@@ -303,9 +303,17 @@ int fleece_state_manager_set(FleeceStateManager* manager, uint32_t key, const ui
         return -1;
     }
 
+    // Deliberately NOT touching last_write_tick here: its only consumer
+    // (fleece_state_manager_ticks_since_last_write, via
+    // runtime_send_resync_requests's quiescence gate) exists to delay
+    // SHARED-stream repair while THIS node is itself mid-burst on shared
+    // writes, not to track local/self-stream activity in general. A
+    // self-field write (own position, own currentGoalKey, ...) says nothing
+    // about shared-digest churn; counting it here starved the gate under any
+    // workload that touches a self field every tick (which most do) - found
+    // live via the goal-pool auction, where self.currentGoalKey is rewritten
+    // every brain tick and the gate never once opened as a result.
     return upsert_field(manager, key, manager->node_id, manager->node_id, NULL, data, size, ++manager->local_timestamp, false);
-    manager->last_write_tick = manager->current_tick;
-    manager->last_write_tick = manager->current_tick;
 }
 
 int fleece_state_manager_get(FleeceStateManager* manager, uint32_t key, uint8_t** data, uint32_t* size) {
@@ -351,7 +359,8 @@ int fleece_state_manager_remove(FleeceStateManager* manager, uint32_t key) {
     // loses its own LWW race on every peer holding that value, so the delete
     // never propagates.
     field->timestamp = ++manager->local_timestamp;
-    manager->last_write_tick = manager->current_tick;
+    // Deliberately NOT touching last_write_tick -- self-stream, same
+    // reasoning as fleece_state_manager_set()'s own comment.
     field->is_tombstone = true;
     return 0;
 }
@@ -404,9 +413,9 @@ int fleece_state_manager_set_named(FleeceStateManager* manager, const char* name
         return -1;
     }
 
+    // Deliberately NOT touching last_write_tick -- see fleece_state_manager_set()'s
+    // own comment just above; the same reasoning applies here.
     return upsert_field(manager, hash_name(name), manager->node_id, manager->node_id, name, data, size, ++manager->local_timestamp, false);
-    manager->last_write_tick = manager->current_tick;
-    manager->last_write_tick = manager->current_tick;
 }
 
 int fleece_state_manager_remove_named(FleeceStateManager* manager, const char* name) {
@@ -422,7 +431,8 @@ int fleece_state_manager_remove_named(FleeceStateManager* manager, const char* n
     field->size = 0;
     field->is_tombstone = true;
     field->timestamp = ++manager->local_timestamp;
-    manager->last_write_tick = manager->current_tick;
+    // Deliberately NOT touching last_write_tick -- self-stream, same
+    // reasoning as fleece_state_manager_set()'s own comment.
     return 0;
 }
 
@@ -475,9 +485,8 @@ int fleece_state_manager_set_shared(FleeceStateManager* manager, const char* nam
         return -1;
     }
 
+    manager->last_write_tick = manager->current_tick;
     return upsert_field(manager, hash_name(name), FLEECE_SHARED_OWNER_ID, manager->node_id, name, data, size, ++manager->local_timestamp, false);
-    manager->last_write_tick = manager->current_tick;
-    manager->last_write_tick = manager->current_tick;
 }
 
 int fleece_state_manager_remove_shared(FleeceStateManager* manager, const char* name) {
@@ -523,9 +532,9 @@ int fleece_state_manager_set_shared_cas(FleeceStateManager* manager, const char*
     }
 
     if (upsert_field(manager, key, FLEECE_SHARED_OWNER_ID, manager->node_id, name, new_data, new_size, ++manager->local_timestamp, false) != 0) {
-    manager->last_write_tick = manager->current_tick;
         return -1;
     }
+    manager->last_write_tick = manager->current_tick;
     return 0;
 }
 
@@ -797,7 +806,6 @@ int fleece_state_manager_export_shared_delta_bounded(FleeceStateManager* manager
     for (uint32_t e = 0; e < eligible_n; e++) {
         uint32_t i = eligible[e];
         struct FieldEntry* f = &manager->fields[i];
-        if (f->timestamp > max_ts) max_ts = f->timestamp;
         uint32_t name_len = (uint32_t)strlen(f->name);
         uint32_t data_len = f->is_tombstone ? 0 : f->size;
         size_t rec = fleece_cbor_array_header_size(5)
@@ -807,6 +815,21 @@ int fleece_state_manager_export_shared_delta_bounded(FleeceStateManager* manager
                    + fleece_cbor_uint_size(f->timestamp)
                    + fleece_cbor_bytes_size(data_len);
         if (count > 0 && body + rec > cap_bytes) break;  /* oldest-first window ends here */
+        /* max_ts (and so the caller's watermark, included_max_ts below) must
+         * only ever advance to a record that was ACTUALLY included (take[i]
+         * set true) -- bumping it for a record the cap check is about to
+         * reject reintroduces the exact "permanently invisible to every
+         * future export" bug this whole bounded/oldest-first exporter exists
+         * to fix (see this function's own header comment and
+         * fleece_runtime.c's own watermark-advance comment for the original
+         * incident): the watermark would skip straight past a record that
+         * was never sent, and since export only ever looks at
+         * field.timestamp > since_timestamp, it would never be retried.
+         * Found live via swarmpu's own goal-pool auction under heavy
+         * simultaneous multi-node contention -- some drones' claims never
+         * reached others at all, permanently, not just slowly.
+         */
+        if (f->timestamp > max_ts) max_ts = f->timestamp;
         body += rec;
         take[i] = true;
         count++;
