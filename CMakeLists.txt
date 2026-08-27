@@ -104,6 +104,15 @@ if(NOT TARGET microReticulum)
     # parameter of its own and no size check before the call, so a
     # short/malformed signature or public key (plausible under real
     # multi-peer announce churn) reads past its actual allocation.
+    # 0003-pool-malloc-drop-per-alloc-tlsf-walk-check.patch: profiling a
+    # 5-node native_sim swarm found Utilities::Memory::pool_malloc() ran a
+    # FULL tlsf_walk_pool() + a FULL tlsf_check() (both O(n) over every
+    # block in the pool) on EVERY allocation, unconditionally, in every
+    # build -- debug/integrity-check scaffolding that never got stripped
+    # from the hot path (TLSF's actual malloc is O(1) via bitmap lookup).
+    # gdb stack sampling showed most of one drone's sustained ~70% CPU
+    # sitting in this exact call chain, independent of mesh traffic
+    # volume -- fixed, CPU per node dropped to ~5-8%.
     # See each patch's own comment for the fix.
     FetchContent_Declare(
         rns_microreticulum

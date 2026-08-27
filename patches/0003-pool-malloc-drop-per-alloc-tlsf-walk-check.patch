@@ -1,0 +1,31 @@
+diff --git a/src/microReticulum/Utilities/Memory.cpp b/src/microReticulum/Utilities/Memory.cpp
+index 2c9b6b3..8ec1a41 100644
+--- a/src/microReticulum/Utilities/Memory.cpp
++++ b/src/microReticulum/Utilities/Memory.cpp
+@@ -189,13 +189,19 @@ void tlsf_mem_walker(void* ptr, size_t size, int used, void* user)
+ 	}
+ 	void* p;
+ 	if (pool_info.tlsf != nullptr) {
+-		struct tlsf_stats stats;
+-		memset(&stats, 0, sizeof(stats));
+-		tlsf_walk_pool(tlsf_get_pool(pool_info.tlsf), tlsf_mem_walker, &stats);
+-		if (tlsf_check(pool_info.tlsf) != 0) {
+-			printf("--- HEAP CORRUPTION DETECTED!!!\n");
+-		}
+-		//printf("--- allocating memory from tlsf (%u bytes) (%u free)\n", size, stats.free_size);
++		// swarmpu: this used to run a FULL tlsf_walk_pool() + a FULL
++		// tlsf_check() (both O(n) over every block in the pool) on EVERY
++		// allocation, unconditionally, in every build -- no #ifdef DEBUG/
++		// NDEBUG guard anywhere. TLSF's whole design point is O(1) alloc
++		// via bitmap lookup; walk+check are debug/integrity-check
++		// scaffolding (the dump_memory_stats()-style functions elsewhere
++		// in this file already call the same walk deliberately, on
++		// demand, when it's actually wanted) that never got stripped from
++		// the hot path. Found live profiling a 5-node native_sim swarm:
++		// gdb stack sampling showed most of one drone's sustained ~70%
++		// CPU sitting in this exact call chain, independent of actual
++		// mesh traffic volume. tlsf_malloc() below is the real, O(1)
++		// allocation this function exists for.
+ 		p = tlsf_malloc(pool_info.tlsf, size);
+ 		//printf("--- allocated memory from tlsf (addr=%lx) (%u bytes)\n", p, size);
+ 	}
