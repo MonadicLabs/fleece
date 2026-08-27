@@ -103,7 +103,14 @@ static int copy_str(char* dst, size_t dst_sz, const char* src) {
     size_t n = strlen(src);
     if (n >= dst_sz) {
         dst[0] = '\0';
-        fprintf(stderr, "fleece: source too long (%zu bytes, max %zu); increase FLEECE_GOAP_SOURCE_MAX\n", n, dst_sz - 1);
+        // Truncated in the message itself (not just dst) -- this same helper
+        // backs both JS source fields (FLEECE_GOAP_SOURCE_MAX, genuinely
+        // large authored bodies) and short name/id fields
+        // (FLEECE_GOAP_NAME_MAX), and the two overflow for very different
+        // reasons; printing the actual value that didn't fit turns "which
+        // one, and why" from a debugging session into a glance.
+        fprintf(stderr, "fleece: string too long for its field (%zu bytes, max %zu): \"%.80s%s\"\n",
+                n, dst_sz - 1, src, n > 80 ? "..." : "");
         return -1;
     }
     memcpy(dst, src, n);

@@ -32,7 +32,25 @@
 extern "C" {
 #endif
 
-#define FLEECE_GOAP_NAME_MAX 32      // ids / names / dims / curve refs
+// 64, matching state/fleece_state_manager.h's FLEECE_FIELD_NAME_MAX -- a
+// FleeceGoapBlackboard field's own name (FleeceGoapField.name, below) is
+// always derived from a state-manager field name (fleece_goap_bb_set is fed
+// straight from fleece_state_manager_list_fields()'s own output, both by
+// fleece_goap_js_bb_from_state's per-tick snapshot and by every commit back
+// afterward), so capping it any tighter than the state manager's own budget
+// just reintroduces the exact same silent-overflow trap at one layer up.
+// Found live: main.c's own per-peer telemetry mirroring
+// (publish_world_telemetry, "<16-hex-node-id>.<field>") produces
+// "<id>.battery_percent" at exactly 32 bytes -- one over the old 31-byte
+// cap -- which made fleece_goap_js_bb_from_state fail outright for the
+// WHOLE blackboard snapshot the instant a second peer's telemetry entered
+// world state, silently freezing all goal-pool dispatch (claim/blocked/
+// done, precondition repair) even though claiming itself kept working
+// (it never goes through this blackboard at all). Also used for action/
+// goal/unit/curve ids/names/dims in the real (non-goal-pool) GOAP planner
+// -- same reasoning applies there, and the memory cost is the same
+// deliberately-accepted order of magnitude as the state-manager bump.
+#define FLEECE_GOAP_NAME_MAX 64      // ids / names / dims / curve refs
 #define FLEECE_GOAP_SOURCE_MAX 2048   // pre/eff/goal/cost/exec JS function sources
 #define FLEECE_GOAP_NOTE_MAX 128     // mission notes
 
