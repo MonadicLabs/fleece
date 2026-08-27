@@ -12,7 +12,17 @@
 extern "C" {
 #endif
 
-#define FLEECE_FIELD_NAME_MAX 32
+// 64, not 32: a shared budget across every field name in the system (self/
+// world fields, claim_<key>/goal_<key> keys, ...), and 32 kept getting hit
+// silently -- several call sites (e.g. fleece_embedded.c/fleece_goap_js.c's
+// claim_key[FLEECE_FIELD_NAME_MAX + 8] locals) size their own buffer wider
+// than this, giving the illusion of headroom, while upsert_field's actual
+// storage (strncpy(field->name, name, FLEECE_FIELD_NAME_MAX - 1)) silently
+// truncates to whatever this constant says regardless. Cost of the bump:
+// FIELD_CAPACITY (128, fleece_state_manager.c) * 32 extra bytes = 4KB per
+// FleeceStateManager instance -- against an STM32H753's ~1MB SRAM (the
+// current hardware target, docs/decisions/013), inconsequential.
+#define FLEECE_FIELD_NAME_MAX 64
 
 // Reserved node id representing swarm-shared state (see fleece_state_manager_set_shared).
 // A real node's own id must never be this value - fleece_state_manager_create_with_node_id

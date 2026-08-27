@@ -284,10 +284,17 @@ static JSValue get_named_value(JSContext* ctx, FleeceStateManager* manager, uint
     return result;
 }
 
-static JSValue names_to_js_array(JSContext* ctx, char names[][FLEECE_FIELD_NAME_MAX], uint32_t count) {
+// `names` is a flat 2D char array (names[count][stride]) from ANY fixed-width
+// name buffer -- callers pass different ones (FLEECE_FIELD_NAME_MAX for
+// state-manager field names, FLEECE_PLATFORM_FUNCTION_NAME_MAX for platform
+// function names), which happened to compile as the same type only by
+// coincidence while both constants were numerically 32. Generic over
+// `stride` rather than hardcoded to one of them so that coincidence isn't
+// load-bearing.
+static JSValue names_to_js_array(JSContext* ctx, const char* names, size_t stride, uint32_t count) {
     JSValue arr = JS_NewArray(ctx);
     for (uint32_t i = 0; i < count; i++) {
-        JS_DefinePropertyValueUint32(ctx, arr, i, JS_NewString(ctx, names[i]), JS_PROP_C_W_E);
+        JS_DefinePropertyValueUint32(ctx, arr, i, JS_NewString(ctx, names + (size_t)i * stride), JS_PROP_C_W_E);
     }
     return arr;
 }
@@ -360,7 +367,7 @@ static JSValue js_self_keys(JSContext* ctx, JSValueConst this_val, int argc, JSV
 
     char names[FLEECE_JS_LIST_MAX][FLEECE_FIELD_NAME_MAX];
     uint32_t count = fleece_state_manager_list_fields(emb->manager, fleece_state_manager_get_node_id(emb->manager), names, FLEECE_JS_LIST_MAX);
-    return names_to_js_array(ctx, names, count);
+    return names_to_js_array(ctx, &names[0][0], FLEECE_FIELD_NAME_MAX, count);
 }
 
 static JSValue js_self_id(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
@@ -442,7 +449,7 @@ static JSValue js_swarm_keys(JSContext* ctx, JSValueConst this_val, int argc, JS
 
     char names[FLEECE_JS_LIST_MAX][FLEECE_FIELD_NAME_MAX];
     uint32_t count = fleece_state_manager_list_fields(emb->manager, node_id, names, FLEECE_JS_LIST_MAX);
-    return names_to_js_array(ctx, names, count);
+    return names_to_js_array(ctx, &names[0][0], FLEECE_FIELD_NAME_MAX, count);
 }
 
 static JSValue js_world_get(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
@@ -513,7 +520,7 @@ static JSValue js_world_keys(JSContext* ctx, JSValueConst this_val, int argc, JS
 
     char names[FLEECE_JS_LIST_MAX][FLEECE_FIELD_NAME_MAX];
     uint32_t count = fleece_state_manager_list_fields(emb->manager, FLEECE_SHARED_OWNER_ID, names, FLEECE_JS_LIST_MAX);
-    return names_to_js_array(ctx, names, count);
+    return names_to_js_array(ctx, &names[0][0], FLEECE_FIELD_NAME_MAX, count);
 }
 
 // worldCompareAndSet(name, expectedValueOrUndefined, newValue) -> bool.
@@ -886,7 +893,7 @@ static JSValue js_platform_names(JSContext* ctx, JSValueConst this_val, int argc
 
     char names[FLEECE_JS_LIST_MAX][FLEECE_PLATFORM_FUNCTION_NAME_MAX];
     uint32_t count = fleece_platform_list_functions(emb->platform, names, FLEECE_JS_LIST_MAX);
-    return names_to_js_array(ctx, names, count);
+    return names_to_js_array(ctx, &names[0][0], FLEECE_PLATFORM_FUNCTION_NAME_MAX, count);
 }
 
 // Calls a registered platform function: argv[0] is the name, argv[1] is a JS

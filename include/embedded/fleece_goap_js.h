@@ -99,7 +99,9 @@ typedef enum {
     FLEECE_GOAP_BRAIN_EVENT_REPLAN,        // new goal/action selected (see getters)
     FLEECE_GOAP_BRAIN_EVENT_ACTION_DONE,   // an action's effect was applied+committed
     FLEECE_GOAP_BRAIN_EVENT_ABORTED,       // an action exceeded max_action_ticks and was dropped
-    FLEECE_GOAP_BRAIN_EVENT_IDLE           // no unsatisfied goal, or none currently plannable
+    FLEECE_GOAP_BRAIN_EVENT_IDLE,          // no unsatisfied goal, or none currently plannable
+    FLEECE_GOAP_BRAIN_EVENT_GOAL_POOL      // a goal-pool claim/release/blocked/done transition -- see
+                                            // fleece_goap_brain_goal_pool_transition_kind/key() below
 } FleeceGoapBrainEvent;
 
 // Called after a tick's decisions. brain is read-only during the callback;
@@ -194,6 +196,95 @@ void fleece_goap_brain_set_goal_cooldown_ticks(FleeceGoapBrain* brain, uint32_t 
 // default). Call any time; takes effect on the brain's next tick.
 void fleece_goap_brain_set_goal_pool(FleeceGoapBrain* brain, const char* goal_prefix,
                                       const char* current_key_field, double contest_margin);
+
+// --- Action library (native goal-directed dispatch, no verb) --------------
+//
+// Extends goal-pool mode with a small, fixed table of actions the brain can
+// execute directly -- no GOAP action/goal registration needed at all
+// (fleece_goap_add_action/add_goal go unused in this mode; a goal-pool
+// brain with an action library registered and zero actions/goals is the
+// normal, supported shape). A held pool entry's `params` is a DESIRED
+// STATE (a partial bb.self snapshot: `{lat, lon, alt}`, `{px4_landed:
+// "in_air"}`, ...), never a command name -- there is deliberately no
+// "verb" field anywhere in this API. That's a design choice, not an
+// oversight: a goal naming an action to run is a dispatch table wearing
+// GOAP's clothes, not GOAP -- classical GOAP goals are state, actions are
+// state transformers, and selection falls out of matching preconditions/
+// effects against that state, never a symbolic command name. Every tick,
+// right after claiming (see fleece_goap_brain_set_goal_pool's own doc
+// comment):
+//
+//   1. Calls the mission-authored global `goalSatisfied(bb) -> bool` (same
+//      calling convention as `scoreGoal(key, record)` in
+//      fleece_embedded_claim_best_goal()'s own doc comment: one
+//      well-known JS global the loaded script defines, read fresh each
+//      call, not cached -- reads bb.world[bb.self.<current_key_field>]
+//      itself if it needs the goal record, exactly like an authored
+//      pre/eff/exec body already does). Undefined `goalSatisfied` means
+//      "never satisfied" (safe default: a mission that forgot to define
+//      it doesn't silently auto-complete every goal). True: the held goal
+//      AND its claim are deleted (host completed it) -- no action runs
+//      this tick.
+//   2. Otherwise scans the registered FleeceActionDef table for the FIRST
+//      one whose `pre` holds and runs its `exec(bb, tick)` (mutates its bb
+//      copy, committed each tick; exec's own return value is a normal
+//      GOAP-style done/not-done report for the action's OWN work, but
+//      nothing here consumes it for cleanup -- only goalSatisfied does,
+//      checked at the top of the NEXT tick). An action decides its own
+//      relevance to whatever's currently held by reading
+//      bb.world[bb.self.<current_key_field>].params in its OWN `pre` body
+//      -- e.g. a location-reaching action's pre might require
+//      `typeof g.params.lat === 'number' && bb.self.px4_landed ===
+//      'in_air'`. This is what replaces verb matching: no lookup table,
+//      just each action inspecting the held goal's desired-state fields
+//      for itself.
+//   3. If NO action's `pre` currently holds: the missing precondition is
+//      repaired by one-ply lookahead, not a symbolic capability table --
+//      every registered action's `eff` (heuristic effect, same
+//      non-applied-by-the-executor contract as a GOAP action's eff: it
+//      exists only so this search can simulate "if I ran this, would
+//      something become possible") is applied to a COPY of the current
+//      blackboard; the first one for which EITHER goalSatisfied now holds
+//      OR some action's `pre` now holds is the provider. This node then
+//      authors a SELF-TARGETED prerequisite pool entry
+//      (`required_agents:[self_id]`, `interrupt:true` -- the exact
+//      override-goal mechanics fleece_embedded_claim_best_goal() already
+//      implements, not a new eligibility path) whose `params` are simply
+//      the bb.self fields that differ between the original and simulated
+//      blackboard -- a state diff, not a name, since there is nothing to
+//      name -- if one isn't already in flight, and releases (NOT deletes)
+//      its current claim, exactly the existing "outbid/failed" release
+//      path, so the original goal stays in the pool for reauction, by this
+//      node or whichever is actually best-positioned once the prerequisite
+//      completes. No provider found: leaves the claim held and does
+//      nothing further this tick (retries next tick).
+//
+// pre/eff/exec sources follow the exact same JS FUNCTION SOURCE convention
+// as FleeceGoapActionDef (see fleece_planner.h) - compiled once at
+// registration (action libraries are small and effectively static, unlike
+// action/goal tables which can be rebuilt), not re-parsed per tick.
+typedef struct FleeceActionDef {
+    const char* pre;    // JS: function(bb){ return <bool>; } -- NULL/"" = trivially true
+    const char* eff;    // JS: function(bb){ ...; return bb; } -- heuristic only; see doc above
+    const char* exec;   // JS: function(bb, tick){ ...; return <done>; } -- the real per-tick body
+} FleeceActionDef;
+
+// Registers (copies) the action library. Replaces any previously-registered
+// one. Pass count == 0 (or defs == NULL) to clear it. Returns 0 on success,
+// -1 on allocation failure or a source that fails to compile (logged via
+// fleece's usual JS-exception dump).
+int fleece_goap_brain_set_action_library(FleeceGoapBrain* brain, const FleeceActionDef* defs, uint32_t count);
+
+typedef enum {
+    FLEECE_GOAL_POOL_CLAIM,     // currentGoalKey newly non-empty
+    FLEECE_GOAL_POOL_LOST,      // currentGoalKey newly empty/different, NOT via this node's own blocked/done handling below (a peer outbid it, or it vanished from the pool)
+    FLEECE_GOAL_POOL_BLOCKED,   // this node released its own claim after finding an unmet precondition (see key() for which goal)
+    FLEECE_GOAL_POOL_DONE       // this node's exec reported the held goal complete; goal+claim deleted
+} FleeceGoalPoolTransitionKind;
+
+// Valid only during a FLEECE_GOAP_BRAIN_EVENT_GOAL_POOL callback.
+FleeceGoalPoolTransitionKind fleece_goap_brain_goal_pool_transition_kind(const FleeceGoapBrain* brain);
+const char* fleece_goap_brain_goal_pool_transition_key(const FleeceGoapBrain* brain);
 
 // Current brain state, for introspection/logging. NULL when none.
 const char* fleece_goap_brain_goal_id(const FleeceGoapBrain* brain);

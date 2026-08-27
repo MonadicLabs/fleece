@@ -603,6 +603,24 @@ struct FleeceGoapBrain {
     char goal_pool_prefix[FLEECE_FIELD_NAME_MAX];    // empty = goal-pool mode off
     char goal_pool_key_field[FLEECE_FIELD_NAME_MAX]; // self field the held key is published into
     double goal_pool_contest_margin;
+    char goal_pool_last_logged[FLEECE_FIELD_NAME_MAX]; // last currentGoalKey a transition was fired for (see action_library_tick)
+
+    // Action library (fleece_goap_brain_set_action_library) -- parallel
+    // arrays, one entry per registered FleeceActionDef. Compiled once at
+    // registration (action libraries are small and effectively static),
+    // not per tick. No name array: actions are found by which `pre` holds
+    // against the held goal's state, never by looking one up by name (see
+    // fleece_goap_js.h's action-library doc comment for why).
+    JSValue* action_pre_fns;   // JS_UNDEFINED = no precondition (trivially true)
+    JSValue* action_eff_fns;   // JS_UNDEFINED = no effect (can't provide anything)
+    JSValue* action_exec_fns;  // JS_UNDEFINED = no exec body
+    uint32_t action_count;
+
+    // Last goal-pool transition reported via FLEECE_GOAP_BRAIN_EVENT_GOAL_POOL
+    // (see fleece_goap_brain_goal_pool_transition_kind/key()). Valid only
+    // during that callback.
+    FleeceGoalPoolTransitionKind goal_pool_transition_kind;
+    char goal_pool_transition_key[FLEECE_FIELD_NAME_MAX];
 };
 
 FleeceGoapBrain* fleece_goap_brain_create(FleeceEmbedded* embedded, FleeceGoap* goap) {
@@ -630,9 +648,30 @@ FleeceGoapBrain* fleece_goap_brain_create(FleeceEmbedded* embedded, FleeceGoap* 
     return b;
 }
 
+// Frees the brain's currently-registered action library (JSValues), if
+// any. Shared by fleece_goap_brain_set_action_library (replacing a prior
+// registration) and fleece_goap_brain_destroy.
+static void action_library_free(FleeceGoapBrain* b) {
+    if (!b->action_pre_fns) return;
+    JSContext* ctx = (JSContext*)fleece_embedded_get_context(b->embedded);
+    for (uint32_t i = 0; i < b->action_count; i++) {
+        JS_FreeValue(ctx, b->action_pre_fns[i]);
+        JS_FreeValue(ctx, b->action_eff_fns[i]);
+        JS_FreeValue(ctx, b->action_exec_fns[i]);
+    }
+    fleece_free(b->action_pre_fns);
+    fleece_free(b->action_eff_fns);
+    fleece_free(b->action_exec_fns);
+    b->action_pre_fns = NULL;
+    b->action_eff_fns = NULL;
+    b->action_exec_fns = NULL;
+    b->action_count = 0;
+}
+
 void fleece_goap_brain_destroy(FleeceGoapBrain* b) {
     if (!b) return;
     if (b->plan) fleece_goap_plan_destroy(b->plan);
+    action_library_free(b);
     fleece_goap_js_eval_destroy(b->eval);
     fleece_free(b->goal_cooldown_until);
     fleece_free(b);
@@ -862,6 +901,46 @@ void fleece_goap_brain_set_goal_pool(FleeceGoapBrain* b, const char* goal_prefix
     b->goal_pool_contest_margin = contest_margin;
 }
 
+int fleece_goap_brain_set_action_library(FleeceGoapBrain* b, const FleeceActionDef* defs, uint32_t count) {
+    if (!b) return -1;
+    action_library_free(b);
+    if (!defs || count == 0) return 0;
+
+    JSContext* ctx = (JSContext*)fleece_embedded_get_context(b->embedded);
+    JSValue* pre_fns = (JSValue*)fleece_calloc(count, sizeof(JSValue));
+    JSValue* eff_fns = (JSValue*)fleece_calloc(count, sizeof(JSValue));
+    JSValue* exec_fns = (JSValue*)fleece_calloc(count, sizeof(JSValue));
+    if (!pre_fns || !eff_fns || !exec_fns) {
+        fleece_free(pre_fns);
+        fleece_free(eff_fns);
+        fleece_free(exec_fns);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        pre_fns[i] = (defs[i].pre && defs[i].pre[0]) ? compile_goap_fn(ctx, defs[i].pre) : JS_UNDEFINED;
+        eff_fns[i] = (defs[i].eff && defs[i].eff[0]) ? compile_goap_fn(ctx, defs[i].eff) : JS_UNDEFINED;
+        exec_fns[i] = (defs[i].exec && defs[i].exec[0]) ? compile_goap_fn(ctx, defs[i].exec) : JS_UNDEFINED;
+        if (JS_IsException(pre_fns[i])) { goap_js_dump_exception(ctx, "action pre"); pre_fns[i] = JS_UNDEFINED; }
+        if (JS_IsException(eff_fns[i])) { goap_js_dump_exception(ctx, "action eff"); eff_fns[i] = JS_UNDEFINED; }
+        if (JS_IsException(exec_fns[i])) { goap_js_dump_exception(ctx, "action exec"); exec_fns[i] = JS_UNDEFINED; }
+    }
+
+    b->action_pre_fns = pre_fns;
+    b->action_eff_fns = eff_fns;
+    b->action_exec_fns = exec_fns;
+    b->action_count = count;
+    return 0;
+}
+
+FleeceGoalPoolTransitionKind fleece_goap_brain_goal_pool_transition_kind(const FleeceGoapBrain* b) {
+    return b ? b->goal_pool_transition_kind : FLEECE_GOAL_POOL_LOST;
+}
+
+const char* fleece_goap_brain_goal_pool_transition_key(const FleeceGoapBrain* b) {
+    return (b && b->goal_pool_transition_key[0]) ? b->goal_pool_transition_key : NULL;
+}
+
 // Reads b->goal_pool_key_field (a JSON string field, quotes included, same
 // convention every fleece string field uses) and strips the quotes -- the
 // currently-held pool key, or an empty string if none. A byte-level strip
@@ -900,6 +979,309 @@ static void goal_pool_read_current(FleeceStateManager* sm, uint64_t self_id,
 // merged before this node touches its own copy again.
 #define FLEECE_GOAL_POOL_REASSERT_EVERY_TICKS 30
 
+static void goal_pool_fire_event(FleeceGoapBrain* b, FleeceGoalPoolTransitionKind kind, const char* key) {
+    b->goal_pool_transition_kind = kind;
+    strncpy(b->goal_pool_transition_key, key ? key : "", sizeof(b->goal_pool_transition_key) - 1);
+    b->goal_pool_transition_key[sizeof(b->goal_pool_transition_key) - 1] = '\0';
+    if (b->event_cb) b->event_cb(b, FLEECE_GOAP_BRAIN_EVENT_GOAL_POOL, b->event_ud);
+}
+
+// Runs a compiled precondition (or effect, called the same way) against bb,
+// returning its boolean result. JS_UNDEFINED (no source registered) is
+// trivially true -- matches js_action_pre's "no source: trivially true".
+static bool action_call_bool(FleeceGoapBrain* b, JSValue fn, const FleeceGoapBlackboard* bb) {
+    JSContext* ctx = (JSContext*)fleece_embedded_get_context(b->embedded);
+    if (JS_IsUndefined(fn)) return true;
+    JSValue bbjs = goap_bb_to_js(b->eval, bb);
+    JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst*)&bbjs);
+    JS_FreeValue(ctx, bbjs);
+    if (JS_IsException(result)) {
+        goap_js_dump_exception(ctx, "action pre/eff");
+        JS_FreeValue(ctx, result);
+        return false;
+    }
+    bool holds = JS_ToBool(ctx, result) > 0;
+    JS_FreeValue(ctx, result);
+    return holds;
+}
+
+// Applies a compiled effect to a COPY of bb, producing dst (heuristic
+// simulation only -- see fleece_goap_js.h's FleeceActionDef doc comment).
+// Returns false if fn is JS_UNDEFINED (nothing to apply) or on error.
+static bool action_call_eff(FleeceGoapBrain* b, JSValue fn, const FleeceGoapBlackboard* bb,
+                            FleeceGoapBlackboard* dst) {
+    JSContext* ctx = (JSContext*)fleece_embedded_get_context(b->embedded);
+    if (JS_IsUndefined(fn)) return false;
+    JSValue bbjs = goap_bb_to_js(b->eval, bb);
+    JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst*)&bbjs);
+    JS_FreeValue(ctx, bbjs);
+    if (JS_IsException(result) || !JS_IsObject(result)) {
+        if (JS_IsException(result)) goap_js_dump_exception(ctx, "action eff");
+        JS_FreeValue(ctx, result);
+        return false;
+    }
+    int rc = goap_js_to_bb(b->eval, result, dst);
+    JS_FreeValue(ctx, result);
+    return rc == 0;
+}
+
+// Round-trips bb through the SAME JS marshaling pipeline action_call_eff
+// uses (goap_bb_to_js -> ... -> goap_js_to_bb) without calling any action --
+// this is the "identity effect". Needed as the baseline for
+// build_self_diff_json's comparison: bb's own raw stored bytes (written by
+// native C -- e.g. a float serialized via snprintf) are not guaranteed
+// byte-identical to how QuickJS re-serializes the SAME numeric value after
+// a JSON.parse/JSON.stringify round trip (different precision/formatting).
+// Diffing a genuinely-simulated `sim` (which DID go through that pipeline)
+// against raw `bb` bytes therefore flags every such field as "changed" even
+// though nothing about it was touched -- diffing against this round-tripped
+// baseline instead means both sides went through identical formatting, so
+// only fields an eff actually modified show up as different. Found live:
+// an untouched `position` field (lat/lon as JS doubles vs the C side's
+// float32 formatting) was polluting every prerequisite goal's params with
+// itself, producing embedded floating-point literals immediately followed
+// by other JSON tokens with no separating comma -- corrupting the whole
+// goal record's JSON just enough that JS_ParseJSON silently failed to
+// parse it, so bb.world[key] read back as undefined and goalSatisfied
+// could never see the prerequisite's own params at all.
+static bool action_call_identity(FleeceGoapBrain* b, const FleeceGoapBlackboard* bb, FleeceGoapBlackboard* dst) {
+    JSContext* ctx = (JSContext*)fleece_embedded_get_context(b->embedded);
+    JSValue bbjs = goap_bb_to_js(b->eval, bb);
+    int rc = goap_js_to_bb(b->eval, bbjs, dst);
+    JS_FreeValue(ctx, bbjs);
+    return rc == 0;
+}
+
+// Calls the mission-authored global `goalSatisfied(bb) -> bool`, looked up
+// fresh each call (same convention js_score_goal uses for scoreGoal in
+// fleece_embedded.c: one well-known JS global the loaded script defines,
+// not cached, so a script reload always takes effect). Undefined/non-
+// function goalSatisfied means "never satisfied" -- unlike
+// action_call_bool's "no source: trivially true" default for pre/eff,
+// treating a missing goalSatisfied as trivially-true would silently
+// auto-complete every held goal the instant it's claimed.
+static bool js_call_goal_satisfied(FleeceGoapBrain* b, const FleeceGoapBlackboard* bb) {
+    JSContext* ctx = (JSContext*)fleece_embedded_get_context(b->embedded);
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, global, "goalSatisfied");
+    JS_FreeValue(ctx, global);
+    if (!JS_IsFunction(ctx, fn)) {
+        JS_FreeValue(ctx, fn);
+        return false;
+    }
+    JSValue bbjs = goap_bb_to_js(b->eval, bb);
+    JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst*)&bbjs);
+    JS_FreeValue(ctx, bbjs);
+    JS_FreeValue(ctx, fn);
+    if (JS_IsException(result)) {
+        goap_js_dump_exception(ctx, "goalSatisfied");
+        JS_FreeValue(ctx, result);
+        return false;
+    }
+    bool holds = JS_ToBool(ctx, result) > 0;
+    JS_FreeValue(ctx, result);
+    return holds;
+}
+
+// Returns the index of the first registered action whose `pre` currently
+// holds against bb, or UINT32_MAX. There is no name/verb lookup -- each
+// action decides its own relevance by inspecting the held goal's params
+// directly in its own `pre` body (see fleece_goap_js.h's action-library
+// doc comment); this is just a linear scan over that.
+static uint32_t action_library_find_applicable(FleeceGoapBrain* b, const FleeceGoapBlackboard* bb) {
+    for (uint32_t i = 0; i < b->action_count; i++) {
+        if (action_call_bool(b, b->action_pre_fns[i], bb)) return i;
+    }
+    return UINT32_MAX;
+}
+
+// Builds a JSON object of the bb.self fields that differ between orig and
+// sim (the state a candidate action's `eff` predicts) -- the diff becomes
+// a prerequisite goal's own `params`, since a prerequisite has nothing to
+// name (goal params are desired STATE, never a command -- see
+// fleece_goap_js.h). Only self (non-shared) fields are considered: a
+// prerequisite describes what the acting node itself needs to become
+// true, not the world. Field values are copied verbatim as raw JSON
+// (already committed-shape JSON from the bb round trip), not re-encoded.
+// Fields that would overflow out_cap are skipped rather than truncating
+// mid-object -- a dropped field just means a smaller (still valid) diff.
+static int build_self_diff_json(const FleeceGoapBlackboard* orig, const FleeceGoapBlackboard* sim,
+                                 char* out, size_t out_cap) {
+    if (out_cap < 3) return -1;
+    size_t len = 0;
+    out[len++] = '{';
+    bool first = true;
+    for (uint32_t i = 0; i < sim->count; i++) {
+        const FleeceGoapField* f = &sim->fields[i];
+        if (f->is_shared) continue;
+        uint32_t osz = 0;
+        const uint8_t* ov = fleece_goap_bb_get(orig, f->name, &osz);
+        if (ov && osz == f->size && (f->size == 0 || memcmp(ov, f->data, f->size) == 0)) continue;
+
+        size_t name_len = strlen(f->name);
+        size_t need = name_len + (size_t)f->size + 6;  // quotes + colon + comma headroom
+        if (len + need >= out_cap) continue;
+
+        if (!first) out[len++] = ',';
+        first = false;
+        out[len++] = '"';
+        memcpy(out + len, f->name, name_len);
+        len += name_len;
+        out[len++] = '"';
+        out[len++] = ':';
+        memcpy(out + len, f->data, f->size);
+        len += f->size;
+    }
+    if (len + 1 >= out_cap) return -1;
+    out[len++] = '}';
+    out[len] = '\0';
+    return 0;
+}
+
+// Authors a self-targeted, interrupt-scored prerequisite goal whose params
+// are the bb.self state diff between orig and sim (what a candidate
+// action's `eff` predicts becoming true) -- exactly the override-goal
+// shape fleece_embedded_claim_best_goal() already treats as an
+// unconditional win (required_agents excludes every other node; interrupt
+// bypasses CONTEST_MARGIN). Idempotent: does nothing if one is already in
+// flight, so repeated blocked ticks before it's claimed/completed don't
+// re-stamp it. Key is "goal_pre_" + 8 hex digits (the low 32 bits of
+// self_id -- collision odds negligible at any realistic swarm size, and
+// required_agents below still carries the FULL id for the actual
+// eligibility check, which isn't length-limited) -- no verb suffix, since
+// only one prerequisite is ever in flight per node at a time and there is
+// nothing to name a state diff after (this scheme replaced an earlier
+// "goal_pre_<verb>_<hex>" one that could overflow FLEECE_FIELD_NAME_MAX;
+// that trap no longer applies since there's no verb string here at all).
+static void goal_pool_spawn_prerequisite(FleeceStateManager* sm, uint64_t self_id,
+                                          const FleeceGoapBlackboard* orig, const FleeceGoapBlackboard* sim) {
+    char key[FLEECE_FIELD_NAME_MAX];
+    int n = snprintf(key, sizeof(key), "goal_pre_%08llx", (unsigned long long)(self_id & 0xFFFFFFFFULL));
+    if (n < 0 || (size_t)n >= sizeof(key)) return;
+    if (fleece_state_manager_exists_named(sm, FLEECE_SHARED_OWNER_ID, key)) return;
+
+    char diff[256];
+    if (build_self_diff_json(orig, sim, diff, sizeof(diff)) != 0) return;
+
+    char value[384];
+    n = snprintf(value, sizeof(value),
+                 "{\"params\":%s,\"kind\":\"prereq\",\"priority\":100,"
+                 "\"required_agents\":[\"%016llx\"],\"interrupt\":true}",
+                 diff, (unsigned long long)self_id);
+    if (n < 0 || (size_t)n >= sizeof(value)) return;
+    fleece_state_manager_set_shared(sm, key, (const uint8_t*)value, (uint32_t)n);
+}
+
+// Runs after claiming (goal_pool_tick, below): given the held pool key,
+// checks whether it's already satisfied, else runs whichever registered
+// action currently applies, else repairs a missing precondition -- see
+// fleece_goap_js.h's own extensive doc comment on the action-library
+// dispatch contract. No-op if no action library is registered or nothing
+// is held. `current` is goal_pool_tick's own claim result for this tick;
+// this function may overwrite goal_pool_key_field again (done/blocked
+// clear it) - the caller does not need to re-read it afterward.
+static void action_library_tick(FleeceGoapBrain* b, const char* current) {
+    // Claim/lost transition logging: mirrors the pre-native-action-library
+    // design's "mine !== lastLogged" check, now done here since nothing
+    // else observes currentGoalKey changing.
+    if (strcmp(current, b->goal_pool_last_logged) != 0) {
+        if (b->goal_pool_last_logged[0]) goal_pool_fire_event(b, FLEECE_GOAL_POOL_LOST, b->goal_pool_last_logged);
+        if (current[0]) goal_pool_fire_event(b, FLEECE_GOAL_POOL_CLAIM, current);
+        strncpy(b->goal_pool_last_logged, current, sizeof(b->goal_pool_last_logged) - 1);
+        b->goal_pool_last_logged[sizeof(b->goal_pool_last_logged) - 1] = '\0';
+    }
+
+    if (!current[0] || b->action_count == 0) return;
+
+    FleeceStateManager* sm = (FleeceStateManager*)fleece_embedded_get_state_manager(b->embedded);
+    JSContext* ctx = (JSContext*)fleece_embedded_get_context(b->embedded);
+    uint64_t self_id = fleece_state_manager_get_node_id(sm);
+
+    char claim_key[FLEECE_FIELD_NAME_MAX + 8];
+    snprintf(claim_key, sizeof(claim_key), "claim_%s", current);
+
+    FleeceGoapBlackboard bb = {0};
+    if (fleece_goap_js_bb_from_state(b->embedded, &bb) != 0) return;
+
+    if (js_call_goal_satisfied(b, &bb)) {
+        fleece_state_manager_remove_shared(sm, current);
+        fleece_state_manager_remove_shared(sm, claim_key);
+        fleece_state_manager_set_named(sm, b->goal_pool_key_field, (const uint8_t*)"\"\"", 2);
+        strncpy(b->goal_pool_last_logged, "", sizeof(b->goal_pool_last_logged));
+        goal_pool_fire_event(b, FLEECE_GOAL_POOL_DONE, current);
+        fleece_goap_bb_release(&bb);
+        return;
+    }
+
+    uint32_t idx = action_library_find_applicable(b, &bb);
+    if (idx != UINT32_MAX) {
+        JSValue fn = b->action_exec_fns[idx];
+        if (!JS_IsUndefined(fn)) {
+            JSValue bbjs = goap_bb_to_js(b->eval, &bb);
+            JSValue tickv = JS_NewInt32(ctx, (int32_t)b->tick_count);
+            JSValue argv[2] = {bbjs, tickv};
+            JSValue result = JS_Call(ctx, fn, JS_UNDEFINED, 2, (JSValueConst*)argv);
+            JS_FreeValue(ctx, tickv);
+            if (JS_IsException(result)) {
+                goap_js_dump_exception(ctx, "action exec");
+                JS_FreeValue(ctx, result);
+                JS_FreeValue(ctx, bbjs);
+            } else {
+                // exec's own return value is a normal done/not-done report
+                // for its own work, same shape a GOAP action's exec
+                // reports -- but nothing here consumes it for cleanup.
+                // Only goalSatisfied, checked at the top of the NEXT tick,
+                // decides whether the held goal itself is done (see
+                // fleece_goap_js.h's action-library doc comment).
+                JSValue extract = JS_IsObject(result) ? result : bbjs;
+                FleeceGoapBlackboard committed = {0};
+                if (goap_js_to_bb(b->eval, extract, &committed) == 0) {
+                    fleece_goap_js_bb_commit(b->embedded, &committed);
+                    fleece_goap_bb_release(&committed);
+                }
+                JS_FreeValue(ctx, result);
+                JS_FreeValue(ctx, bbjs);
+            }
+        }
+        fleece_goap_bb_release(&bb);
+        return;
+    }
+
+    // Nothing currently applicable: one-ply lookahead for a provider (see
+    // fleece_goap_js.h's action-library doc comment) -- simulate each
+    // OTHER action's `eff` and check whether goalSatisfied or some
+    // action's `pre` would then hold. The diff is computed against
+    // rt_orig (bb round-tripped through the identical JS marshaling
+    // pipeline `sim` itself went through), not raw `bb` -- see
+    // action_call_identity's own comment for why comparing against raw
+    // bytes produces spurious diffs.
+    bool spawned = false;
+    FleeceGoapBlackboard rt_orig = {0};
+    bool have_rt_orig = action_call_identity(b, &bb, &rt_orig);
+    for (uint32_t c = 0; c < b->action_count && !spawned; c++) {
+        if (JS_IsUndefined(b->action_eff_fns[c])) continue;
+        FleeceGoapBlackboard sim = {0};
+        if (!action_call_eff(b, b->action_eff_fns[c], &bb, &sim)) continue;
+        bool now_ok = js_call_goal_satisfied(b, &sim) || action_library_find_applicable(b, &sim) != UINT32_MAX;
+        if (now_ok && have_rt_orig) {
+            goal_pool_spawn_prerequisite(sm, self_id, &rt_orig, &sim);
+            spawned = true;
+        }
+        fleece_goap_bb_release(&sim);
+    }
+    if (have_rt_orig) fleece_goap_bb_release(&rt_orig);
+
+    if (spawned) {
+        fleece_state_manager_remove_shared(sm, claim_key);
+        fleece_state_manager_set_named(sm, b->goal_pool_key_field, (const uint8_t*)"\"\"", 2);
+        strncpy(b->goal_pool_last_logged, "", sizeof(b->goal_pool_last_logged));
+        goal_pool_fire_event(b, FLEECE_GOAL_POOL_BLOCKED, current);
+    }
+    // No provider found: leave the claim held, retry next tick (matches a
+    // GOAP action's own "precondition unmet, wait" behavior).
+    fleece_goap_bb_release(&bb);
+}
+
 // Runs one goal-pool auction tick when configured (fleece_goap_brain_set_
 // goal_pool): claims/holds the best-scoring eligible pool entry via
 // fleece_embedded_claim_best_goal() and publishes the result into
@@ -930,6 +1312,12 @@ static void goal_pool_tick(FleeceGoapBrain* b) {
     if (written > 0 && (size_t)written < sizeof(json_val)) {
         fleece_state_manager_set_named(sm, b->goal_pool_key_field, (const uint8_t*)json_val, (uint32_t)written);
     }
+
+    // Action-library dispatch (no-op if none registered) may itself
+    // overwrite goal_pool_key_field again (blocked/done both clear it) - it
+    // re-reads nothing from what was just written above, `claimed` is
+    // passed directly.
+    action_library_tick(b, claimed);
 }
 
 const char* fleece_goap_brain_goal_id(const FleeceGoapBrain* b) {
