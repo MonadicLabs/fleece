@@ -27,6 +27,17 @@ struct FleeceStateManager {
         char name[FLEECE_FIELD_NAME_MAX];  // empty for legacy raw-key entries
         bool exists;
         bool is_tombstone;
+        // manager->local_timestamp as of this field's last successful inclusion in an
+        // outbound shared-delta gossip frame (0 = never sent) -- see
+        // fleece_state_manager_export_shared_delta_bounded()'s own comment for why this
+        // exists separately from `timestamp` (the LWW conflict clock): a field rewritten
+        // faster than the gossip cadence (e.g. a drone's own position at 10Hz) always
+        // carries the newest `timestamp` of any locally-held field, so sorting export
+        // priority by `timestamp` starves it behind any standing backlog forever -- its
+        // own value is perpetually "too new" to ever be the oldest-eligible record. This
+        // field decouples "am I due for a resend" from "what does my current value's LWW
+        // clock read", fixing that without touching LWW semantics at all.
+        uint64_t last_export_ts;
     } *fields;
     uint32_t field_count;
     uint32_t field_capacity;
@@ -769,39 +780,61 @@ int fleece_state_manager_export_shared_delta_bounded(FleeceStateManager* manager
     size_t body = fleece_cbor_array_header_size(5) + fleece_cbor_uint_size(manager->node_id)
                  + fleece_cbor_uint_size(FLEECE_SHARED_OWNER_ID)
                  + 9 + 9 + 3;
-    /* Oldest-first, ALWAYS: the delta is a cap-bounded WINDOW over the
-     * stream of changed records. Packing in slot order let the watermark
-     * advance past records that didn't fit, permanently silencing them
-     * whenever the world held more changed data than one frame carries
-     * (found live: a POI written on every drone never reached the GC-SPU
-     * because telemetry keys monopolized the frame). Oldest-first with the
-     * watermark at the last SENT record rotates everything through within
-     * a few frames, no matter how large the backlog grows. */
+    /* Least-recently-EXPORTED-first, ALWAYS: the delta is a cap-bounded WINDOW
+     * over the stream of changed records, and the packing order decides which
+     * eligible records actually make it into THIS frame when the backlog is
+     * bigger than one frame's budget.
+     *
+     * This sorts by `last_export_ts` (when this field last actually rode in an
+     * outbound frame, 0 = never), NOT by `timestamp` (the LWW conflict clock).
+     * Sorting by `timestamp` was tried first and starved any field rewritten
+     * faster than the gossip cadence (e.g. a drone's own position at 10Hz):
+     * such a field's `timestamp` is bumped on every local write, so it is
+     * essentially always the NEWEST eligible record and so always sorts LAST
+     * -- against any standing backlog of older, infrequently-written records
+     * it never ages into "oldest" and so never wins a frame slot, forever
+     * (found live: a late-joining drone's battery_percent/px4_state reached
+     * the GC-SPU fine, but its 10Hz position never did). `last_export_ts` is
+     * untouched by rewrites -- it only advances when a record is actually
+     * sent (see the marking loop below) -- so a field that keeps losing stays
+     * frozen at its old (or zero) value and its priority rises every round
+     * until it finally wins a slot, exactly like the timestamp-based sort was
+     * meant to guarantee for a one-time backlog but couldn't for a live one.
+     * Ties (most commonly: several never-sent records, last_export_ts==0)
+     * fall back to `timestamp` ascending, preserving the original
+     * oldest-content-first tiebreak among equally-overdue records. */
     uint32_t eligible[FIELD_CAPACITY];
+    uint64_t eligible_export_ts[FIELD_CAPACITY];
     uint64_t eligible_ts[FIELD_CAPACITY];
     uint32_t eligible_n = 0;
     for (uint32_t i = 0; i < manager->field_capacity; i++) {
         struct FieldEntry* f = &manager->fields[i];
         if (!f->exists || f->node_id != FLEECE_SHARED_OWNER_ID || f->name[0] == '\0' || f->timestamp <= since_timestamp) continue;
         eligible[eligible_n] = i;
+        eligible_export_ts[eligible_n] = f->last_export_ts;
         eligible_ts[eligible_n] = f->timestamp;
         eligible_n++;
     }
-    /* insertion sort by timestamp ascending (n <= capacity, nearly sorted) */
+    /* insertion sort by (last_export_ts, timestamp) ascending (n <= capacity, nearly sorted) */
     for (uint32_t a = 1; a < eligible_n; a++) {
         uint32_t idx = eligible[a];
+        uint64_t ets = eligible_export_ts[a];
         uint64_t ts = eligible_ts[a];
         uint32_t b = a;
-        while (b > 0 && eligible_ts[b - 1] > ts) {
+        while (b > 0 && (eligible_export_ts[b - 1] > ets ||
+                         (eligible_export_ts[b - 1] == ets && eligible_ts[b - 1] > ts))) {
             eligible[b] = eligible[b - 1];
+            eligible_export_ts[b] = eligible_export_ts[b - 1];
             eligible_ts[b] = eligible_ts[b - 1];
             b--;
         }
         eligible[b] = idx;
+        eligible_export_ts[b] = ets;
         eligible_ts[b] = ts;
     }
 
     uint64_t max_ts = 0;
+    uint32_t stop_e = eligible_n;  /* index where packing stopped -- eligible_n if nothing was left over */
     for (uint32_t i = 0; i < manager->field_capacity; i++) take[i] = false;
     for (uint32_t e = 0; e < eligible_n; e++) {
         uint32_t i = eligible[e];
@@ -814,25 +847,30 @@ int fleece_state_manager_export_shared_delta_bounded(FleeceStateManager* manager
                    + fleece_cbor_text_size(name_len)
                    + fleece_cbor_uint_size(f->timestamp)
                    + fleece_cbor_bytes_size(data_len);
-        if (count > 0 && body + rec > cap_bytes) break;  /* oldest-first window ends here */
-        /* max_ts (and so the caller's watermark, included_max_ts below) must
-         * only ever advance to a record that was ACTUALLY included (take[i]
-         * set true) -- bumping it for a record the cap check is about to
-         * reject reintroduces the exact "permanently invisible to every
-         * future export" bug this whole bounded/oldest-first exporter exists
-         * to fix (see this function's own header comment and
-         * fleece_runtime.c's own watermark-advance comment for the original
-         * incident): the watermark would skip straight past a record that
-         * was never sent, and since export only ever looks at
-         * field.timestamp > since_timestamp, it would never be retried.
-         * Found live via swarmpu's own goal-pool auction under heavy
-         * simultaneous multi-node contention -- some drones' claims never
-         * reached others at all, permanently, not just slowly.
-         */
+        if (count > 0 && body + rec > cap_bytes) { stop_e = e; break; }  /* packing window ends here */
         if (f->timestamp > max_ts) max_ts = f->timestamp;
+        f->last_export_ts = manager->local_timestamp;  /* due again only once rewritten or re-overdue */
         body += rec;
         take[i] = true;
         count++;
+    }
+    /* The caller's watermark (included_max_ts) must only ever advance to a value that
+     * doesn't skip over a still-eligible record left out of THIS frame -- bumping it past
+     * one reintroduces the exact "permanently invisible to every future export" bug this
+     * exporter exists to fix (see fleece_runtime.c's own watermark-advance comment for the
+     * original incident: found live via the goal-pool auction under heavy contention, some
+     * drones' claims never reached others at all). The original oldest-first-ALWAYS
+     * packing order made this automatic (every left-over record's timestamp was, by
+     * construction, >= every included one's). Packing least-recently-EXPORTED-first
+     * (above) breaks that invariant -- a record with a low timestamp can now be left over
+     * while one with a much higher timestamp got sent, so max_ts alone is no longer a safe
+     * watermark. Clamp it to just below the lowest timestamp among whatever's left over. */
+    uint64_t leftover_min_ts = UINT64_MAX;
+    for (uint32_t e = stop_e; e < eligible_n; e++) {
+        if (eligible_ts[e] < leftover_min_ts) leftover_min_ts = eligible_ts[e];
+    }
+    if (leftover_min_ts != UINT64_MAX && leftover_min_ts - 1 < max_ts) {
+        max_ts = leftover_min_ts - 1;
     }
     if (included_max_ts) *included_max_ts = max_ts;
 
