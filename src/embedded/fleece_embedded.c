@@ -795,6 +795,18 @@ int fleece_embedded_claim_best_goal(FleeceEmbedded* emb, const char* prefix,
 
     char best_key[FLEECE_FIELD_NAME_MAX];
     best_key[0] = '\0';
+    // Mirrors have_current/current_score just above: a sentinel best_score
+    // of 0 with a bare `score > best_score` test meant a candidate scoring
+    // exactly 0 could never become "best" even when it's the only eligible
+    // one -- found live via swarmpu's own default goal priority (0) landing
+    // on scoreGoal()'s -distance+priority*1000 formula at exactly 0 (no
+    // ambient self.lat/lon populated -> distance term is 0 too), so a whole
+    // class of goals silently never got claimed by anyone, ever. have_best
+    // tracks "seen ANY eligible candidate" independent of its score, same
+    // as have_current does for the currently-held goal, so the FIRST
+    // eligible candidate always wins regardless of sign, and only a later
+    // one that scores strictly higher replaces it.
+    bool have_best = false;
     double best_score = 0;
     uint8_t* best_expected_raw = NULL;
     uint32_t best_expected_raw_size = 0;
@@ -830,7 +842,8 @@ int fleece_embedded_claim_best_goal(FleeceEmbedded* emb, const char* prefix,
             eligible = score > holder_score + contest_margin;
         }
 
-        if (eligible && score > best_score) {
+        if (eligible && (!have_best || score > best_score)) {
+            have_best = true;
             best_score = score;
             strncpy(best_key, key, sizeof(best_key) - 1);
             best_key[sizeof(best_key) - 1] = '\0';

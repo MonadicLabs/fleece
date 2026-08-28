@@ -334,6 +334,61 @@ static void test_peer_ttl_expiry(void) {
     printf("Done: peer TTL expiry test\n");
 }
 
+static void test_claim_best_goal_zero_score(void) {
+    printf("Running claim_best_goal zero-score test...\n");
+
+    FleeceStateManager* manager = fleece_state_manager_create_with_node_id(0xC1C1C1C1C1C1C1C1ULL);
+    FleeceEmbedded* embedded = make_embedded(manager);
+
+    // A candidate that scores EXACTLY 0 (swarmpu's own real-world trigger:
+    // goal_pool_goap.c's scoreGoal() lands here for the default/"Normal"
+    // priority whenever the distance term is also 0) must still be claimable
+    // when it's the only eligible candidate -- best_score's old sentinel of
+    // 0 plus a bare `score > best_score` meant it silently never won.
+    CHECK(fleece_embedded_execute(embedded,
+        "function scoreGoal(key, g) { return 0; }"
+        "world.goal_a = { params: { lat: 1 } };"
+    ) == 0, "setup: define a zero-scoring scoreGoal and one goal_ candidate");
+
+    char out_key[FLEECE_FIELD_NAME_MAX];
+    CHECK(fleece_embedded_claim_best_goal(embedded, "goal_", NULL, 5.0, true,
+                                           out_key, sizeof(out_key)) == 0,
+          "claim_best_goal should not error");
+    CHECK(strcmp(out_key, "goal_a") == 0,
+          "a lone candidate scoring exactly 0 must still be claimed, not silently skipped");
+
+    fleece_embedded_destroy(embedded);
+    fleece_state_manager_destroy(manager);
+    printf("Done: claim_best_goal zero-score test\n");
+}
+
+static void test_claim_best_goal_prefers_higher_score(void) {
+    printf("Running claim_best_goal score-comparison test...\n");
+
+    FleeceStateManager* manager = fleece_state_manager_create_with_node_id(0xC2C2C2C2C2C2C2C2ULL);
+    FleeceEmbedded* embedded = make_embedded(manager);
+
+    // goal_a scores 0, goal_b scores 5 -- the zero-score fix must not turn
+    // this into "first seen always wins": a later, genuinely better
+    // candidate still has to win the comparison.
+    CHECK(fleece_embedded_execute(embedded,
+        "function scoreGoal(key, g) { return g.score; }"
+        "world.goal_a = { score: 0 };"
+        "world.goal_b = { score: 5 };"
+    ) == 0, "setup: two goal_ candidates with different scores");
+
+    char out_key[FLEECE_FIELD_NAME_MAX];
+    CHECK(fleece_embedded_claim_best_goal(embedded, "goal_", NULL, 1.0, true,
+                                           out_key, sizeof(out_key)) == 0,
+          "claim_best_goal should not error");
+    CHECK(strcmp(out_key, "goal_b") == 0,
+          "the higher-scoring candidate should still win over a zero-scoring one");
+
+    fleece_embedded_destroy(embedded);
+    fleece_state_manager_destroy(manager);
+    printf("Done: claim_best_goal score-comparison test\n");
+}
+
 int main(void) {
     printf("Fleece Embedded (QuickJS self/swarm) Unit Tests\n");
     printf("=================================================\n\n");
@@ -358,6 +413,10 @@ int main(void) {
     test_shared_owner_hidden_from_swarm();
     printf("\n");
     test_peer_ttl_expiry();
+    printf("\n");
+    test_claim_best_goal_zero_score();
+    printf("\n");
+    test_claim_best_goal_prefers_higher_score();
     printf("\n");
 
     if (g_failures > 0) {
