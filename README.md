@@ -460,18 +460,33 @@ fleece_comms_receive(comms, destination, &data, &size);
 - **Adaptive timeout handling**
 
 ## License
-MIT License - See LICENSE file for details
+
+Copyright (C) 2026 Monadic Labs.
+
+fleece is licensed under the [GNU Affero General Public License v3.0](LICENSE)
+(AGPLv3) — you're free to use, study, modify, and redistribute it, including
+running a modified version as a network service, as long as you make your
+own source available under the same terms (that's what the "A" in AGPL adds
+over plain GPL: running it as a service doesn't exempt you from sharing
+source, the way it would under GPL alone).
+
+If AGPLv3's copyleft terms don't work for your use case — you want to embed
+fleece in a closed-source product without open-sourcing your own code — a
+separate commercial license is available. See [CONTRIBUTING.md](CONTRIBUTING.md)
+or get in touch via [monadiclabs.github.io/contact](https://monadiclabs.github.io/contact).
+
+Note: this covers fleece itself. swarmpu, the SPU firmware that embeds
+fleece as a submodule, is closed-source and not covered by this license.
 
 ## Future Work
 
 ### Planned Enhancements
-1. **A built-in Reticulum/radio transport** for comms - `example2_search_and_deliver.c` shows a real transport (UDP multicast) is fully possible via the existing send/poll callbacks, but fleece itself still ships only the simulated default backend
-2. **A `reset()` trigger** - the lifecycle function is callable but nothing in the runtime calls it automatically yet
-3. **Real hardware platform bindings** (e.g. a MAVLink or ROS2 integration) - `example3_embodied_swarm.c` shows the registry in real use (a simple 2D movement binding), but nothing resembling actual flight-controller or robot hardware is wired up yet
-4. **Hardware-specific optimizations** (ESP32, STM32, etc.) and validation on an actual microcontroller target (currently desktop POSIX only)
-5. **More example applications** (leader election, foraging at scale, etc.)
-6. **Performance profiling** and optimization
-7. **Documentation updates** and tutorials
+1. **A `reset()` trigger** - the lifecycle function is callable but nothing in the runtime calls it automatically yet
+2. **ROS2 platform bindings** - `example3_embodied_swarm.c` shows the platform registry in real use (a simple 2D movement binding); a real MAVLink binding already exists downstream (swarmpu's own SPU firmware), but nothing for ROS2 yet
+3. **Hardware-specific optimizations** (ESP32, STM32, etc.) beyond the one real deployment target that exists today (STM32H7, via swarmpu) - fleece itself still only ships a desktop-POSIX build in this repo
+4. **More example applications** (leader election, foraging at scale, etc.)
+5. **Performance profiling** and optimization
+6. **Documentation updates** and tutorials
 
 ### Design Considerations
 - **Backward compatibility** in the API
