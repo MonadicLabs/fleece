@@ -1,0 +1,32 @@
+diff --git a/src/microReticulum/Type.h b/src/microReticulum/Type.h
+index 032f9da..7aa2da8 100644
+--- a/src/microReticulum/Type.h
++++ b/src/microReticulum/Type.h
+@@ -143,8 +143,26 @@ namespace RNS { namespace Type {
+ 
+ 		Future minimum will probably be locked in at 251 bytes to support
+ 		networks with segments of different MTUs. Absolute minimum is 219.
++
++		Bumped down from the upstream default of 500 to 460: this fork is
++		vendored specifically for swarmpu's embedded builds (fleece), whose
++		own air-radio UART framing (uart_framing.hpp's kMeshMtuBytes) hard-
++		caps every frame at 460 bytes and silently drops anything larger --
++		it does not truncate or fragment. Resource::SDU derives from
++		Packet::MDU, which derives from this constant; at the old MTU=500 a
++		Resource part packet came out to 464 bytes, four bytes over that
++		hard cap, so every full-size part silently vanished at the framing
++		layer while smaller handshake/advertisement packets (which fit)
++		went through fine -- the receiver's watchdog saw outstanding_parts
++		get stuck forever, exhausted its retries, and failed
++		(status=FAILED). Confirmed live via a diagnostic build instrumenting
++		Resource::__watchdog_job()'s receiver-side branch: eifr/rtt/timeout
++		math was all sane, only outstanding_parts never decreased. Per this
++		comment's own note above, an identical MTU is a prerequisite for
++		peers to communicate at all -- fine here, since every swarmpu node
++		links this exact fork, never a stock/upstream RNS peer.
+ 		*/
+-		static const uint16_t MTU = 500;
++		static const uint16_t MTU = 460;
+ 
+ 		/*
+ 		Whether automatic link MTU discovery is enabled by default in this
